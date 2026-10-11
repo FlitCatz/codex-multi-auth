@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+	type CodexCliVersionDeps,
 	detectInstalledCodexCliVersion,
 	parseCodexCliVersion,
 } from "../lib/codex-cli/version.js";
+
+const asExecFile = (fn: unknown) => fn as CodexCliVersionDeps["execFile"];
 
 describe("parseCodexCliVersion", () => {
 	it.each([
@@ -30,7 +33,7 @@ describe("detectInstalledCodexCliVersion", () => {
 		const execFile = vi.fn(async () => ({ stdout: "codex-cli 0.160.1\n" }));
 		const version = await detectInstalledCodexCliVersion({
 			resolveBin: async () => ({ path: "/opt/codex/codex.exe", launchWithNode: false }),
-			execFile: execFile as never,
+			execFile: asExecFile(execFile),
 		});
 		expect(version).toBe("0.160.1");
 		expect(execFile).toHaveBeenCalledWith(
@@ -47,7 +50,7 @@ describe("detectInstalledCodexCliVersion", () => {
 				path: "C:\\npm\\node_modules\\@openai\\codex\\bin\\codex.js",
 				launchWithNode: true,
 			}),
-			execFile: execFile as never,
+			execFile: asExecFile(execFile),
 		});
 		expect(execFile).toHaveBeenCalledWith(
 			process.execPath,
@@ -61,7 +64,7 @@ describe("detectInstalledCodexCliVersion", () => {
 		expect(
 			await detectInstalledCodexCliVersion({
 				resolveBin: async () => null,
-				execFile: execFile as never,
+				execFile: asExecFile(execFile),
 			}),
 		).toBeNull();
 		expect(execFile).not.toHaveBeenCalled();
@@ -71,15 +74,15 @@ describe("detectInstalledCodexCliVersion", () => {
 		expect(
 			await detectInstalledCodexCliVersion({
 				resolveBin: async () => ({ path: "/bin/codex", launchWithNode: false }),
-				execFile: (async () => {
+				execFile: asExecFile(async () => {
 					throw new Error("spawn failed");
-				}) as never,
+				}),
 			}),
 		).toBeNull();
 		expect(
 			await detectInstalledCodexCliVersion({
 				resolveBin: async () => ({ path: "/bin/codex", launchWithNode: false }),
-				execFile: (async () => ({ stdout: "codex-cli\n" })) as never,
+				execFile: asExecFile(async () => ({ stdout: "codex-cli\n" })),
 			}),
 		).toBeNull();
 	});
