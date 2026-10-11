@@ -5,6 +5,41 @@ Dates use ISO format (`YYYY-MM-DD`).
 
 This repository's current stable release line is `2.x`. Full release notes live in [`docs/releases/`](docs/releases/) — this file is the short version. Pre-`0.1.0` iteration history is archived in [`docs/releases/legacy-pre-0.1-history.md`](docs/releases/legacy-pre-0.1-history.md). Conventions: entry headings are `## [x.y.z] - YYYY-MM-DD`; section headings come from `Added`, `Changed`, `Fixed`, `Removed`, `Security`, `Internal`, `Notes`; issue and pull-request references link as `[#N](https://github.com/ndycode/codex-multi-auth/pull/N)`.
 
+## [2.20.0] - 2026-10-11
+
+Luna Reserve arrives as a first-class routing fallback, direct model
+discovery self-heals its now-required client version, and usage rows
+stop losing token counts on headerless SSE streams.
+[Full notes](docs/releases/v2.20.0.md).
+
+### Added
+
+- First-class Luna Reserve (`gpt-reserve`) support: registered as a
+  Luna-compatible model with the Luna reasoning ladder and tool
+  capabilities, parsed from the official multi-bucket
+  `rateLimitsByLimitId` response by `limitName: "gpt-reserve"`, and
+  reported through an additive `lunaReserve` object in
+  `limits --json --refresh` (offered/available, used/remaining %,
+  window duration, reset timestamp, limit ID, normal Luna slug). An
+  absent bucket reports unknown rather than 0%, and a genuine quota
+  429 on a Luna model falls back to `gpt-reserve` without spending
+  reset credits or feeding ordinary quota bookkeeping
+  ([#732](https://github.com/ndycode/codex-multi-auth/pull/732))
+
+### Fixed
+
+- `check` OAuth model discovery no longer fails with HTTP 400 on
+  fresh installs: the now-required `client_version` query parameter
+  falls back to the installed `codex --version` when the inventory
+  has no stored version, and the detected value is persisted for the
+  next check ([#733](https://github.com/ndycode/codex-multi-auth/issues/733),
+  [#735](https://github.com/ndycode/codex-multi-auth/pull/735))
+- Responses SSE bodies without a reliable `Content-Type` are sniffed
+  via a bounded 4 KiB prefix instead of being parsed as one JSON
+  document, so usage-ledger rows carry real token counts and stream
+  completion checks still run
+  ([#731](https://github.com/ndycode/codex-multi-auth/pull/731))
+
 ## [2.19.1] - 2026-10-06
 
 Light-terminal readability plus a full dependency and toolchain refresh:
