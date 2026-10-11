@@ -5,6 +5,7 @@ import { mapWithConcurrency } from "../concurrency.js";
 import { ApiModelCapabilities, type ProbeResult } from "./api-model-capabilities.js";
 import { getAppBindStatus } from "./app-bind.js";
 import { isRecord } from "../utils.js";
+import { spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import { join, dirname } from "node:path";
 import { z } from "zod";
@@ -24,6 +25,55 @@ import { CODEX_BASE_URL } from "../constants.js";
 import { getCodexMultiAuthDir } from "../runtime-paths.js";
 import { tempPathFor } from "../temp-path.js";
 import { withRetry } from "../fs-retry.js";
+
+/** Same shape as the saved inventory `clientVersion` field. */
+const CATALOG_CLIENT_VERSION = /^[0-9A-Za-z.+_-]{1,80}$/;
+
+/** Pull `0.160.1` out of `codex --version` (`codex-cli 0.160.1`). */
+export function parseCodexCliVersion(output: string): string | undefined {
+	const match = /(?:^|\s)codex-cli\s+([0-9A-Za-z.+_-]+)/.exec(output);
+	const version = match?.[1];
+	if (!version || version.length > 80 || !CATALOG_CLIENT_VERSION.test(version)) return undefined;
+	return version;
+}
+
+let installedCodexVersion: string | undefined | null = null;
+
+/** One process-wide lookup. A missing binary or a bad status is "unknown", not a throw. */
+export function readInstalledCodexVersion(): string | undefined {
+	if (installedCodexVersion !== null) return installedCodexVersion;
+	installedCodexVersion = undefined;
+	try {
+		const result = spawnSync("codex", ["--version"], {
+			encoding: "utf8",
+			timeout: 3000,
+			windowsHide: true,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		if (result.status === 0) {
+			installedCodexVersion = parseCodexCliVersion(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
+		}
+	} catch {
+		installedCodexVersion = undefined;
+	}
+	return installedCodexVersion;
+}
+
+/**
+ * Stored inventory version wins. Otherwise ask `detect` (the installed `codex` CLI
+ * by default). ChatGPT rejects `/codex/models` when this query param is absent.
+ */
+export function resolveCatalogClientVersion(
+	explicit?: string,
+	detect: () => string | undefined = readInstalledCodexVersion,
+): string | undefined {
+	const stored = explicit?.trim();
+	if (stored && stored.length <= 80 && CATALOG_CLIENT_VERSION.test(stored)) return stored;
+	const found = detect()?.trim();
+	if (found && found.length <= 80 && CATALOG_CLIENT_VERSION.test(found)) return found;
+	return undefined;
+}
+
 const printable = z
 	.string()
 	.max(256)
@@ -83,6 +133,8 @@ export async function discoverModelInventory(
 		fetchImpl?: typeof fetch;
 		now?: () => number;
 		clientVersion?: string;
+		/** Used only when `clientVersion` is absent. Tests inject this; the CLI detects `codex --version`. */
+		resolveClientVersion?: () => string | undefined;
 		updateApiDiscovery?: typeof updateApiModelDiscovery;
 		/** Send billable API probes even when a result is inside the 15-minute cache. */
 		forceProbes?: boolean;
@@ -92,6 +144,10 @@ export async function discoverModelInventory(
 ): Promise<ModelInventory> {
 	const fetcher = options.fetchImpl ?? fetch,
 		now = options.now ?? Date.now;
+	const version = resolveCatalogClientVersion(
+		options.clientVersion,
+		options.resolveClientVersion ?? (() => undefined),
+	);
 	const manager = new AccountManager(
 		undefined,
 		storage ?? {
@@ -120,9 +176,7 @@ export async function discoverModelInventory(
 		const id = scope?.accountId;
 		if (!id) throw Error("Identity unavailable");
 		const url = new URL(`${CODEX_BASE_URL}/codex/models`);
-		const version = options.clientVersion;
-		if (version && /^[0-9A-Za-z.+_-]{1,80}$/.test(version))
-			url.searchParams.set("client_version", version);
+		if (version) url.searchParams.set("client_version", version);
 		const response = await fetcher(url, {
 			headers: createCodexHeaders({
 				accountId: id,
@@ -189,7 +243,7 @@ export async function discoverModelInventory(
 	return {
 		version: 1,
 		checkedAt: now(),
-		clientVersion: options.clientVersion,
+		clientVersion: version,
 		entries,
 	};
 }
@@ -348,7 +402,7 @@ export async function refreshAndPrintModelInventory(
 			await loadAccounts(),
 			await loadApiRoutes().catch(() => {apiConfigurationUnavailable=true;log("API configuration unavailable; checking subscription models only.");return [];}),
 			{
-				clientVersion: previous?.clientVersion,
+				clientVersion: resolveCatalogClientVersion(previous?.clientVersion),
 				updateApiDiscovery: updateApiModelDiscovery,
 				forceProbes: deps.forceProbes === true,
 				persistProbes: true,

@@ -385,6 +385,59 @@ it("asks a running proxy to force paid probes only for an explicit capability ch
  expect(urls).toEqual(["http://127.0.0.1:12345/models?refresh_capabilities=1", "http://127.0.0.1:12345/models?refresh_capabilities=1&force_probes=1"]);
 });
 
+it("parses the installed Codex CLI version and ignores junk", async () => {
+	const { parseCodexCliVersion, resolveCatalogClientVersion } = await import(
+		"../lib/runtime/model-discovery-status.js"
+	);
+	expect(parseCodexCliVersion("codex-cli 0.162.1\n")).toBe("0.162.1");
+	expect(parseCodexCliVersion("")).toBeUndefined();
+	expect(parseCodexCliVersion("not a version")).toBeUndefined();
+	expect(parseCodexCliVersion("codex-cli !!!")).toBeUndefined();
+	const detect = vi.fn(() => "9.9.9");
+	expect(resolveCatalogClientVersion("0.162.1", detect)).toBe("0.162.1");
+	expect(detect).not.toHaveBeenCalled();
+	expect(resolveCatalogClientVersion("  ", detect)).toBe("9.9.9");
+	expect(resolveCatalogClientVersion(undefined, () => "nope spaces")).toBeUndefined();
+});
+
+it("sends an injected Codex client_version and lets an explicit version win", async () => {
+	const storage = {
+		version: 3 as const,
+		activeIndex: 0,
+		activeIndexByFamily: {},
+		accounts: [
+			{
+				accountId: "fixture-account",
+				refreshToken: "fixture-refresh",
+				accessToken: "fixture-access",
+				expiresAt: Date.now() + 3600000,
+				addedAt: 1,
+				lastUsed: 1,
+			},
+		],
+	};
+	const urls: string[] = [];
+	const fetcher = vi.fn(async (url: string | URL) => {
+		urls.push(String(url));
+		return Response.json({ models: [{ slug: "fixture-model" }] });
+	});
+	await discoverModelInventory(storage, [], {
+		fetchImpl: fetcher as typeof fetch,
+		resolveClientVersion: () => "0.162.1",
+	});
+	expect(new URL(urls[0]!).searchParams.get("client_version")).toBe("0.162.1");
+	urls.length = 0;
+	await discoverModelInventory(storage, [], {
+		fetchImpl: fetcher as typeof fetch,
+		clientVersion: "0.160.1",
+		resolveClientVersion: () => "0.162.1",
+	});
+	expect(new URL(urls[0]!).searchParams.get("client_version")).toBe("0.160.1");
+	urls.length = 0;
+	await discoverModelInventory(storage, [], { fetchImpl: fetcher as typeof fetch });
+	expect(new URL(urls[0]!).searchParams.has("client_version")).toBe(false);
+});
+
 it("merges concurrent checks' probe results instead of replacing the shared cache", async () => {
  const { promises: fs } = await import("node:fs");
  const { tmpdir } = await import("node:os");
