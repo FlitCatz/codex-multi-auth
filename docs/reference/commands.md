@@ -175,6 +175,12 @@ request without `--prime`; the dashboard's Quick and Deep Check do not prime.
 `account auto-prime <index> on` instead authorizes periodic priming by a running
 CLI/app router.
 
+Upstream model discovery requires a `client_version` query parameter. `check`
+sends the version stored in `model-discovery.json`; when none is stored it
+detects the installed `codex --version`, sends that, and saves it for the next
+check. The value is never hardcoded because the catalog filters advertised
+models by each client's `minimal_client_version`.
+
 Unlike `fix`, `check` does not skip disabled accounts: an account whose token
 is still usable is re-enabled as part of the run. With `showQuotaDetails` on
 (the default, see [settings.md](settings.md)) healthy lines carry a compact

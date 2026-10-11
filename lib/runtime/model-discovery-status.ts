@@ -19,6 +19,10 @@ import {
 import { ApiModelRuntime, boundedJson } from "./api-model-runtime.js";
 import { AccountModelCatalog } from "./account-model-catalog.js";
 import { ensureFreshAccessToken } from "./rotation-token-refresh.js";
+import {
+	CLIENT_VERSION_PATTERN,
+	detectInstalledCodexCliVersion,
+} from "../codex-cli/version.js";
 import { createCodexHeaders } from "../request/headers.js";
 import { CODEX_BASE_URL } from "../constants.js";
 import { getCodexMultiAuthDir } from "../runtime-paths.js";
@@ -121,7 +125,7 @@ export async function discoverModelInventory(
 		if (!id) throw Error("Identity unavailable");
 		const url = new URL(`${CODEX_BASE_URL}/codex/models`);
 		const version = options.clientVersion;
-		if (version && /^[0-9A-Za-z.+_-]{1,80}$/.test(version))
+		if (version && CLIENT_VERSION_PATTERN.test(version))
 			url.searchParams.set("client_version", version);
 		const response = await fetcher(url, {
 			headers: createCodexHeaders({
@@ -290,14 +294,26 @@ export async function refreshAndPrintModelInventory(
 		}>;
 		fetchImpl?: typeof fetch;
 		loadInventory?: typeof loadModelInventory;
+		loadAccounts?: typeof loadAccounts;
+		loadApiRoutes?: typeof loadApiRoutes;
 		now?: () => number;
 		/** Only an explicit `check capabilities` bypasses the 15-minute probe cache. */
 		forceProbes?: boolean;
+		/** Installed `codex --version` probe, used when the inventory stores no clientVersion. */
+		detectClientVersion?: () => Promise<string | null>;
 	} = {},
 ): Promise<boolean> {
 	try {
 		const load = deps.loadInventory ?? loadModelInventory;
 		const previous = await load();
+		// The catalog requires client_version (issue #733): the stored inventory
+		// version wins, otherwise probe the installed `codex --version` so a fresh
+		// inventory seeds one and saves it for the next check.
+		const detectClientVersion = async () =>
+			(await (deps.detectClientVersion ?? detectInstalledCodexCliVersion)().catch(
+				() => null,
+			)) ?? undefined;
+		const clientVersion = previous?.clientVersion;
 		const binding = await (deps.getBinding ?? getAppBindStatus)();
 		if (binding.running && binding.state?.nativeOpenai) {
 			const started = (deps.now ?? Date.now)();
@@ -315,8 +331,9 @@ export async function refreshAndPrintModelInventory(
 			url.pathname = "/models";
 			url.searchParams.set("refresh_capabilities", "1");
 			if (deps.forceProbes) url.searchParams.set("force_probes", "1");
-			if (previous?.clientVersion)
-				url.searchParams.set("client_version", previous.clientVersion);
+			const proxyClientVersion = clientVersion ?? (await detectClientVersion());
+			if (proxyClientVersion)
+				url.searchParams.set("client_version", proxyClientVersion);
    const clientApiKey = binding.state.clientApiKey;
    const current = await withCheckProgress("Refreshing workspace catalogs and API/ZDR probes", async () => {
 			const response = await (deps.fetchImpl ?? fetch)(url, {
@@ -345,10 +362,11 @@ export async function refreshAndPrintModelInventory(
   const value = await withCheckProgress("Discovering workspace models and API/ZDR capabilities", async () => {
         let apiConfigurationUnavailable = false;
 		const value = await discoverModelInventory(
-			await loadAccounts(),
-			await loadApiRoutes().catch(() => {apiConfigurationUnavailable=true;log("API configuration unavailable; checking subscription models only.");return [];}),
+			await (deps.loadAccounts ?? loadAccounts)(),
+			await (deps.loadApiRoutes ?? loadApiRoutes)().catch(() => {apiConfigurationUnavailable=true;log("API configuration unavailable; checking subscription models only.");return [];}),
 			{
-				clientVersion: previous?.clientVersion,
+				clientVersion: clientVersion ?? (await detectClientVersion()),
+				fetchImpl: deps.fetchImpl,
 				updateApiDiscovery: updateApiModelDiscovery,
 				forceProbes: deps.forceProbes === true,
 				persistProbes: true,
