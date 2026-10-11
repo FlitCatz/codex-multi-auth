@@ -1,9 +1,9 @@
 # PROJECT KNOWLEDGE BASE
 
-Generated: 2026-10-06
-Commit: 65b9e682
+Generated: 2026-10-11
+Commit: 013a6159
 Branch: main
-Package version: 2.19.1
+Package version: 2.20.0
 
 ## OVERVIEW
 
@@ -47,8 +47,8 @@ Package version: 2.19.1
 │   ├── tools/                # hashline helper tools
 │   ├── ui/                   # TUI rendering, menus, copy, theme, select
 │   └── (flat modules)        # governance stores, quota, refresh machinery, rotation, config, schemas, utils
-├── test/                     # vitest suites (see test/AGENTS.md) — 415 files incl. property/ + chaos/
-├── docs/                     # user docs + reference/, releases/ (~82), development/ runbooks, audits/, design/, benchmarks/
+├── test/                     # vitest suites (see test/AGENTS.md) — 424 files incl. property/ + chaos/
+├── docs/                     # user docs + reference/, releases/ (~87), development/ runbooks, audits/, design/, benchmarks/
 ├── config/                   # pluginConfig templates (modern/legacy/minimal) + generated JSON schema
 ├── vendor/                   # vendored codex-ai-plugin + codex-ai-sdk type-only shims (+ provenance.json)
 ├── assets/                   # static assets (icons, hero image)
@@ -132,7 +132,7 @@ Package version: 2.19.1
 | UI components | `lib/ui/` | ansi, auth-menu(+builder), check-progress, confirm, display-width, format, runtime, select, theme, ui-copy |
 | Hashline tools | `lib/tools/hashline-tools.ts` | plugin-host edit/apply_patch/hashline_read tool impl |
 | Repo hygiene | `scripts/repo-hygiene.js` | `clean --mode aggressive`, `check`, Windows retry helpers |
-| Tests | `test/` | 415 vitest files, ~6,960 tests; see `test/AGENTS.md` |
+| Tests | `test/` | 424 vitest files, ~7,450 tests; see `test/AGENTS.md` |
 
 ## CONVENTIONS
 

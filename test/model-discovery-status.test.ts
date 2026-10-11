@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
 	discoverModelInventory,
 	formatModelInventory,
-	resetInstalledCodexVersionForTests,
 } from "../lib/runtime/model-discovery-status.js";
 import { promises as isolationFs } from "node:fs";
 import { tmpdir as isolationTmpdir } from "node:os";
@@ -12,9 +11,6 @@ import { join as isolationJoin } from "node:path";
 let previousMultiAuthDir: string | undefined;
 let multiAuthDir: string;
 beforeEach(async () => {
-	resetInstalledCodexVersionForTests();
-	const isolated = await import("../lib/runtime/model-discovery-status.js");
-	isolated.resetInstalledCodexVersionForTests();
 	previousMultiAuthDir = process.env.CODEX_MULTI_AUTH_DIR;
 	multiAuthDir = await isolationFs.mkdtemp(isolationJoin(isolationTmpdir(), "model-discovery-"));
 	process.env.CODEX_MULTI_AUTH_DIR = multiAuthDir;
@@ -157,7 +153,6 @@ it("refreshes the running native proxy instead of only an independent discovery 
 		fetchImpl: fetcher as typeof fetch,
 		loadInventory: load,
 		now: () => 100,
-		resolveClientVersion: () => undefined,
 	});
 	expect(fetcher).toHaveBeenCalledTimes(1);
 	expect(String(fetcher.mock.calls[0]?.[0])).toBe(
@@ -185,7 +180,6 @@ it.each(["https://remote.invalid", "http://127.0.0.1:12345/redirect"])(
 			}),
 			fetchImpl: fetcher,
 			loadInventory: async () => null,
-			resolveClientVersion: () => undefined,
 		});
 		expect(fetcher).not.toHaveBeenCalled();
 		expect(log.mock.calls.flat().join("\n")).toContain("failed");
@@ -307,8 +301,7 @@ it("reports a failed capability refresh to the focused CLI caller", async () => 
  const {refreshAndPrintModelInventory} = await import('../lib/runtime/model-discovery-status.js');
  expect(await refreshAndPrintModelInventory(vi.fn(), {
   getBinding:async()=>({running:true,state:{nativeOpenai:true,baseUrl:'http://127.0.0.1:12345',clientApiKey:'fixture-token'}}),
-  fetchImpl:vi.fn(async()=>new Response(null,{status:503})),loadInventory:async()=>null,
-  resolveClientVersion: () => undefined,
+  fetchImpl:vi.fn(async()=>new Response(null,{status:503})),loadInventory:async()=>null,detectClientVersion:async()=>null,
  })).toBe(false);
 });
 
@@ -386,218 +379,143 @@ it("asks a running proxy to force paid probes only for an explicit capability ch
   await refreshAndPrintModelInventory(vi.fn(), {
    getBinding: async () => ({ running: true, state: { nativeOpenai: true, baseUrl: "http://127.0.0.1:12345", clientApiKey: "fixture-token" } }),
    fetchImpl: (async (url: URL) => { urls.push(String(url)); return Response.json({ models: [] }); }) as unknown as typeof fetch,
-   loadInventory: load, now: () => 100, forceProbes,
-   resolveClientVersion: () => undefined,
+   loadInventory: load, now: () => 100, forceProbes, detectClientVersion: async () => null,
   });
  }
  expect(urls).toEqual(["http://127.0.0.1:12345/models?refresh_capabilities=1", "http://127.0.0.1:12345/models?refresh_capabilities=1&force_probes=1"]);
 });
 
-it("parses the installed Codex CLI version and ignores junk", async () => {
-	const { parseCodexCliVersion, resolveCatalogClientVersion } = await import(
+it("sends the installed codex version for direct discovery and stores it for the next check", async () => {
+	const { refreshAndPrintModelInventory, loadModelInventory } = await import(
 		"../lib/runtime/model-discovery-status.js"
 	);
-	expect(parseCodexCliVersion("codex-cli 0.162.1\n")).toBe("0.162.1");
-	expect(parseCodexCliVersion("")).toBeUndefined();
-	expect(parseCodexCliVersion("not a version")).toBeUndefined();
-	expect(parseCodexCliVersion("codex-cli !!!")).toBeUndefined();
-	const detect = vi.fn(() => "9.9.9");
-	expect(resolveCatalogClientVersion("0.162.1", detect)).toBe("0.162.1");
-	expect(detect).not.toHaveBeenCalled();
-	expect(resolveCatalogClientVersion("  ", detect)).toBe("9.9.9");
-	expect(resolveCatalogClientVersion(undefined, () => "nope spaces")).toBeUndefined();
-});
-
-it("sends an injected Codex client_version and lets an explicit version win", async () => {
 	const storage = {
 		version: 3 as const,
 		activeIndex: 0,
 		activeIndexByFamily: {},
 		accounts: [
 			{
-				accountId: "fixture-account",
-				refreshToken: "fixture-refresh",
-				accessToken: "fixture-access",
-				expiresAt: Date.now() + 3600000,
+				accountId: "acct-1",
+				refreshToken: "rt",
+				accessToken: "at",
+				expiresAt: Date.now() + 3600_000,
+				addedAt: 1,
+				lastUsed: 1,
+			},
+		],
+	};
+	const catalogUrls: string[] = [];
+	const fetchImpl = (async (url: URL) => {
+		const u = new URL(String(url));
+		if (u.pathname.endsWith("/codex/models")) {
+			catalogUrls.push(u.toString());
+			if (!u.searchParams.get("client_version")) {
+				return Response.json(
+					{ detail: [{ loc: ["query", "client_version"], msg: "Field required" }] },
+					{ status: 400 },
+				);
+			}
+			return Response.json({ models: [{ slug: "model-a" }] });
+		}
+		return new Response("not found", { status: 404 });
+	}) as unknown as typeof fetch;
+	const ok = await refreshAndPrintModelInventory(vi.fn(), {
+		getBinding: async () => ({ running: false, state: null }),
+		fetchImpl,
+		loadInventory: async () => null,
+		loadAccounts: async () => storage,
+		loadApiRoutes: async () => [],
+		detectClientVersion: async () => "0.160.1",
+	});
+	expect(ok).toBe(true);
+	expect(catalogUrls).toHaveLength(1);
+	expect(catalogUrls[0]).toContain("client_version=0.160.1");
+	// The detected version is persisted so the next check reuses it instead of
+	// re-detecting the installed client.
+	expect((await loadModelInventory())?.clientVersion).toBe("0.160.1");
+});
+
+it("prefers the stored inventory version over a fresh detection", async () => {
+	const { refreshAndPrintModelInventory } = await import(
+		"../lib/runtime/model-discovery-status.js"
+	);
+	const urls: string[] = [];
+	const detect = vi.fn(async () => "9.9.9");
+	const load = vi
+		.fn()
+		.mockResolvedValueOnce({ version: 1, checkedAt: 1, clientVersion: "1.2.3", entries: [] })
+		.mockResolvedValueOnce({ version: 1, checkedAt: 200, entries: [] });
+	await refreshAndPrintModelInventory(vi.fn(), {
+		getBinding: async () => ({
+			running: true,
+			state: { nativeOpenai: true, baseUrl: "http://127.0.0.1:12345", clientApiKey: "k" },
+		}),
+		fetchImpl: (async (url: URL) => {
+			urls.push(String(url));
+			return Response.json({ models: [] });
+		}) as unknown as typeof fetch,
+		loadInventory: load,
+		detectClientVersion: detect,
+		now: () => 100,
+	});
+	expect(detect).not.toHaveBeenCalled();
+	expect(urls[0]).toBe(
+		"http://127.0.0.1:12345/models?refresh_capabilities=1&client_version=1.2.3",
+	);
+});
+
+it("forwards the detected codex version to a running proxy refresh when none is stored", async () => {
+	const { refreshAndPrintModelInventory } = await import(
+		"../lib/runtime/model-discovery-status.js"
+	);
+	const urls: string[] = [];
+	const load = vi
+		.fn()
+		.mockResolvedValueOnce(null)
+		.mockResolvedValueOnce({ version: 1, checkedAt: 200, entries: [] });
+	await refreshAndPrintModelInventory(vi.fn(), {
+		getBinding: async () => ({
+			running: true,
+			state: { nativeOpenai: true, baseUrl: "http://127.0.0.1:12345", clientApiKey: "k" },
+		}),
+		fetchImpl: (async (url: URL) => {
+			urls.push(String(url));
+			return Response.json({ models: [] });
+		}) as unknown as typeof fetch,
+		loadInventory: load,
+		detectClientVersion: async () => "0.160.1",
+		now: () => 100,
+	});
+	expect(urls).toEqual([
+		"http://127.0.0.1:12345/models?refresh_capabilities=1&client_version=0.160.1",
+	]);
+});
+
+it("forwards client_version to the models catalog when discoverModelInventory is given one", async () => {
+	const storage = {
+		version: 3 as const,
+		activeIndex: 0,
+		activeIndexByFamily: {},
+		accounts: [
+			{
+				accountId: "acct-1",
+				refreshToken: "rt",
+				accessToken: "at",
+				expiresAt: Date.now() + 3600_000,
 				addedAt: 1,
 				lastUsed: 1,
 			},
 		],
 	};
 	const urls: string[] = [];
-	const fetcher = vi.fn(async (url: string | URL) => {
-		urls.push(String(url));
-		return Response.json({ models: [{ slug: "fixture-model" }] });
-	});
 	await discoverModelInventory(storage, [], {
-		fetchImpl: fetcher as typeof fetch,
-		resolveClientVersion: () => "0.162.1",
-	});
-	expect(new URL(urls[0]!).searchParams.get("client_version")).toBe("0.162.1");
-	urls.length = 0;
-	await discoverModelInventory(storage, [], {
-		fetchImpl: fetcher as typeof fetch,
 		clientVersion: "0.160.1",
-		resolveClientVersion: () => "0.162.1",
-	});
-	expect(new URL(urls[0]!).searchParams.get("client_version")).toBe("0.160.1");
-	urls.length = 0;
-	await discoverModelInventory(storage, [], { fetchImpl: fetcher as typeof fetch });
-	expect(new URL(urls[0]!).searchParams.has("client_version")).toBe(false);
-});
-
-it("launches a Codex package entry through node and reuses that version until reset", async () => {
-	const { readInstalledCodexVersion, resetInstalledCodexVersionForTests } = await import(
-		"../lib/runtime/model-discovery-status.js"
-	);
-	const packageEntry = "C:\\prefix\\node_modules\\@openai\\codex\\bin\\codex.js";
-	const spawn = vi.fn(() => ({ status: 0, stdout: "codex-cli 0.162.1\n", stderr: "" }));
-	const lookup = {
-		resolveBin: () => ({ path: packageEntry, launchWithNode: true }),
-		spawn,
-	};
-	expect(await readInstalledCodexVersion(lookup)).toBe("0.162.1");
-	expect(spawn.mock.calls[0]?.[0]).toBe(process.execPath);
-	expect(spawn.mock.calls[0]?.[1]).toEqual([packageEntry, "--version"]);
-	expect(await readInstalledCodexVersion(lookup)).toBe("0.162.1");
-	expect(spawn).toHaveBeenCalledTimes(1);
-	resetInstalledCodexVersionForTests();
-	expect(await readInstalledCodexVersion(lookup)).toBe("0.162.1");
-	expect(spawn).toHaveBeenCalledTimes(2);
-});
-
-it("spawns a native Codex executable directly", async () => {
-	const { readInstalledCodexVersion } = await import("../lib/runtime/model-discovery-status.js");
-	const spawn = vi.fn(() => ({ status: 0, stdout: "codex-cli 0.160.1\n", stderr: "" }));
-	expect(
-		await readInstalledCodexVersion({
-			resolveBin: () => ({ path: "/usr/bin/codex", launchWithNode: false }),
-			spawn,
-		}),
-	).toBe("0.160.1");
-	expect(spawn.mock.calls[0]?.[0]).toBe("/usr/bin/codex");
-	expect(spawn.mock.calls[0]?.[1]).toEqual(["--version"]);
-});
-
-it("retries a Codex version lookup that did not succeed", async () => {
-	const { readInstalledCodexVersion } = await import("../lib/runtime/model-discovery-status.js");
-	const spawn = vi.fn(() => ({ status: 1, stdout: "", stderr: "missing" }));
-	const lookup = {
-		resolveBin: () => ({ path: "/usr/bin/codex", launchWithNode: false as const }),
-		spawn,
-	};
-	expect(await readInstalledCodexVersion(lookup)).toBeUndefined();
-	expect(await readInstalledCodexVersion(lookup)).toBeUndefined();
-	expect(spawn).toHaveBeenCalledTimes(2);
-});
-
-it("sends and saves the installed Codex version ahead of the stored inventory", async () => {
-	const { readInstalledCodexVersion, refreshAndPrintModelInventory, loadModelInventory } =
-		await import("../lib/runtime/model-discovery-status.js");
-	await readInstalledCodexVersion({
-		resolveBin: () => ({ path: "/usr/bin/codex", launchWithNode: false }),
-		spawn: () => ({ status: 0, stdout: "codex-cli 0.162.1\n", stderr: "" }),
-	});
-	const urls: string[] = [];
-	await refreshAndPrintModelInventory(vi.fn(), {
-		getBinding: async () => ({ running: false, state: null }),
-		loadInventory: async () => ({
-			version: 1 as const,
-			checkedAt: 1,
-			clientVersion: "0.1.0",
-			entries: [],
-		}),
-		loadAccounts: async () => ({
-			version: 3 as const,
-			activeIndex: 0,
-			activeIndexByFamily: {},
-			accounts: [
-				{
-					accountId: "fixture-account",
-					refreshToken: "fixture-refresh",
-					accessToken: "fixture-access",
-					expiresAt: Date.now() + 3600000,
-					addedAt: 1,
-					lastUsed: 1,
-				},
-			],
-		}),
-		fetchImpl: (async (url: string | URL) => {
+		fetchImpl: (async (url: URL) => {
 			urls.push(String(url));
-			return Response.json({ models: [{ slug: "fixture-model" }] });
-		}) as typeof fetch,
+			return Response.json({ models: [{ slug: "model-a" }] });
+		}) as unknown as typeof fetch,
 	});
-	expect(new URL(urls[0]!).searchParams.get("client_version")).toBe("0.162.1");
-	expect((await loadModelInventory())?.clientVersion).toBe("0.162.1");
-});
-
-it("keeps the stored catalog version when Codex version detection finds nothing usable", async () => {
-	const { refreshAndPrintModelInventory, loadModelInventory } = await import(
-		"../lib/runtime/model-discovery-status.js"
-	);
-	const urls: string[] = [];
-	await refreshAndPrintModelInventory(vi.fn(), {
-		getBinding: async () => ({ running: false, state: null }),
-		resolveClientVersion: () => "not a version",
-		loadInventory: async () => ({
-			version: 1 as const,
-			checkedAt: 1,
-			clientVersion: "0.160.1",
-			entries: [],
-		}),
-		loadAccounts: async () => ({
-			version: 3 as const,
-			activeIndex: 0,
-			activeIndexByFamily: {},
-			accounts: [
-				{
-					accountId: "fixture-account",
-					refreshToken: "fixture-refresh",
-					accessToken: "fixture-access",
-					expiresAt: Date.now() + 3600000,
-					addedAt: 1,
-					lastUsed: 1,
-				},
-			],
-		}),
-		fetchImpl: (async (url: string | URL) => {
-			urls.push(String(url));
-			return Response.json({ models: [{ slug: "fixture-model" }] });
-		}) as typeof fetch,
-	});
-	expect(new URL(urls[0]!).searchParams.get("client_version")).toBe("0.160.1");
-	expect((await loadModelInventory())?.clientVersion).toBe("0.160.1");
-});
-
-it("asks a running proxy to refresh with the installed version instead of the stored one", async () => {
-	const { readInstalledCodexVersion, refreshAndPrintModelInventory } = await import(
-		"../lib/runtime/model-discovery-status.js"
-	);
-	await readInstalledCodexVersion({
-		resolveBin: () => ({ path: "/usr/bin/codex", launchWithNode: false }),
-		spawn: () => ({ status: 0, stdout: "codex-cli 0.162.1\n", stderr: "" }),
-	});
-	const urls: string[] = [];
-	const inventory = { version: 1 as const, checkedAt: 200, clientVersion: "1.2.3", entries: [] };
-	await refreshAndPrintModelInventory(vi.fn(), {
-		getBinding: async () => ({
-			running: true,
-			state: {
-				nativeOpenai: true,
-				baseUrl: "http://127.0.0.1:12345",
-				clientApiKey: "fixture-token",
-			},
-		}),
-		loadInventory: vi.fn().mockResolvedValueOnce(inventory).mockResolvedValueOnce(inventory),
-		fetchImpl: (async (url: string | URL) => {
-			urls.push(String(url));
-			return Response.json({ models: [] });
-		}) as typeof fetch,
-		now: () => 100,
-	});
-	expect(urls[0]).toBe(
-		"http://127.0.0.1:12345/models?refresh_capabilities=1&client_version=0.162.1",
-	);
+	expect(urls[0]).toContain("client_version=0.160.1");
 });
 
 it("merges concurrent checks' probe results instead of replacing the shared cache", async () => {
