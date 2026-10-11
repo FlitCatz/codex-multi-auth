@@ -6,8 +6,9 @@ import { ApiModelCapabilities, type ProbeResult } from "./api-model-capabilities
 import { getAppBindStatus } from "./app-bind.js";
 import { isRecord } from "../utils.js";
 import { spawnSync } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { modelScopeId, workspaceModelScopes } from "./workspace-model-scopes.js";
 import { AccountManager } from "../accounts.js";
@@ -29,6 +30,24 @@ import { withRetry } from "../fs-retry.js";
 /** Same shape as the saved inventory `clientVersion` field. */
 const CATALOG_CLIENT_VERSION = /^[0-9A-Za-z.+_-]{1,80}$/;
 
+type CodexExecutable = { path: string; launchWithNode: boolean };
+
+type CodexVersionSpawn = (
+	command: string,
+	args: readonly string[],
+	options: {
+		encoding: "utf8";
+		timeout: number;
+		windowsHide: true;
+		stdio: ["ignore", "pipe", "pipe"];
+	},
+) => { status: number | null; stdout?: string | null; stderr?: string | null };
+
+export type InstalledCodexVersionLookup = {
+	resolveBin?: () => Promise<CodexExecutable | null> | CodexExecutable | null;
+	spawn?: CodexVersionSpawn;
+};
+
 /** Pull `0.160.1` out of `codex --version` (`codex-cli 0.160.1`). */
 export function parseCodexCliVersion(output: string): string | undefined {
 	const match = /(?:^|\s)codex-cli\s+([0-9A-Za-z.+_-]+)/.exec(output);
@@ -37,41 +56,111 @@ export function parseCodexCliVersion(output: string): string | undefined {
 	return version;
 }
 
-let installedCodexVersion: string | undefined | null = null;
+function acceptCatalogClientVersion(value?: string): string | undefined {
+	const version = value?.trim();
+	if (version && version.length <= 80 && CATALOG_CLIENT_VERSION.test(version)) return version;
+	return undefined;
+}
 
-/** One process-wide lookup. A missing binary or a bad status is "unknown", not a throw. */
-export function readInstalledCodexVersion(): string | undefined {
-	if (installedCodexVersion !== null) return installedCodexVersion;
-	installedCodexVersion = undefined;
-	try {
-		const result = spawnSync("codex", ["--version"], {
-			encoding: "utf8",
-			timeout: 3000,
-			windowsHide: true,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		if (result.status === 0) {
-			installedCodexVersion = parseCodexCliVersion(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
+/** Node plus the package entry for a `.js` bin; the native image otherwise. Never a `.cmd` shim. */
+export function codexVersionCommand(bin: CodexExecutable): { command: string; args: string[] } | undefined {
+	const path = bin.path.trim();
+	if (!path) return undefined;
+	if (bin.launchWithNode) return { command: process.execPath, args: [path, "--version"] };
+	return { command: path, args: ["--version"] };
+}
+
+let installedCodexVersion: string | undefined | null = null;
+let resolveRealCodexBin: (() => unknown) | null = null;
+
+/** Clears the successful-version cache and the loaded binary resolver. */
+export function resetInstalledCodexVersionForTests(): void {
+	installedCodexVersion = null;
+	resolveRealCodexBin = null;
+}
+
+function resolverModuleUrl(): URL | undefined {
+	const candidates = [
+		new URL("../../scripts/codex-bin-resolver.js", import.meta.url),
+		new URL("../../../scripts/codex-bin-resolver.js", import.meta.url),
+	];
+	return candidates.find((url) => {
+		try {
+			return existsSync(fileURLToPath(url));
+		} catch {
+			return false;
 		}
-	} catch {
-		installedCodexVersion = undefined;
+	});
+}
+
+async function defaultResolveBin(): Promise<CodexExecutable | null> {
+	if (!resolveRealCodexBin) {
+		const url = resolverModuleUrl();
+		if (!url) return null;
+		const loaded: unknown = await import(url.href);
+		if (!isRecord(loaded) || typeof loaded.resolveRealCodexBin !== "function") return null;
+		const resolve = loaded.resolveRealCodexBin as () => unknown;
+		resolveRealCodexBin = () => resolve();
 	}
-	return installedCodexVersion;
+	const bin: unknown = resolveRealCodexBin();
+	if (!isRecord(bin) || typeof bin.path !== "string" || typeof bin.launchWithNode !== "boolean") return null;
+	return { path: bin.path, launchWithNode: bin.launchWithNode };
 }
 
 /**
- * Stored inventory version wins. Otherwise ask `detect` (the installed `codex` CLI
- * by default). ChatGPT rejects `/codex/models` when this query param is absent.
+ * A successful lookup is reused for this process. A miss is not cached, so a
+ * later check can see a Codex install that was not there the first time.
+ * `lookup` is for tests; production uses `scripts/codex-bin-resolver.js`.
+ */
+export async function readInstalledCodexVersion(
+	lookup: InstalledCodexVersionLookup = {},
+): Promise<string | undefined> {
+	if (installedCodexVersion !== null) return installedCodexVersion;
+	let found: string | undefined;
+	try {
+		const bin = await (lookup.resolveBin ?? defaultResolveBin)();
+		const command = bin ? codexVersionCommand(bin) : undefined;
+		if (command) {
+			const result = (lookup.spawn ?? spawnSync)(command.command, command.args, {
+				encoding: "utf8",
+				timeout: 3000,
+				windowsHide: true,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			if (result.status === 0)
+				found = parseCodexCliVersion(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
+		}
+	} catch {
+		found = undefined;
+	}
+	if (found) installedCodexVersion = found;
+	return found;
+}
+
+/**
+ * An explicit version wins. Otherwise `detect`. Callers that have a saved
+ * inventory version must not pass it here: a newer installed CLI has to be
+ * able to replace it.
  */
 export function resolveCatalogClientVersion(
 	explicit?: string,
-	detect: () => string | undefined = readInstalledCodexVersion,
+	detect: () => string | undefined = () => undefined,
 ): string | undefined {
-	const stored = explicit?.trim();
-	if (stored && stored.length <= 80 && CATALOG_CLIENT_VERSION.test(stored)) return stored;
-	const found = detect()?.trim();
-	if (found && found.length <= 80 && CATALOG_CLIENT_VERSION.test(found)) return found;
-	return undefined;
+	return acceptCatalogClientVersion(explicit) ?? acceptCatalogClientVersion(detect());
+}
+
+/** Installed CLI version, then the last saved inventory version. */
+export async function resolveRefreshCatalogClientVersion(
+	stored?: string,
+	detect: () => string | undefined | Promise<string | undefined> = readInstalledCodexVersion,
+): Promise<string | undefined> {
+	let detected: string | undefined;
+	try {
+		detected = await detect();
+	} catch {
+		detected = undefined;
+	}
+	return acceptCatalogClientVersion(detected) ?? acceptCatalogClientVersion(stored);
 }
 
 const printable = z
@@ -347,11 +436,18 @@ export async function refreshAndPrintModelInventory(
 		now?: () => number;
 		/** Only an explicit `check capabilities` bypasses the 15-minute probe cache. */
 		forceProbes?: boolean;
+		/** Installed Codex version. Defaults to `codex --version` via the bin resolver. */
+		resolveClientVersion?: () => string | undefined | Promise<string | undefined>;
+		loadAccounts?: typeof loadAccounts;
 	} = {},
 ): Promise<boolean> {
 	try {
 		const load = deps.loadInventory ?? loadModelInventory;
 		const previous = await load();
+		const clientVersion = await resolveRefreshCatalogClientVersion(
+			previous?.clientVersion,
+			deps.resolveClientVersion,
+		);
 		const binding = await (deps.getBinding ?? getAppBindStatus)();
 		if (binding.running && binding.state?.nativeOpenai) {
 			const started = (deps.now ?? Date.now)();
@@ -369,8 +465,7 @@ export async function refreshAndPrintModelInventory(
 			url.pathname = "/models";
 			url.searchParams.set("refresh_capabilities", "1");
 			if (deps.forceProbes) url.searchParams.set("force_probes", "1");
-			if (previous?.clientVersion)
-				url.searchParams.set("client_version", previous.clientVersion);
+			if (clientVersion) url.searchParams.set("client_version", clientVersion);
    const clientApiKey = binding.state.clientApiKey;
    const current = await withCheckProgress("Refreshing workspace catalogs and API/ZDR probes", async () => {
 			const response = await (deps.fetchImpl ?? fetch)(url, {
@@ -399,10 +494,11 @@ export async function refreshAndPrintModelInventory(
   const value = await withCheckProgress("Discovering workspace models and API/ZDR capabilities", async () => {
         let apiConfigurationUnavailable = false;
 		const value = await discoverModelInventory(
-			await loadAccounts(),
+			await (deps.loadAccounts ?? loadAccounts)(),
 			await loadApiRoutes().catch(() => {apiConfigurationUnavailable=true;log("API configuration unavailable; checking subscription models only.");return [];}),
 			{
-				clientVersion: resolveCatalogClientVersion(previous?.clientVersion),
+				clientVersion,
+				fetchImpl: deps.fetchImpl,
 				updateApiDiscovery: updateApiModelDiscovery,
 				forceProbes: deps.forceProbes === true,
 				persistProbes: true,
