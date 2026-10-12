@@ -2352,6 +2352,7 @@ async function handleRequestInner(
 						policy: policyDecision,
 						pinnedIndex,
 						now: state.now(),
+						transcriptionRateLimitUntilByRecordId: state.transcriptionRateLimitUntilByRecordId,
 						preferredIndex,
 						fallbackPinnedIndex: state.nativeOpenai ? storageMeta.pinnedAccountIndex : null,
 						skipReasons: accountSkipReasons,
@@ -2428,6 +2429,52 @@ async function handleRequestInner(
 							1,
 							Math.min(accountCount, state.maxRuntimeAccountAttempts),
 						);
+						if (runtimePolicyState) {
+							try {
+								const reloadedPolicyDecision = await evaluateRuntimePolicy({
+									state: runtimePolicyState,
+									accounts: accountManager.getAccountsSnapshot(),
+									model: context.model,
+									now: state.now(),
+								});
+								policyDecision = reloadedPolicyDecision;
+								mutateRuntimeObservabilitySnapshot((snapshot) => {
+									snapshot.policyBlockedIndexes = [...reloadedPolicyDecision.blockedAccountIndexes];
+									snapshot.policyBlockedReasons = Object.fromEntries(
+										[...reloadedPolicyDecision.blockedAccountIndexes].map((index) => [String(index), "policy-blocked"]),
+									);
+								});
+								if (!reloadedPolicyDecision.allowed) {
+									await usageRecorder.record({
+										outcome: "blocked",
+										statusCode: reloadedPolicyDecision.statusCode,
+										errorCode: reloadedPolicyDecision.errorCode,
+									});
+									writeJson(res, reloadedPolicyDecision.statusCode, {
+										error: {
+											message: "Runtime policy blocked this local request.",
+											code: reloadedPolicyDecision.errorCode ?? "policy_blocked",
+											reasons: reloadedPolicyDecision.reasons,
+										},
+									});
+									return;
+								}
+							} catch (error) {
+								state.status.lastError = error instanceof Error ? error.message : String(error);
+								await usageRecorder.record({
+									outcome: "failure",
+									statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
+									errorCode: "runtime_policy_unavailable",
+								});
+								writeJson(res, HTTP_STATUS.SERVICE_UNAVAILABLE, {
+									error: {
+										message: "Runtime policy could not be loaded for this local request.",
+										code: "runtime_policy_unavailable",
+									},
+								});
+								return;
+							}
+						}
 						accountSkipReasons.clear();
 						attemptedIndexes.clear();
 						continue;
@@ -2582,7 +2629,12 @@ async function handleRequestInner(
 				continue;
 			}
 
-			const pendingScopes = workspaceCandidates.get(refreshed.account.index);
+			let pendingScopes = workspaceCandidates.get(refreshed.account.index);
+			if (isTranscribeRequest) {
+				pendingScopes = workspaceModelScopes(refreshed.account)
+					.filter((scope) => scope.routable)
+					.sort((a, b) => Number(b.selected) - Number(a.selected) || Number(b.bound) - Number(a.bound));
+			}
    // Revalidate enabled scopes after token refresh; never write a per-request choice to the account.
    const enabledScopes = new Set(workspaceModelScopes(refreshed.account).filter(s=>s.routable).map(s=>s.id));
    while(pendingScopes?.length && !enabledScopes.has(pendingScopes[0]?.id ?? "")) pendingScopes.shift();
@@ -2846,6 +2898,16 @@ async function handleRequestInner(
 			if (upstream.status === HTTP_STATUS.TOO_MANY_REQUESTS) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
 				if (isTranscribeRequest) {
+					const retryAfterMs =
+						parseRetryAfterHeaderMs(upstream.headers, state.now()) ??
+						parseRetryAfterBodyMs(bodyText, state.now()) ??
+						60_000;
+					if (refreshed.account.recordId) {
+						state.transcriptionRateLimitUntilByRecordId.set(
+							refreshed.account.recordId,
+							state.now() + Math.max(1_000, Math.floor(retryAfterMs)),
+						);
+					}
 					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
 					res.end(bodyText);
 					await usageRecorder.record({
@@ -3323,6 +3385,9 @@ async function handleRequestInner(
 			// neither completed nor failed. That says nothing about the account.
 			const clientDisconnected = !forwarded && !streamErrored && !res.writableEnded;
 			if (forwarded && upstream.ok) {
+				if (isTranscribeRequest && refreshed.account.recordId) {
+					state.transcriptionRateLimitUntilByRecordId.delete(refreshed.account.recordId);
+				}
 				if (!isTranscribeRequest) {
 					accountManager.recordSuccess(refreshed.account, context.family, context.model);
 					recordRuntimeAccountRecovery(refreshed.account.index);

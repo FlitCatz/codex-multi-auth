@@ -26,6 +26,7 @@ export function chooseTranscriptionAccount(params: {
 	policy: RuntimePolicyDecision | null;
 	pinnedIndex: number | null;
 	now: number;
+	transcriptionRateLimitUntilByRecordId?: ReadonlyMap<string, number>;
 	preferredIndex?: number | null;
 	fallbackPinnedIndex?: number | null;
 	skipReasons?: Map<number, string>;
@@ -36,6 +37,7 @@ export function chooseTranscriptionAccount(params: {
 		policy,
 		pinnedIndex,
 		now,
+		transcriptionRateLimitUntilByRecordId,
 		preferredIndex,
 		fallbackPinnedIndex,
 		skipReasons,
@@ -53,6 +55,12 @@ export function chooseTranscriptionAccount(params: {
 			typeof account.coolingDownUntil === "number" &&
 			account.coolingDownUntil > now
 		) return "cooling-down:auth-failure";
+		const transcriptionRateLimitUntil = account.recordId
+			? transcriptionRateLimitUntilByRecordId?.get(account.recordId)
+			: undefined;
+		if (typeof transcriptionRateLimitUntil === "number" && transcriptionRateLimitUntil > now) {
+			return "transcription-rate-limited";
+		}
 		if (policy?.blockedAccountIndexes.has(index)) return "policy-blocked";
 		if (attemptedIndexes.has(index)) return "already-attempted";
 		return null;

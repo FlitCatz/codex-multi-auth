@@ -1799,6 +1799,16 @@ export class AccountManager {
 					return null;
 				}
 
+				const liveAccount = this.getAccountByIdentity(source, auth);
+				// Credential rotation proves auth health only. It must not erase an
+				// unrelated inference network/server/rate-limit backoff that happens
+				// to be live on the same account.
+				const preserveNonAuthCooldown =
+					liveAccount?.cooldownReason !== undefined &&
+					liveAccount.cooldownReason !== "auth-failure" &&
+					typeof liveAccount.coolingDownUntil === "number" &&
+					liveAccount.coolingDownUntil > nowMs();
+
 				storedAccount.refreshToken = auth.refresh;
 				storedAccount.accessToken = auth.access;
 				storedAccount.expiresAt = auth.expires;
@@ -1818,10 +1828,14 @@ export class AccountManager {
 				storedAccount.enabled = undefined;
 				delete storedAccount.authInvalidatedAt;
 				delete storedAccount.authInvalidationErrorCode;
-				delete storedAccount.coolingDownUntil;
-				delete storedAccount.cooldownReason;
+				if (preserveNonAuthCooldown && liveAccount) {
+					storedAccount.coolingDownUntil = liveAccount.coolingDownUntil;
+					storedAccount.cooldownReason = liveAccount.cooldownReason;
+				} else {
+					delete storedAccount.coolingDownUntil;
+					delete storedAccount.cooldownReason;
+				}
 
-				const liveAccount = this.getAccountByIdentity(source, auth);
 				if (liveAccount) {
 					const previousLiveAccountState = {
 						access: liveAccount.access,
@@ -1841,7 +1855,7 @@ export class AccountManager {
 
 					this.updateFromAuth(liveAccount, auth);
 					liveAccount.enabled = true;
-					this.clearAccountCooldown(liveAccount);
+					if (!preserveNonAuthCooldown) this.clearAccountCooldown(liveAccount);
 					this.clearAuthFailures(liveAccount);
 
 					try {

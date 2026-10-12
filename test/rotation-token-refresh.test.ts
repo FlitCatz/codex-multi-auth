@@ -143,6 +143,38 @@ describe("ensureFreshAccessToken", () => {
 		});
 	});
 
+	it("preserves a live non-auth inference cooldown when transcription refreshes credentials", async () => {
+		const cooldownUntil = NOW + 120_000;
+		const accountManager = managerWith(STALE_EXPIRES, {
+			coolingDownUntil: cooldownUntil,
+			cooldownReason: "network-error",
+		});
+		let persisted: AccountStorageV3 | null = null;
+		withAccountStorageTransactionMock.mockImplementationOnce(async (handler) =>
+			handler(null, async (storage) => {
+				persisted = structuredClone(storage);
+			}),
+		);
+		queuedRefreshMock.mockResolvedValue({
+			type: "success",
+			access: "access-new",
+			refresh: "refresh-new",
+			expires: NOW + 7_200_000,
+		});
+
+		const result = await ensureFreshAccessToken(refreshParams(accountManager));
+
+		expect(result).toMatchObject({ ok: true, accessToken: "access-new" });
+		expect(accountManager.getAccountByIndex(0)).toMatchObject({
+			coolingDownUntil: cooldownUntil,
+			cooldownReason: "network-error",
+		});
+		expect(persisted?.accounts[0]).toMatchObject({
+			coolingDownUntil: cooldownUntil,
+			cooldownReason: "network-error",
+		});
+	});
+
 	it("falls back to the refresh result's token when the commit cannot resolve the account", async () => {
 		const accountManager = managerWith(STALE_EXPIRES);
 		const original = accountManager.getAccountByIndex(0);

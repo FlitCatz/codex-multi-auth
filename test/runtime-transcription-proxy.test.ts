@@ -95,6 +95,25 @@ async function postTranscribe(
 	});
 }
 
+async function postResponses(
+	proxy: RuntimeRotationProxyServer,
+	sessionId: string,
+): Promise<Response> {
+	return fetch(`${proxy.baseUrl}/codex/responses`, {
+		method: "POST",
+		headers: {
+			authorization: `Bearer ${CLIENT_KEY}`,
+			"content-type": "application/json",
+		},
+		body: JSON.stringify({
+			model: "gpt-5-codex",
+			stream: true,
+			input: [{ type: "message", role: "user", content: "hi" }],
+			metadata: { session_id: sessionId },
+		}),
+	});
+}
+
 beforeEach(() => {
 	resetTrackers();
 	clearCircuitBreakers();
@@ -202,6 +221,32 @@ describe("runtime transcription proxy", () => {
 		expect(proxy.getStatus().lunaReserveFallbacks ?? 0).toBe(0);
 	});
 
+	it("skips a transcription-rate-limited credential on the next request", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) =>
+			attempt === 1
+				? new Response(JSON.stringify({ error: { code: "rate_limit_exceeded" } }), {
+					status: HTTP_STATUS.TOO_MANY_REQUESTS,
+					headers: { "content-type": "application/json", "retry-after": "60" },
+				})
+				: new Response(JSON.stringify({ text: "second credential" }), {
+					status: HTTP_STATUS.OK,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const first = await postTranscribe(proxy, Buffer.from("--first--\r\n"));
+		const second = await postTranscribe(proxy, Buffer.from("--second--\r\n"));
+
+		expect(first.status).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+		expect(second.status).toBe(HTTP_STATUS.OK);
+		expect(calls).toHaveLength(2);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-1");
+		expect(calls[1]?.headers.get("authorization")).toBe("Bearer access-2");
+		expect(proxy.getStatus().rotations).toBe(0);
+	});
+
 	it("forwards Cloudflare 403 once without rotating or disabling accounts", async () => {
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
 		const { calls, fetchImpl } = createRecordingFetch(() =>
@@ -262,6 +307,36 @@ describe("runtime transcription proxy", () => {
 		expect(proxy.getStatus().rotations).toBe(0);
 	});
 
+	it("uses request-local enabled workspace scope without mutating the saved selection", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const account = manager.getAccountByIndex(0);
+		if (!account) throw new Error("missing test account");
+		account.accountId = "workspace-bound";
+		account.workspaces = [
+			{ id: "workspace-bound", name: "Bound", enabled: true },
+			{ id: "workspace-selected", name: "Selected", enabled: true },
+		];
+		account.currentWorkspaceIndex = 1;
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "workspace" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const selected = await postTranscribe(proxy, Buffer.from("--selected--\r\n"));
+		expect(selected.status).toBe(HTTP_STATUS.OK);
+		expect(calls[0]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("workspace-selected");
+		expect(account.currentWorkspaceIndex).toBe(1);
+
+		account.workspaces[1]!.enabled = false;
+		const fallback = await postTranscribe(proxy, Buffer.from("--fallback--\r\n"));
+		expect(fallback.status).toBe(HTTP_STATUS.OK);
+		expect(calls[1]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("workspace-bound");
+		expect(account.currentWorkspaceIndex).toBe(1);
+	});
+
 	it("honors auth-failure cooldowns while selecting a transcription credential", async () => {
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
 		const first = manager.getAccountByIndex(0);
@@ -315,6 +390,80 @@ describe("runtime transcription proxy", () => {
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.headers.get("authorization")).toBe("Bearer repaired-access");
 		expect(repaired.getAccountByIndex(0)?.rateLimitResetTimes.codex).toBe(expectedRateLimit);
+	});
+
+	it("preserves inference updates that arrive while credential reload is pending", async () => {
+		const now = Date.now();
+		const manager = new AccountManager(undefined, createStorage(now, 1));
+		const stale = manager.getAccountByIndex(0);
+		if (!stale) throw new Error("missing stale test account");
+		manager.markAuthInvalidated(stale, "test_invalidated");
+
+		const repairedStorage = createStorage(now, 1);
+		const repairedRow = repairedStorage.accounts[0];
+		if (!repairedRow) throw new Error("missing repaired storage row");
+		repairedRow.accessToken = "repaired-access";
+		const repaired = new AccountManager(undefined, repairedStorage);
+		let signalLoadStarted!: () => void;
+		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
+		let releaseLoad!: () => void;
+		const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+		vi.spyOn(AccountManager, "loadFromDisk").mockImplementation(async () => {
+			signalLoadStarted();
+			await loadGate;
+			return repaired;
+		});
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "repaired" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const pending = postTranscribe(proxy, Buffer.from("--x--\r\n"));
+		await loadStarted;
+		manager.markRateLimitedWithReason(stale, 90_000, "codex", "quota", null);
+		const concurrentRateLimit = stale.rateLimitResetTimes.codex;
+		releaseLoad();
+		const response = await pending;
+
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		expect(calls).toHaveLength(1);
+		expect(repaired.getAccountByIndex(0)?.rateLimitResetTimes.codex).toBe(concurrentRateLimit);
+	});
+
+	it("re-evaluates runtime policy after credential reload before routing audio", async () => {
+		const now = Date.now();
+		const manager = new AccountManager(undefined, createStorage(now, 1));
+		const stale = manager.getAccountByIndex(0);
+		if (!stale) throw new Error("missing stale test account");
+		manager.markAuthInvalidated(stale, "test_invalidated");
+
+		const repaired = new AccountManager(undefined, createStorage(now, 1));
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(repaired);
+		const baseDecision = {
+			allowed: true,
+			statusCode: 200,
+			errorCode: null,
+			reasons: [],
+			projectKey: null,
+			scoreBoostByAccount: {},
+			budgetEvaluations: [],
+		};
+		const policySpy = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy")
+			.mockResolvedValueOnce({ ...baseDecision, blockedAccountIndexes: new Set<number>() })
+			.mockResolvedValue({ ...baseDecision, blockedAccountIndexes: new Set<number>([0]) });
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "should not run" }), { status: HTTP_STATUS.OK }),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const response = await postTranscribe(proxy, Buffer.from("--policy--\r\n"));
+
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(policySpy).toHaveBeenCalledTimes(2);
+		expect(calls).toHaveLength(0);
 	});
 
 	it("ignores inference rate limits and preserves them after transcription", async () => {
@@ -391,6 +540,49 @@ describe("runtime transcription proxy", () => {
 		expect(manager.getCurrentAccountForFamily("codex")?.index).toBe(0);
 		expect(markSwitched).not.toHaveBeenCalled();
 		expect(markSwitchedLocked).not.toHaveBeenCalled();
+	});
+
+	it("does not change concurrent inference selection with the routing mutex enabled", async () => {
+		const previousMutex = process.env.CODEX_AUTH_ROUTING_MUTEX;
+		process.env.CODEX_AUTH_ROUTING_MUTEX = "enabled";
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		let releaseTranscription: (() => void) | undefined;
+		const transcriptionGate = new Promise<void>((resolve) => { releaseTranscription = resolve; });
+		let markTranscriptionStarted: (() => void) | undefined;
+		const transcriptionStarted = new Promise<void>((resolve) => { markTranscriptionStarted = resolve; });
+		const { calls, fetchImpl } = createRecordingFetch(async (call) => {
+			if (call.url.endsWith("/transcribe")) {
+				markTranscriptionStarted?.();
+				await transcriptionGate;
+				return new Response(JSON.stringify({ text: "voice" }), {
+					status: HTTP_STATUS.OK,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("data: forwarded\n\n", {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "text/event-stream" },
+			});
+		});
+		const proxy = await startProxy(manager, fetchImpl);
+		if (previousMutex === undefined) delete process.env.CODEX_AUTH_ROUTING_MUTEX;
+		else process.env.CODEX_AUTH_ROUTING_MUTEX = previousMutex;
+		expect(manager.getRoutingMutexMode()).toBe("enabled");
+
+		const transcription = postTranscribe(proxy, Buffer.from("--voice--\r\n"));
+		await transcriptionStarted;
+		const inference = await postResponses(proxy, "concurrent-inference");
+		expect(inference.status).toBe(HTTP_STATUS.OK);
+		await inference.text();
+		releaseTranscription?.();
+		const transcriptionResponse = await transcription;
+		expect(transcriptionResponse.status).toBe(HTTP_STATUS.OK);
+
+		const transcriptionCall = calls.find((call) => call.url.endsWith("/transcribe"));
+		const inferenceCall = calls.find((call) => call.url.endsWith("/codex/responses"));
+		expect(transcriptionCall?.headers.get("authorization")).toBe("Bearer access-1");
+		expect(inferenceCall?.headers.get("authorization")).toBe("Bearer access-1");
+		expect(manager.getCurrentAccountForFamily("codex")?.index).toBe(0);
 	});
 
 	it("forwards an ordinary transcription 401 once without inference failure or rotation", async () => {

@@ -87,8 +87,15 @@ export async function ensureFreshAccessToken(params: {
 	| { ok: true; accessToken: string; account: ManagedAccount }
 	| { ok: false; retryable: boolean; invalidated?: boolean }
 > {
-	const { accountManager, account, family, model, now, tokenRefreshSkewMs, tokenInvalidationCooldownMs } =
-		params;
+	const {
+		accountManager,
+		account,
+		family,
+		model,
+		now,
+		tokenRefreshSkewMs,
+		tokenInvalidationCooldownMs,
+	} = params;
 	if (hasUsableAccessToken(account, now, tokenRefreshSkewMs)) {
 		return { ok: true, accessToken: account.access ?? "", account };
 	}

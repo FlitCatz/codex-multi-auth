@@ -98,6 +98,7 @@ export interface RotationProxyState extends RotationProxyStateInit {
 	lastStaleRuntimeReloadAt: number;
 	credentialReloadPromise: Promise<AccountManager | null> | null;
 	lastCredentialReloadAt: number;
+	readonly transcriptionRateLimitUntilByRecordId: Map<string, number>;
 }
 
 const STALE_RUNTIME_RELOAD_DEDUPE_MS = 1_000;
@@ -129,6 +130,7 @@ export function createRotationProxyState(
 		lastStaleRuntimeReloadAt: 0,
 		credentialReloadPromise: null,
 		lastCredentialReloadAt: 0,
+		transcriptionRateLimitUntilByRecordId: new Map<string, number>(),
 	};
 }
 
@@ -156,9 +158,12 @@ export async function reloadRuntimeCredentials(
 
 	state.credentialReloadPromise = (async () => {
 		const previousManager = state.activeAccountManager;
-		const previousAccounts = previousManager.getAccountsSnapshot();
 		const reloaded = await AccountManager.loadFromDisk();
 		reloaded.setRoutingMutexMode(state.routingMutexMode);
+		// Snapshot only after the disk read resolves. Inference can still update
+		// the old live manager while I/O is pending, and those observations must
+		// be carried into the replacement manager before it becomes active.
+		const previousAccounts = previousManager.getAccountsSnapshot();
 		const freshAccounts = reloaded.getAccountsSnapshot();
 		const claimed = new Set<number>();
 		/** Stable matching key for carrying only runtime observations between credential snapshots. */
