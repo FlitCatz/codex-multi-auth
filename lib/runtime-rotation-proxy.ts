@@ -529,6 +529,9 @@ const ALLOWED_IMAGE_PATHS = new Set([
 	"/v1/images/generations",
 	"/v1/images/edits",
 ]);
+const ALLOWED_TRANSCRIBE_PATHS = new Set<string>([
+	URL_PATHS.TRANSCRIBE,
+]);
 const ALLOWED_THREAD_GOAL_PATHS = new Set([
 	"/thread/goal/get",
 	"/thread/goal/set",
@@ -975,6 +978,23 @@ function buildImageRequestContext(
 	};
 }
 
+function buildTranscribeRequestContext(
+	req: IncomingMessage,
+	body: Buffer,
+): RequestContext {
+	return {
+		body,
+		headers: headersFromIncoming(req),
+		method: "POST",
+		upstreamPath: URL_PATHS.TRANSCRIBE,
+		model: null,
+		family: "codex",
+		stream: false,
+		sessionKey: null,
+		stableSessionKey: null,
+	};
+}
+
 function buildModelsRequestContext(req: IncomingMessage): RequestContext {
 	return {
 		body: Buffer.alloc(0),
@@ -1047,7 +1067,7 @@ function writeMethodOrPathError(res: ServerResponse): void {
 	writeJson(res, 404, {
 		error: {
 			message:
-				"Runtime rotation proxy only accepts Responses API, images, model discovery, and Codex thread goal requests.",
+				"Runtime rotation proxy only accepts Responses API, images, transcription, model discovery, and Codex thread goal requests.",
 			code: "runtime_rotation_proxy_not_found",
 		},
 	});
@@ -1479,12 +1499,14 @@ async function handleRequestInner(
 			req.method === "GET" && isModelsPath(incomingUrl.pathname);
 		const isImageRequest =
 			req.method === "POST" && ALLOWED_IMAGE_PATHS.has(incomingUrl.pathname);
+		const isTranscribeRequest =
+			req.method === "POST" && ALLOWED_TRANSCRIBE_PATHS.has(incomingUrl.pathname);
 		const isThreadGoalRequest =
 			(req.method === "GET" || req.method === "POST") &&
 			isThreadGoalPath(incomingUrl.pathname);
 		if (
 			!isResponsesRequest && !isModelsRequest &&
-			!isThreadGoalRequest && !isImageRequest
+			!isThreadGoalRequest && !isImageRequest && !isTranscribeRequest
 		) {
 			writeMethodOrPathError(res);
 			return;
@@ -1492,7 +1514,7 @@ async function handleRequestInner(
 
 		state.status.totalRequests += 1;
 		let requestBody =
-			isResponsesRequest || isImageRequest ||
+			isResponsesRequest || isImageRequest || isTranscribeRequest ||
 			(isThreadGoalRequest && req.method === "POST")
 				? await readRequestBody(req, state.maxRequestBodyBytes)
 				: Buffer.alloc(0);
@@ -1516,7 +1538,9 @@ async function handleRequestInner(
 				? buildThreadGoalRequestContext(req, requestBody, incomingUrl.pathname)
 				: isImageRequest
 					? buildImageRequestContext(req, requestBody, incomingUrl.pathname)
-						: buildResponsesRequestContext(req, requestBody);
+					: isTranscribeRequest
+						? buildTranscribeRequestContext(req, requestBody)
+							: buildResponsesRequestContext(req, requestBody);
 		if (isResponsesRequest) {
 			context.headers.delete("content-encoding");
 			context.headers.delete("content-length");
@@ -1571,7 +1595,9 @@ async function handleRequestInner(
 					? "thread-goal"
 					: isImageRequest
 						? "images"
-						: "responses",
+						: isTranscribeRequest
+							? "transcribe"
+							: "responses",
 			model,
 			projectKey,
 			requestId: traceId,
@@ -2173,9 +2199,10 @@ async function handleRequestInner(
 
 		// The token bucket spreads load across a selectable pool. A pin has no
 		// alternative account, so exhausting that local heuristic can only reject a
-		// request that the pinned account could serve. Keep circuit-breaker admission
-		// inside consumeToken, but do not debit the pool-scoring bucket for a pin.
-		const bypassPoolTokenBucket = isPinned;
+		// request that the pinned account could serve. Transcription is not inference
+		// and must not debit the Codex model pool either. Keep circuit-breaker
+		// admission inside consumeToken for both cases.
+		const bypassPoolTokenBucket = isPinned || isTranscribeRequest;
 		const refundConsumedPoolToken = (account: ManagedAccount): void => {
 			if (!bypassPoolTokenBucket) {
 				accountManager.refundToken(account, context.family, context.model);
@@ -2424,6 +2451,7 @@ async function handleRequestInner(
 				state.now(),
 			);
 			if (
+				!isTranscribeRequest &&
 				context.model !== LUNA_RESERVE_MODEL &&
 				preemptiveDeferral.defer &&
 				preemptiveDeferral.waitMs > 0
@@ -2688,16 +2716,18 @@ async function handleRequestInner(
 					return;
 				}
 				// A timeout may occur after generation; do not retry within this request.
-				if (isImageRequest) {
+				if (isImageRequest || isTranscribeRequest) {
+					const operation = isImageRequest ? "image" : "transcribe";
+					const errorCode = `${operation}_upstream_transport_error`;
 					writeJson(res, 502, {
 						error: {
-							code: "image_upstream_transport_error",
-							message: "Image upstream transport failed; not retried by the proxy.",
+							code: errorCode,
+							message: `${isImageRequest ? "Image" : "Transcription"} upstream transport failed; not retried by the proxy.`,
 						},
 					});
 					await usageRecorder.record({
 						outcome: "failure", statusCode: 502,
-						errorCode: "image_upstream_transport_error", account: refreshed.account,
+						errorCode, account: refreshed.account,
 					});
 					return;
 				}
@@ -2747,7 +2777,7 @@ async function handleRequestInner(
 				}
 			};
 			const quotaSnapshot = readQuotaSchedulerSnapshot(upstream.headers, upstream.status, state.now());
-			if (quotaSnapshot && context.model !== LUNA_RESERVE_MODEL) {
+			if (quotaSnapshot && !isTranscribeRequest && context.model !== LUNA_RESERVE_MODEL) {
 				observeQuota(quotaSnapshot, upstream.headers.get("x-codex-plan-type") ?? undefined);
 			}
 
@@ -2778,6 +2808,17 @@ async function handleRequestInner(
    }
 			if (upstream.status === HTTP_STATUS.TOO_MANY_REQUESTS) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
+				if (isTranscribeRequest) {
+					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
+					res.end(bodyText);
+					await usageRecorder.record({
+						outcome: "failure",
+						statusCode: upstream.status,
+						errorCode: extractErrorCodeFromBody(bodyText) ?? "transcribe_rate_limited",
+						account: refreshed.account,
+					});
+					return;
+				}
 				// Keep the upstream HINT separate from the 60s fallback. Passing the
 				// synthesized default into the capacity wait would make every
 				// hint-less capacity 429 sleep a full minute and leave the 2s/5s/15s
@@ -3034,6 +3075,22 @@ async function handleRequestInner(
 				continue;
 			}
 
+			// Dictation audio may already have been accepted before any error response.
+			// Do not replay it across accounts or let its endpoint-specific status
+			// mutate Codex inference health/quota state. Auth 401 and explicit
+			// workspace-disable handling above remain account-wide signals.
+			if (isTranscribeRequest && upstream.status >= 400) {
+				const forwarded = await forwardStreamingResponse(
+					upstream, res, state.status, () => undefined, state.streamStallTimeoutMs,
+				);
+				await usageRecorder.record({
+					outcome: "failure", statusCode: upstream.status,
+					errorCode: forwarded ? "transcribe_upstream_error" : "stream_forward_failed",
+					account: refreshed.account,
+				});
+				return;
+			}
+
 			// Forward image validation/moderation/5xx errors without cross-account replay.
 			// Explicit 429 quota and 401 auth handling above still use the existing pool.
 			if (isImageRequest && upstream.status >= 400) {
@@ -3120,45 +3177,47 @@ async function handleRequestInner(
 			// "rate-limited") lingers on disk until an explicit runtime reset and
 			// the forecast keeps reporting this working account as unavailable.
 			// No-op when no reason is recorded, so the hot path stays write-free.
-			const quotaDeferral = state.preemptiveQuotaScheduler.getDeferral(
-				quotaScheduleKey,
-				state.now(),
-			);
-			const nearExhaustionWaitMs =
-				context.model === LUNA_RESERVE_MODEL
-					? 0
-					: quotaDeferral.defer
-						? quotaDeferral.waitMs
-						: 0;
-			if (nearExhaustionWaitMs > 0) {
-				accountManager.markRateLimitedWithReason(
-					refreshed.account,
-					nearExhaustionWaitMs,
-					context.family,
-					"quota",
-					context.model,
-				);
-				state.sessionAffinityStore?.forgetSession(context.sessionKey);
-				accountManager.saveToDiskDebounced();
-			} else {
-				state.sessionAffinityStore?.remember(
-					context.sessionKey,
-					refreshed.account.index,
+			if (!isTranscribeRequest) {
+				const quotaDeferral = state.preemptiveQuotaScheduler.getDeferral(
+					quotaScheduleKey,
 					state.now(),
 				);
-				if (refreshed.account.index !== state.lastGlobalAccountIndex) {
-					state.lastGlobalAccountIndex = refreshed.account.index;
+				const nearExhaustionWaitMs =
+					context.model === LUNA_RESERVE_MODEL
+						? 0
+						: quotaDeferral.defer
+							? quotaDeferral.waitMs
+							: 0;
+				if (nearExhaustionWaitMs > 0) {
+					accountManager.markRateLimitedWithReason(
+						refreshed.account,
+						nearExhaustionWaitMs,
+						context.family,
+						"quota",
+						context.model,
+					);
+					state.sessionAffinityStore?.forgetSession(context.sessionKey);
+					accountManager.saveToDiskDebounced();
+				} else {
+					state.sessionAffinityStore?.remember(
+						context.sessionKey,
+						refreshed.account.index,
+						state.now(),
+					);
+					if (refreshed.account.index !== state.lastGlobalAccountIndex) {
+						state.lastGlobalAccountIndex = refreshed.account.index;
+					}
+					state.lastGlobalSwitchAt = state.now();
 				}
-				state.lastGlobalSwitchAt = state.now();
+				await persistRuntimeActiveAccount(
+					accountManager,
+					refreshed.account,
+					context.family,
+					isPinned && refreshed.account.index === pinnedIndex,
+					state.schedulingStrategy,
+					state.nativeOpenai,
+				);
 			}
-			await persistRuntimeActiveAccount(
-				accountManager,
-				refreshed.account,
-				context.family,
-				isPinned && refreshed.account.index === pinnedIndex,
-				state.schedulingStrategy,
-				state.nativeOpenai,
-			);
 
 			// Recover the upstream token counts as the body streams past. Without
 			// them every ledger row lands with all-zero tokens and a zero cost, so
@@ -3169,7 +3228,7 @@ async function handleRequestInner(
 				contentType: upstream.headers.get("content-type"),
 				onEvent: (event) => {
 					responseOutcome.observe(event);
-					if (context.model === LUNA_RESERVE_MODEL) return;
+					if (isTranscribeRequest || context.model === LUNA_RESERVE_MODEL) return;
 					const snapshot = readSubscriptionQuotaEvent(event, state.now());
 					if (!snapshot) return;
 					observeQuota(snapshot, snapshot.planType);
@@ -3185,6 +3244,7 @@ async function handleRequestInner(
 				state.status,
 				() => {
 					streamErrored = true;
+					if (isTranscribeRequest) return;
 					// Deliberately NOT the pre-header transport policy above,
 					// which skips recordFailure (#677). By this point the
 					// upstream accepted the request and began responding, so a
@@ -3213,8 +3273,10 @@ async function handleRequestInner(
 			// neither completed nor failed. That says nothing about the account.
 			const clientDisconnected = !forwarded && !streamErrored && !res.writableEnded;
 			if (forwarded && upstream.ok) {
-				accountManager.recordSuccess(refreshed.account, context.family, context.model);
-				recordRuntimeAccountRecovery(refreshed.account.index);
+				if (!isTranscribeRequest) {
+					accountManager.recordSuccess(refreshed.account, context.family, context.model);
+					recordRuntimeAccountRecovery(refreshed.account.index);
+				}
 			} else if (!clientDisconnected) {
 				state.sessionAffinityStore?.forgetSession(context.sessionKey);
 				const rejection = classifyCapabilityFailure(400, responseOutcome.rejection);
@@ -3241,7 +3303,7 @@ async function handleRequestInner(
 			// it here inflates the measurement by this turn's thinking budget
 			// against a deliberately tight threshold. `outputTokens` is already
 			// reasoning-stripped (lib/usage/usage-extraction.ts).
-			if (usageTokens && context.stableSessionKey && context.model) {
+			if (!isTranscribeRequest && usageTokens && context.stableSessionKey && context.model) {
 				state.contextBudgetGuard.update(context.stableSessionKey, {
 					model: context.model,
 					contextTokens: usageTokens.inputTokens + usageTokens.outputTokens,

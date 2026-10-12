@@ -10,6 +10,7 @@ export type UsageLedgerOperation =
 	| "images"
 	| "models"
 	| "thread-goal"
+	| "transcribe"
 	| "auth-refresh"
 	| "diagnostic"
 	| "unknown";
