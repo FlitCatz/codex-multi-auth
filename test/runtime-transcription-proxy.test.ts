@@ -262,6 +262,105 @@ describe("runtime transcription proxy", () => {
 		expect(proxy.getStatus().rotations).toBe(0);
 	});
 
+	it("ignores inference rate limits and preserves them after transcription", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const account = manager.getAccountByIndex(0);
+		if (!account) throw new Error("missing test account");
+		manager.markRateLimitedWithReason(account, 60_000, "codex", "quota", null);
+		expect(manager.getAccountRuntimeSkipReason(0, "codex", null)).toBe("rate-limited");
+		const consumeToken = vi.spyOn(manager, "consumeTokenWithReason");
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "still works" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const response = await postTranscribe(proxy, Buffer.from("--x--\r\n"));
+
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-1");
+		expect(consumeToken).not.toHaveBeenCalled();
+		expect(manager.getAccountRuntimeSkipReason(0, "codex", null)).toBe("rate-limited");
+	});
+
+	it("does not claim the half-open inference recovery probe", async () => {
+		const now = Date.now();
+		let clock = now;
+		vi.spyOn(Date, "now").mockImplementation(() => clock);
+		const manager = new AccountManager(undefined, createStorage(now, 1));
+		const account = manager.getAccountByIndex(0);
+		if (!account) throw new Error("missing test account");
+		manager.recordFailure(account, "codex", null);
+		manager.recordFailure(account, "codex", null);
+		manager.recordFailure(account, "codex", null);
+		clock += 30_001;
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "probe untouched" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const response = await postTranscribe(proxy, Buffer.from("--x--\r\n"));
+
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		expect(calls).toHaveLength(1);
+		expect(manager.consumeTokenWithReason(account, "codex", null, { bypassTokenBucket: true })).toEqual({ ok: true });
+	});
+
+	it("does not advance the inference cursor when transcription selects another credential", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const first = manager.getAccountByIndex(0);
+		if (!first) throw new Error("missing first test account");
+		manager.markAuthInvalidated(first, "test_invalidated");
+		const markSwitched = vi.spyOn(manager, "markSwitched");
+		const markSwitchedLocked = vi.spyOn(manager, "markSwitchedLocked");
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "second account" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		expect(manager.getCurrentAccountForFamily("codex")?.index).toBe(0);
+		const response = await postTranscribe(proxy, Buffer.from("--x--\r\n"));
+
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-2");
+		expect(manager.getCurrentAccountForFamily("codex")?.index).toBe(0);
+		expect(markSwitched).not.toHaveBeenCalled();
+		expect(markSwitchedLocked).not.toHaveBeenCalled();
+	});
+
+	it("forwards an ordinary transcription 401 once without inference failure or rotation", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const recordFailure = vi.spyOn(manager, "recordFailure");
+		const markCooldown = vi.spyOn(manager, "markAccountCoolingDown");
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ error: { code: "unauthorized", message: "not authorized" } }), {
+				status: HTTP_STATUS.UNAUTHORIZED,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const response = await postTranscribe(proxy, Buffer.from("--x--\r\n"));
+		const payload = (await response.json()) as { error: { code: string } };
+
+		expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+		expect(payload.error.code).toBe("unauthorized");
+		expect(calls).toHaveLength(1);
+		expect(recordFailure).not.toHaveBeenCalled();
+		expect(markCooldown).not.toHaveBeenCalled();
+		expect(proxy.getStatus().rotations).toBe(0);
+	});
+
 	it("keeps explicit token invalidation semantics for 401", async () => {
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
 		const invalidationBody = JSON.stringify({

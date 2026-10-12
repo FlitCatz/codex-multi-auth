@@ -1,5 +1,5 @@
 import { compareSubscriptionQuota, usesSubscriptionReserve, type SubscriptionQuotaPreference } from "./subscription-quota-order.js";
-import type { AccountManager, ManagedAccount } from "../accounts.js";
+import { AUTH_INVALIDATION_MARKER, type AccountManager, type ManagedAccount } from "../accounts.js";
 import type { ModelFamily } from "../prompts/codex.js";
 import type { RuntimePolicyDecision } from "../policy/runtime-policy.js";
 import type { SessionAffinityStore } from "../session-affinity.js";
@@ -11,6 +11,90 @@ import type { SessionAffinityStore } from "../session-affinity.js";
  */
 function isCooldownReason(reason: string): boolean {
 	return reason === "cooling-down" || reason.startsWith("cooling-down:");
+}
+
+/**
+ * Select a managed credential for transcription without consulting or mutating
+ * Codex inference health, quota, cooldown, circuit-breaker, affinity, or cursor
+ * state. Transcription shares account authentication and workspace policy with
+ * inference, but it is a separately admitted operation and must not inherit
+ * model-runtime backpressure.
+ */
+export function chooseTranscriptionAccount(params: {
+	accountManager: AccountManager;
+	attemptedIndexes: ReadonlySet<number>;
+	policy: RuntimePolicyDecision | null;
+	pinnedIndex: number | null;
+	preferredIndex?: number | null;
+	fallbackPinnedIndex?: number | null;
+	skipReasons?: Map<number, string>;
+}): ManagedAccount | null {
+	const {
+		accountManager,
+		attemptedIndexes,
+		policy,
+		pinnedIndex,
+		preferredIndex,
+		fallbackPinnedIndex,
+		skipReasons,
+	} = params;
+
+	/** Return only credential-level blockers; inference runtime health is intentionally ignored. */
+	const credentialReason = (index: number): string | null => {
+		const account = accountManager.getAccountByIndex(index);
+		if (!account) return "missing";
+		if (account.enabled === false) return "disabled";
+		if (!accountManager.hasEnabledWorkspaces(account)) return "workspace-disabled";
+		if (accountManager.isAccountAuthInvalidated(account)) return AUTH_INVALIDATION_MARKER;
+		if (policy?.blockedAccountIndexes.has(index)) return "policy-blocked";
+		if (attemptedIndexes.has(index)) return "already-attempted";
+		return null;
+	};
+
+	/** Resolve one candidate while preserving a diagnostic skip reason for rejected credentials. */
+	const eligible = (index: number): ManagedAccount | null => {
+		const reason = credentialReason(index);
+		if (reason) {
+			skipReasons?.set(index, reason);
+			return null;
+		}
+		return accountManager.getAccountByIndex(index);
+	};
+
+	if (typeof pinnedIndex === "number") return eligible(pinnedIndex);
+
+	if (typeof fallbackPinnedIndex === "number") {
+		const fallback = eligible(fallbackPinnedIndex);
+		if (fallback) return fallback;
+	}
+
+	let candidates = accountManager.getAccountsSnapshot().filter((account) =>
+		credentialReason(account.index) === null,
+	);
+	if (!candidates.length) {
+		for (const account of accountManager.getAccountsSnapshot()) {
+			const reason = credentialReason(account.index);
+			if (reason) skipReasons?.set(account.index, reason);
+		}
+		return null;
+	}
+
+	if (policy?.priorityByAccount) {
+		const tier = Math.min(...candidates.map((account) =>
+			policy.priorityByAccount?.[account.index] ?? 1,
+		));
+		candidates = candidates.filter((account) =>
+			(policy.priorityByAccount?.[account.index] ?? 1) === tier,
+		);
+	}
+
+	if (typeof preferredIndex === "number") {
+		const preferred = candidates.find((account) => account.index === preferredIndex);
+		if (preferred) return accountManager.getAccountByIndex(preferred.index);
+	}
+
+	const first = candidates[0];
+	return first ? accountManager.getAccountByIndex(first.index) : null;
 }
 
 /**

@@ -119,7 +119,7 @@ import {
 	withTimeout,
 } from "./request/stream-failover-runtime.js";
 import { getAccountRecoveryBoundsForFamily } from "./runtime/account-status.js";
-import { chooseAccount } from "./runtime/rotation-account-selection.js";
+import { chooseAccount, chooseTranscriptionAccount } from "./runtime/rotation-account-selection.js";
 import {
 	createRotationProxyState,
 	recoverStaleRuntimeState,
@@ -2200,8 +2200,8 @@ async function handleRequestInner(
 		// The token bucket spreads load across a selectable pool. A pin has no
 		// alternative account, so exhausting that local heuristic can only reject a
 		// request that the pinned account could serve. Transcription is not inference
-		// and must not debit the Codex model pool either. Keep circuit-breaker
-		// admission inside consumeToken for both cases.
+		// and must not debit the Codex model pool or claim its inference circuit probe.
+		// Transcription uses credential-only admission below.
 		const bypassPoolTokenBucket = isPinned || isTranscribeRequest;
 		const refundConsumedPoolToken = (account: ManagedAccount): void => {
 			if (!bypassPoolTokenBucket) {
@@ -2343,13 +2343,25 @@ async function handleRequestInner(
       if(scope)subscriptionQuotaByAccount[index]=subscriptionQuotaPreference(quotaForScope(account,scope),state.now());
      }
     }
+				const attemptedForSelection = new Set([...attemptedIndexes, ...catalogExcludedIndexes()]);
+				if (isTranscribeRequest) {
+					return chooseTranscriptionAccount({
+						accountManager,
+						attemptedIndexes: attemptedForSelection,
+						policy: policyDecision,
+						pinnedIndex,
+						preferredIndex,
+						fallbackPinnedIndex: state.nativeOpenai ? storageMeta.pinnedAccountIndex : null,
+						skipReasons: accountSkipReasons,
+					});
+				}
 				const result=chooseAccount({
 					accountManager,
 					sessionAffinityStore: state.sessionAffinityStore,
 					sessionKey: context.sessionKey,
 					family: context.family,
 					model: context.model,
-					attemptedIndexes: new Set([...attemptedIndexes, ...catalogExcludedIndexes()]),
+					attemptedIndexes: attemptedForSelection,
 					now: state.now(),
 					policy: policyDecision,
 					pinnedIndex,
@@ -2375,6 +2387,7 @@ async function handleRequestInner(
 							const candidate = selectAccount();
 							if (
 								candidate &&
+								!isTranscribeRequest &&
 								pinnedIndex === null &&
 								state.schedulingStrategy !== "sequential"
 							) {
@@ -2399,6 +2412,7 @@ async function handleRequestInner(
             for (const index of catalogExcludedIndexes()) accountSkipReasons.set(index, "model-not-supported");
 			if (!selected) {
 				if (
+					!isTranscribeRequest &&
 					!reloadedAfterNoAccount &&
 					!isPinned &&
 					accountCount > 0 &&
@@ -2475,17 +2489,18 @@ async function handleRequestInner(
 				continue;
 			}
 
-			// consumeToken also takes the race-safe circuit admission slot, so it
-			// can reject for either gate. Take the reason from the call that
-			// rejected rather than re-deriving it: a second evaluation reports the
-			// first blocker it finds (a live cooldown would mask a drained bucket)
-			// and cannot see a half-open probe slot that was just claimed.
-			const admission = accountManager.consumeTokenWithReason(
-				selected,
-				context.family,
-				context.model,
-				{ bypassTokenBucket: bypassPoolTokenBucket },
-			);
+			// Inference consumes both the pool token and the race-safe circuit probe.
+			// Transcription deliberately bypasses both: its credential-only selector
+			// already enforced disabled/workspace/auth/policy gates, and claiming the
+			// inference probe here could strand a half-open account after dictation.
+			const admission = isTranscribeRequest
+				? { ok: true as const }
+				: accountManager.consumeTokenWithReason(
+					selected,
+					context.family,
+					context.model,
+					{ bypassTokenBucket: bypassPoolTokenBucket },
+				);
 			if (!admission.ok) {
 				accountSkipReasons.set(selected.index, admission.reason);
 				exhaustionReason = "rate-limit";
@@ -3024,7 +3039,9 @@ async function handleRequestInner(
 			if (upstream.status === HTTP_STATUS.UNAUTHORIZED) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
 				refundConsumedPoolToken(refreshed.account);
-				accountManager.recordFailure(refreshed.account, context.family, context.model);
+				if (!isTranscribeRequest) {
+					accountManager.recordFailure(refreshed.account, context.family, context.model);
+				}
 				if (isTokenInvalidationError(bodyText)) {
 					// The upstream explicitly revoked this OAuth token. Applying a long
 					// cooldown prevents cascade invalidation: rapidly presenting each
@@ -3060,6 +3077,17 @@ async function handleRequestInner(
 					});
 					return;
 				}
+				if (isTranscribeRequest) {
+					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
+					res.end(bodyText);
+					await usageRecorder.record({
+						outcome: "failure",
+						statusCode: upstream.status,
+						errorCode: extractErrorCodeFromBody(bodyText) ?? "transcribe_unauthorized",
+						account: refreshed.account,
+					});
+					return;
+				}
 				applyMonotonicAuthCooldown(
 					accountManager,
 					refreshed.account,
@@ -3077,8 +3105,8 @@ async function handleRequestInner(
 
 			// Dictation audio may already have been accepted before any error response.
 			// Do not replay it across accounts or let its endpoint-specific status
-			// mutate Codex inference health/quota state. Auth 401 and explicit
-			// workspace-disable handling above remain account-wide signals.
+			// mutate Codex inference health/quota state. Explicit token invalidation
+			// and workspace-disable handling above remain account-wide signals.
 			if (isTranscribeRequest && upstream.status >= 400) {
 				const forwarded = await forwardStreamingResponse(
 					upstream, res, state.status, () => undefined, state.streamStallTimeoutMs,
