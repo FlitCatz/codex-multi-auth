@@ -342,6 +342,8 @@ codex-multi-auth account policy list [--json]
   pick tiers 1–9, 9 recommended). A stored `switch` pin is strict and overrides
   tiers entirely. Eligibility (requested model/reasoning/speed) is filtered
   before priority applies. `account policy list` and `status` show priorities.
+  In sequential mode, equal-priority accounts follow saved list order; quota
+  reset timing and active-account preference do not change that order.
 - `tag` values normalize to lowercase filesystem-safe labels and interact with
   routing-profile preferred/avoid tags.
 

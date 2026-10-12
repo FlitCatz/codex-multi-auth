@@ -16,7 +16,7 @@ Using OpenCode rather than the Codex CLI? The sibling project [`oc-codex-multi-a
 ## What it does
 
 - **Account pool** — OAuth login for multiple ChatGPT accounts, stored locally under `~/.codex/multi-auth` (files `0600`, directories `0700`), with per-project pools under `projects/<project-key>/`.
-- **Switching and selection** — pin an account, pick the forecast-best one, or let health- and quota-aware hybrid selection rotate for you.
+- **Switching and selection** — pin an account, pick the forecast-best one, follow saved account order within eligible priority tiers with sequential scheduling, or let health- and quota-aware hybrid selection rotate for you.
 - **Runtime rotation** — a default-on, loopback-only proxy that forwards Responses API and model-discovery traffic through the best available account during wrapper-launched Codex sessions.
 - **Diagnostics and repair** — status, live health checks, quota forecasts, JSON reports, and `fix`/`doctor`/`verify` commands that recover stale or damaged local state.
 - **Luna Reserve fallback** — treats `gpt-reserve` as a separately metered Luna allowance, automatically falls back after a genuine Luna quota 429, and exposes the Reserve percentage through `limits --json --refresh`.

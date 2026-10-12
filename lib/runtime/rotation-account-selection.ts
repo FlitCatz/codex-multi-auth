@@ -119,8 +119,11 @@ export function chooseAccount(params: {
   }
 		const tier = Math.min(...candidates.map(a => priorities[a.index] ?? 1));
 		const tierIndexes = new Set(candidates.filter(a => (priorities[a.index] ?? 1) === tier).map(a => a.index));
-		let preferred = params.preferredIndex;
-  if (quotaByAccount) {
+		// Sequential priority ties follow saved order, not quota reset timing.
+		let preferred = schedulingStrategy === "sequential"
+			? candidates.find(account => tierIndexes.has(account.index))?.index
+			: params.preferredIndex;
+  if (quotaByAccount && schedulingStrategy !== "sequential") {
    // Rank only measured accounts: "no data" compares equal to everything, which
    // is not transitive and would make the winner depend on storage order.
    const ranked = candidates.flatMap(a=>{
