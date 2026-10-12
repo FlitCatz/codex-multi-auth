@@ -287,7 +287,7 @@ describe("runtime transcription proxy", () => {
 		const baseNow = Date.now();
 		vi.spyOn(Date, "now").mockReturnValue(baseNow);
 		const manager = new AccountManager(undefined, createStorage(baseNow, 2));
-		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager);
+		const reloadSpy = vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager);
 		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) =>
 			new Response(JSON.stringify({ error: { code: "rate_limit_exceeded" } }), {
 				status: HTTP_STATUS.TOO_MANY_REQUESTS,
@@ -309,6 +309,33 @@ describe("runtime transcription proxy", () => {
 		expect(exhausted.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
 		expect(payload.error.retry_after_ms).toBe(30_000);
 		expect(calls).toHaveLength(2);
+		expect(reloadSpy).not.toHaveBeenCalled();
+	});
+
+	it("waits for the latest auth and transcription deadline on one credential", async () => {
+		const baseNow = Date.now();
+		vi.spyOn(Date, "now").mockReturnValue(baseNow);
+		const manager = new AccountManager(undefined, createStorage(baseNow, 1));
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager);
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ error: { code: "rate_limit_exceeded" } }), {
+				status: HTTP_STATUS.TOO_MANY_REQUESTS,
+				headers: { "content-type": "application/json", "retry-after": "60" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		expect((await postTranscribe(proxy, Buffer.from("--first--\r\n"))).status)
+			.toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+		const account = manager.getAccountByIndex(0);
+		if (!account) throw new Error("missing test account");
+		manager.markAccountCoolingDown(account, 30_000, "auth-failure");
+		const blocked = await postTranscribe(proxy, Buffer.from("--blocked--\r\n"));
+		const payload = (await blocked.json()) as { error: { retry_after_ms: number } };
+
+		expect(blocked.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(payload.error.retry_after_ms).toBe(60_000);
+		expect(calls).toHaveLength(1);
 	});
 
 	it("clamps a huge transcription Retry-After to the shared maximum", async () => {
@@ -379,7 +406,7 @@ describe("runtime transcription proxy", () => {
 		const after = await postTranscribe(proxy, Buffer.from("--after--\r\n"));
 		expect(after.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
 		expect(calls).toHaveLength(2);
-		expect(loadFromDisk).toHaveBeenCalledTimes(1);
+		expect(loadFromDisk).not.toHaveBeenCalled();
 	});
 
 	it("keeps the longest overlapping transcription backoff window", async () => {
@@ -419,7 +446,7 @@ describe("runtime transcription proxy", () => {
 		const afterShortWindow = await postTranscribe(proxy, Buffer.from("--after-short--\r\n"));
 		expect(afterShortWindow.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
 		expect(calls).toHaveLength(2);
-		expect(loadFromDisk).toHaveBeenCalledTimes(1);
+		expect(loadFromDisk).not.toHaveBeenCalled();
 	});
 
 	it("forwards Cloudflare 403 once without rotating or disabling accounts", async () => {
@@ -527,6 +554,37 @@ describe("runtime transcription proxy", () => {
 
 		expect(first.status).toBe(HTTP_STATUS.OK);
 		expect(second.status).toBe(HTTP_STATUS.OK);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-1");
+		expect(calls[1]?.headers.get("authorization")).toBe("Bearer access-2");
+		expect(manager.getCurrentAccountForFamily("codex")?.index).toBe(0);
+	});
+
+	it("round-robins native transcription independently of the inference preference", async () => {
+		const now = Date.now();
+		const storage = createStorage(now, 2);
+		const manager = new AccountManager(undefined, structuredClone(storage));
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "ok" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		openManagers.push(manager);
+		const proxy = await startRuntimeRotationProxy({
+			nativeOpenai: true,
+			readNativeAccountStorage: async () => structuredClone(storage),
+			accountManager: manager,
+			fetchImpl,
+			upstreamBaseUrl: "https://example.test/backend-api",
+			clientApiKey: CLIENT_KEY,
+			quotaRemainingPercentThreshold: 10,
+		});
+		openServers.push(proxy);
+
+		expect((await postTranscribe(proxy, Buffer.from("--native-one--\r\n"))).status)
+			.toBe(HTTP_STATUS.OK);
+		expect((await postTranscribe(proxy, Buffer.from("--native-two--\r\n"))).status)
+			.toBe(HTTP_STATUS.OK);
 		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-1");
 		expect(calls[1]?.headers.get("authorization")).toBe("Bearer access-2");
 		expect(manager.getCurrentAccountForFamily("codex")?.index).toBe(0);

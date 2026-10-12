@@ -2357,7 +2357,9 @@ async function handleRequestInner(
 						now: state.now(),
 						transcriptionRateLimitUntilByRecordId: state.transcriptionRateLimitUntilByRecordId,
 						startIndex: state.transcriptionNextAccountIndex,
-						preferredIndex,
+						// Native inference preference must not pin dictation to the current
+						// Responses account; transcription owns an independent round-robin cursor.
+						preferredIndex: null,
 						fallbackPinnedIndex: state.nativeOpenai ? storageMeta.pinnedAccountIndex : null,
 						skipReasons: accountSkipReasons,
 					});
@@ -2422,10 +2424,18 @@ async function handleRequestInner(
 					: selectAccount();
             for (const index of catalogExcludedIndexes()) accountSkipReasons.set(index, "model-not-supported");
 			if (!selected) {
+				const transcriptionBlockedOnlyByEndpointBackoff =
+					isTranscribeRequest &&
+					accountSkipReasons.size > 0 &&
+					(policyDecision?.blockedAccountIndexes.size ?? 0) === 0 &&
+					[...accountSkipReasons.values()].every(
+						(reason) => reason === "transcription-rate-limited",
+					);
 				if (
 					isTranscribeRequest &&
 					!state.nativeOpenai &&
-					!reloadedAfterNoAccount
+					!reloadedAfterNoAccount &&
+					!transcriptionBlockedOnlyByEndpointBackoff
 				) {
 					reloadedAfterNoAccount = true;
 					const reloadedManager = await reloadRuntimeCredentials(state);
@@ -3651,16 +3661,29 @@ async function handleRequestInner(
 					const now = state.now();
 					let minWaitMs: number | null = null;
 					for (const [index, skipReason] of accountSkipReasons) {
+						if (
+							skipReason !== "transcription-rate-limited" &&
+							skipReason !== "cooling-down:auth-failure"
+						) continue;
+						if (policyDecision?.blockedAccountIndexes.has(index)) continue;
 						const account = accountManager.getAccountByIndex(index);
 						if (!account) continue;
-						let until: number | undefined;
-						if (skipReason === "transcription-rate-limited" && account.recordId) {
-							until = state.transcriptionRateLimitUntilByRecordId.get(account.recordId);
-						} else if (skipReason === "cooling-down:auth-failure") {
-							until = account.coolingDownUntil;
-						}
-						if (typeof until !== "number" || until <= now) continue;
-						const waitMs = until - now;
+						const transcriptionUntil = account.recordId
+							? state.transcriptionRateLimitUntilByRecordId.get(account.recordId)
+							: undefined;
+						const authUntil =
+							account.cooldownReason === "auth-failure" &&
+							typeof account.coolingDownUntil === "number"
+								? account.coolingDownUntil
+								: undefined;
+						const readyAt = Math.max(
+							typeof transcriptionUntil === "number" && transcriptionUntil > now
+								? transcriptionUntil
+								: 0,
+							typeof authUntil === "number" && authUntil > now ? authUntil : 0,
+						);
+						if (readyAt <= now) continue;
+						const waitMs = readyAt - now;
 						minWaitMs = minWaitMs === null ? waitMs : Math.min(minWaitMs, waitMs);
 					}
 					return minWaitMs ?? 0;

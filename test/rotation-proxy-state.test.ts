@@ -114,7 +114,12 @@ describe("reloadRuntimeCredentials", () => {
 		const state = createRotationProxyState(stateInit());
 		const previous = state.activeAccountManager.getAccountByIndex(0);
 		if (!previous) throw new Error("missing previous account");
-		const reloaded = new AccountManager(undefined, storageWith(1));
+		previous.accountIdSource = "token";
+		const reloadedStorage = storageWith(1);
+		reloadedStorage.accounts[0]!.accountIdSource = "token";
+		reloadedStorage.accounts[0]!.workspaces = [{ id: "workspace-preserved", enabled: true }];
+		reloadedStorage.accounts[0]!.currentWorkspaceIndex = 0;
+		const reloaded = new AccountManager(undefined, reloadedStorage);
 		let signalLoadStarted!: () => void;
 		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
 		let releaseLoad!: () => void;
@@ -130,6 +135,9 @@ describe("reloadRuntimeCredentials", () => {
 		previous.access = "rotated-access";
 		previous.refreshToken = "rotated-refresh";
 		previous.expires = NOW + 7_200_000;
+		previous.accountId = "acc_rotated";
+		previous.accountIdSource = "token";
+		previous.email = "rotated@example.com";
 		releaseLoad();
 
 		const result = await pending;
@@ -137,7 +145,49 @@ describe("reloadRuntimeCredentials", () => {
 		expect(active?.access).toBe("rotated-access");
 		expect(active?.refreshToken).toBe("rotated-refresh");
 		expect(active?.expires).toBe(NOW + 7_200_000);
+		expect(active?.accountId).toBe("acc_rotated");
+		expect(active?.accountIdSource).toBe("token");
+		expect(active?.email).toBe("rotated@example.com");
+		expect(active?.workspaces).toEqual([{ id: "workspace-preserved", enabled: true }]);
+		expect(active?.currentWorkspaceIndex).toBe(0);
 		expect(state.activeAccountManager).toBe(reloaded);
+	});
+
+	it("keeps an explicit disk workspace binding while carrying rotated tokens", async () => {
+		const state = createRotationProxyState(stateInit());
+		const previous = state.activeAccountManager.getAccountByIndex(0);
+		if (!previous) throw new Error("missing previous account");
+		previous.accountIdSource = "token";
+		const reloadedStorage = storageWith(1);
+		reloadedStorage.accounts[0]!.accountId = "workspace-manual";
+		reloadedStorage.accounts[0]!.accountIdSource = "manual";
+		reloadedStorage.accounts[0]!.workspaces = [{ id: "workspace-manual", enabled: true }];
+		const reloaded = new AccountManager(undefined, reloadedStorage);
+		let signalLoadStarted!: () => void;
+		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
+		let releaseLoad!: () => void;
+		const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+		loadFromDisk.mockImplementationOnce(async () => {
+			signalLoadStarted();
+			await loadGate;
+			return reloaded;
+		});
+
+		const pending = reloadRuntimeCredentials(state);
+		await loadStarted;
+		previous.access = "rotated-access";
+		previous.refreshToken = "rotated-refresh";
+		previous.expires = NOW + 7_200_000;
+		previous.accountId = "token-workspace-new";
+		previous.accountIdSource = "token";
+		releaseLoad();
+
+		const active = (await pending)?.getAccountByIndex(0);
+		expect(active?.access).toBe("rotated-access");
+		expect(active?.refreshToken).toBe("rotated-refresh");
+		expect(active?.accountId).toBe("workspace-manual");
+		expect(active?.accountIdSource).toBe("manual");
+		expect(active?.workspaces).toEqual([{ id: "workspace-manual", enabled: true }]);
 	});
 });
 

@@ -197,12 +197,23 @@ export async function reloadRuntimeCredentials(
 					(identity): identity is string => identity !== null,
 				),
 			);
-			const matched = candidates.find((account) =>
-				account.recordId && account.recordId === previous.recordId,
-			) ?? candidates.find((account) => {
+			const identityMatched = candidates.find((account) => {
 				const identity = identityOf(account);
 				return identity !== null && identities.has(identity);
 			});
+			const stableEmail = sanitizeEmail(previous.email) ?? sanitizeEmail(baseline?.email);
+			const emailMatches = stableEmail
+				? candidates.filter((account) => sanitizeEmail(account.email) === stableEmail)
+				: [];
+			const refreshMatches = candidates.filter((account) =>
+				account.refreshToken === previous.refreshToken ||
+				(baseline !== undefined && account.refreshToken === baseline.refreshToken),
+			);
+			const matched = candidates.find((account) =>
+				account.recordId && account.recordId === previous.recordId,
+			) ?? identityMatched
+				?? (emailMatches.length === 1 ? emailMatches[0] : undefined)
+				?? (refreshMatches.length === 1 ? refreshMatches[0] : undefined);
 			if (!matched) continue;
 			claimed.add(matched.index);
 			const live = reloaded.getAccountByIndex(matched.index);
@@ -216,6 +227,21 @@ export async function reloadRuntimeCredentials(
 				live.access = previous.access;
 				live.refreshToken = previous.refreshToken;
 				live.expires = previous.expires;
+				const tokenBoundIdentityChanged = baseline !== undefined && (
+					baseline.accountId !== previous.accountId ||
+					baseline.accountIdSource !== previous.accountIdSource
+				);
+				const liveHasExplicitBinding =
+					live.accountIdSource === "manual" || live.accountIdSource === "org";
+				const previousHasTokenBinding =
+					previous.accountIdSource === "token" || previous.accountIdSource === "id_token";
+				if (tokenBoundIdentityChanged && previousHasTokenBinding && !liveHasExplicitBinding) {
+					live.accountId = previous.accountId;
+					live.accountIdSource = previous.accountIdSource;
+				}
+				if (baseline !== undefined && baseline.email !== previous.email) {
+					live.email = previous.email;
+				}
 			}
 			for (const [key, until] of Object.entries(previous.rateLimitResetTimes)) {
 				if (typeof until === "number" && until > state.now()) {
