@@ -20,7 +20,7 @@ vi.mock("../lib/runtime/runtime-observability.js", async (importOriginal) => {
 	};
 });
 
-const { createRotationProxyState, recoverStaleRuntimeState } = await import(
+const { createRotationProxyState, recoverStaleRuntimeState, reloadRuntimeCredentials } = await import(
 	"../lib/runtime/rotation-proxy-state.js"
 );
 
@@ -181,6 +181,51 @@ describe("recoverStaleRuntimeState", () => {
 		expect(first).toBe(reloaded);
 		expect(second).toBe(reloaded);
 		expect(loadFromDisk).toHaveBeenCalledTimes(1);
+	});
+
+	it("shares an in-flight stale recovery with credential-only reloads", async () => {
+		const state = createRotationProxyState(stateInit());
+		const recovered = new AccountManager(undefined, storageWith(2));
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		loadFromDisk.mockImplementationOnce(async () => {
+			await gate;
+			return recovered;
+		});
+
+		const stalePending = recoverStaleRuntimeState(state);
+		const credentialPending = reloadRuntimeCredentials(state);
+		release();
+		const [staleResult, credentialResult] = await Promise.all([stalePending, credentialPending]);
+
+		expect(staleResult).toBe(recovered);
+		expect(credentialResult).toBe(recovered);
+		expect(state.activeAccountManager).toBe(recovered);
+		expect(loadFromDisk).toHaveBeenCalledTimes(1);
+	});
+
+	it("runs stale recovery after an earlier credential reload finishes", async () => {
+		const state = createRotationProxyState(stateInit());
+		const credentialReloaded = new AccountManager(undefined, storageWith(2));
+		const staleRecovered = new AccountManager(undefined, storageWith(3));
+		let releaseCredential!: () => void;
+		const credentialGate = new Promise<void>((resolve) => { releaseCredential = resolve; });
+		loadFromDisk
+			.mockImplementationOnce(async () => {
+				await credentialGate;
+				return credentialReloaded;
+			})
+			.mockResolvedValueOnce(staleRecovered);
+
+		const credentialPending = reloadRuntimeCredentials(state);
+		const stalePending = recoverStaleRuntimeState(state);
+		releaseCredential();
+		const [credentialResult, staleResult] = await Promise.all([credentialPending, stalePending]);
+
+		expect(credentialResult).toBe(credentialReloaded);
+		expect(staleResult).toBe(staleRecovered);
+		expect(state.activeAccountManager).toBe(staleRecovered);
+		expect(loadFromDisk).toHaveBeenCalledTimes(2);
 	});
 
 	it("reports a failed reload and allows the next attempt to retry", async () => {

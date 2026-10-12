@@ -27,6 +27,7 @@ export function chooseTranscriptionAccount(params: {
 	pinnedIndex: number | null;
 	now: number;
 	transcriptionRateLimitUntilByRecordId?: ReadonlyMap<string, number>;
+	startIndex?: number | null;
 	preferredIndex?: number | null;
 	fallbackPinnedIndex?: number | null;
 	skipReasons?: Map<number, string>;
@@ -38,6 +39,7 @@ export function chooseTranscriptionAccount(params: {
 		pinnedIndex,
 		now,
 		transcriptionRateLimitUntilByRecordId,
+		startIndex,
 		preferredIndex,
 		fallbackPinnedIndex,
 		skipReasons,
@@ -106,6 +108,12 @@ export function chooseTranscriptionAccount(params: {
 	if (typeof preferredIndex === "number") {
 		const preferred = candidates.find((account) => account.index === preferredIndex);
 		if (preferred) return accountManager.getAccountByIndex(preferred.index);
+	}
+
+	if (typeof startIndex === "number" && candidates.length > 1) {
+		const after = candidates.filter((account) => account.index >= startIndex);
+		const before = candidates.filter((account) => account.index < startIndex);
+		candidates = [...after, ...before];
 	}
 
 	const first = candidates[0];

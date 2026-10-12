@@ -98,6 +98,7 @@ export interface RotationProxyState extends RotationProxyStateInit {
 	lastStaleRuntimeReloadAt: number;
 	credentialReloadPromise: Promise<AccountManager | null> | null;
 	lastCredentialReloadAt: number;
+	transcriptionNextAccountIndex: number;
 	readonly transcriptionRateLimitUntilByRecordId: Map<string, number>;
 }
 
@@ -130,6 +131,7 @@ export function createRotationProxyState(
 		lastStaleRuntimeReloadAt: 0,
 		credentialReloadPromise: null,
 		lastCredentialReloadAt: 0,
+		transcriptionNextAccountIndex: 0,
 		transcriptionRateLimitUntilByRecordId: new Map<string, number>(),
 	};
 }
@@ -151,6 +153,10 @@ export function createRotationProxyState(
 export async function reloadRuntimeCredentials(
 	state: RotationProxyState,
 ): Promise<AccountManager | null> {
+	// Inference stale recovery is destructive by design and takes precedence over
+	// the credential-only refresh. Sharing the in-flight result prevents two
+	// asynchronous loaders from racing to replace activeAccountManager.
+	if (state.staleRuntimeReloadPromise) return state.staleRuntimeReloadPromise;
 	if (Date.now() - state.lastCredentialReloadAt <= STALE_RUNTIME_RELOAD_DEDUPE_MS) {
 		return state.activeAccountManager;
 	}
@@ -222,11 +228,14 @@ export async function reloadRuntimeCredentials(
 export async function recoverStaleRuntimeState(
 	state: RotationProxyState,
 ): Promise<AccountManager | null> {
+	if (state.staleRuntimeReloadPromise) return state.staleRuntimeReloadPromise;
+	// If a non-destructive credential refresh started first, let it publish its
+	// inventory before performing the authoritative stale-state reset. Re-check
+	// the stale promise afterward so concurrent recovery callers still dedupe.
+	if (state.credentialReloadPromise) await state.credentialReloadPromise;
+	if (state.staleRuntimeReloadPromise) return state.staleRuntimeReloadPromise;
 	if (Date.now() - state.lastStaleRuntimeReloadAt <= STALE_RUNTIME_RELOAD_DEDUPE_MS) {
 		return state.activeAccountManager;
-	}
-	if (state.staleRuntimeReloadPromise) {
-		return state.staleRuntimeReloadPromise;
 	}
 	state.staleRuntimeReloadPromise = (async () => {
 		AccountManager.resetVolatileRuntimeState();

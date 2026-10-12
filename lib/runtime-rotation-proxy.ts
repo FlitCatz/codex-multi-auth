@@ -2299,7 +2299,9 @@ async function handleRequestInner(
 
 		let runtimeSelectionIterations = 0;
 		while (
-			(isPinned || attemptedIndexes.size < accountCount) &&
+			(isPinned ||
+				attemptedIndexes.size < accountCount ||
+				(isTranscribeRequest && !state.nativeOpenai && accountCount === 0 && !reloadedAfterNoAccount)) &&
 			transientAttempts < transientAttemptLimit &&
 			(!isPinned ||
 				runtimeSelectionIterations - capacityRetries <
@@ -2346,17 +2348,22 @@ async function handleRequestInner(
     }
 				const attemptedForSelection = new Set([...attemptedIndexes, ...catalogExcludedIndexes()]);
 				if (isTranscribeRequest) {
-					return chooseTranscriptionAccount({
+					const candidate = chooseTranscriptionAccount({
 						accountManager,
 						attemptedIndexes: attemptedForSelection,
 						policy: policyDecision,
 						pinnedIndex,
 						now: state.now(),
 						transcriptionRateLimitUntilByRecordId: state.transcriptionRateLimitUntilByRecordId,
+						startIndex: state.transcriptionNextAccountIndex,
 						preferredIndex,
 						fallbackPinnedIndex: state.nativeOpenai ? storageMeta.pinnedAccountIndex : null,
 						skipReasons: accountSkipReasons,
 					});
+					if (candidate && pinnedIndex === null) {
+						state.transcriptionNextAccountIndex = candidate.index + 1;
+					}
+					return candidate;
 				}
 				const result=chooseAccount({
 					accountManager,
@@ -2911,9 +2918,12 @@ async function handleRequestInner(
 							MAX_RATE_LIMIT_DELAY_MS,
 							Math.max(1_000, Math.floor(retryAfterMs)),
 						);
+						const existingUntil = state.transcriptionRateLimitUntilByRecordId.get(
+							refreshed.account.recordId,
+						) ?? 0;
 						state.transcriptionRateLimitUntilByRecordId.set(
 							refreshed.account.recordId,
-							now + boundedDelayMs,
+							Math.max(existingUntil, now + boundedDelayMs),
 						);
 					}
 					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
@@ -3394,7 +3404,10 @@ async function handleRequestInner(
 			const clientDisconnected = !forwarded && !streamErrored && !res.writableEnded;
 			if (forwarded && upstream.ok) {
 				if (isTranscribeRequest && refreshed.account.recordId) {
-					state.transcriptionRateLimitUntilByRecordId.delete(refreshed.account.recordId);
+					const until = state.transcriptionRateLimitUntilByRecordId.get(refreshed.account.recordId);
+					if (typeof until === "number" && until <= state.now()) {
+						state.transcriptionRateLimitUntilByRecordId.delete(refreshed.account.recordId);
+					}
 				}
 				if (!isTranscribeRequest) {
 					accountManager.recordSuccess(refreshed.account, context.family, context.model);

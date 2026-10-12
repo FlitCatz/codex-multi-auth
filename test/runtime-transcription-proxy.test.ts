@@ -282,6 +282,82 @@ describe("runtime transcription proxy", () => {
 		expect(calls[2]?.headers.get("authorization")).toBe("Bearer access-1");
 	});
 
+	it("keeps a newer transcription backoff when an older request succeeds later", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const loadFromDisk = vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager);
+		let markFirstStarted!: () => void;
+		const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+		const { calls, fetchImpl } = createRecordingFetch(async (_call, attempt) => {
+			if (attempt === 1) {
+				markFirstStarted();
+				await firstGate;
+				return new Response(JSON.stringify({ text: "older success" }), {
+					status: HTTP_STATUS.OK,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response(JSON.stringify({ error: { code: "rate_limit_exceeded" } }), {
+				status: HTTP_STATUS.TOO_MANY_REQUESTS,
+				headers: { "content-type": "application/json", "retry-after": "60" },
+			});
+		});
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const older = postTranscribe(proxy, Buffer.from("--older--\r\n"));
+		await firstStarted;
+		const newer = await postTranscribe(proxy, Buffer.from("--newer--\r\n"));
+		expect(newer.status).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+		releaseFirst();
+		expect((await older).status).toBe(HTTP_STATUS.OK);
+
+		const after = await postTranscribe(proxy, Buffer.from("--after--\r\n"));
+		expect(after.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(calls).toHaveLength(2);
+		expect(loadFromDisk).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps the longest overlapping transcription backoff window", async () => {
+		const baseNow = Date.now();
+		let clock = baseNow;
+		vi.spyOn(Date, "now").mockImplementation(() => clock);
+		const manager = new AccountManager(undefined, createStorage(baseNow, 1));
+		const loadFromDisk = vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager);
+		let markLongStarted!: () => void;
+		const longStarted = new Promise<void>((resolve) => { markLongStarted = resolve; });
+		let releaseLong!: () => void;
+		const longGate = new Promise<void>((resolve) => { releaseLong = resolve; });
+		const { calls, fetchImpl } = createRecordingFetch(async (_call, attempt) => {
+			if (attempt === 1) {
+				markLongStarted();
+				await longGate;
+				return new Response(JSON.stringify({ error: { code: "rate_limit_exceeded" } }), {
+					status: HTTP_STATUS.TOO_MANY_REQUESTS,
+					headers: { "content-type": "application/json", "retry-after": "120" },
+				});
+			}
+			return new Response(JSON.stringify({ error: { code: "rate_limit_exceeded" } }), {
+				status: HTTP_STATUS.TOO_MANY_REQUESTS,
+				headers: { "content-type": "application/json", "retry-after": "60" },
+			});
+		});
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const longer = postTranscribe(proxy, Buffer.from("--long--\r\n"));
+		await longStarted;
+		const shorter = await postTranscribe(proxy, Buffer.from("--short--\r\n"));
+		expect(shorter.status).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+		releaseLong();
+		expect((await longer).status).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+
+		clock = baseNow + 61_000;
+		const afterShortWindow = await postTranscribe(proxy, Buffer.from("--after-short--\r\n"));
+		expect(afterShortWindow.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(calls).toHaveLength(2);
+		expect(loadFromDisk).toHaveBeenCalledTimes(1);
+	});
+
 	it("forwards Cloudflare 403 once without rotating or disabling accounts", async () => {
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
 		const { calls, fetchImpl } = createRecordingFetch(() =>
@@ -370,6 +446,47 @@ describe("runtime transcription proxy", () => {
 		expect(fallback.status).toBe(HTTP_STATUS.OK);
 		expect(calls[1]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("workspace-bound");
 		expect(account.currentWorkspaceIndex).toBe(1);
+	});
+
+	it("round-robins unpinned transcription credentials without moving inference state", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "ok" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const first = await postTranscribe(proxy, Buffer.from("--one--\r\n"));
+		const second = await postTranscribe(proxy, Buffer.from("--two--\r\n"));
+
+		expect(first.status).toBe(HTTP_STATUS.OK);
+		expect(second.status).toBe(HTTP_STATUS.OK);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-1");
+		expect(calls[1]?.headers.get("authorization")).toBe("Bearer access-2");
+		expect(manager.getCurrentAccountForFamily("codex")?.index).toBe(0);
+	});
+
+	it("discovers the first login when the resident transcription pool starts empty", async () => {
+		const now = Date.now();
+		const manager = new AccountManager(undefined, createStorage(now, 0));
+		const repaired = new AccountManager(undefined, createStorage(now, 1));
+		const loadFromDisk = vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(repaired);
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "first login" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const response = await postTranscribe(proxy, Buffer.from("--first-login--\r\n"));
+
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		expect(loadFromDisk).toHaveBeenCalledTimes(1);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-1");
 	});
 
 	it("honors auth-failure cooldowns while selecting a transcription credential", async () => {
