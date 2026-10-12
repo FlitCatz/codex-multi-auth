@@ -2422,7 +2422,7 @@ async function handleRequestInner(
 				) {
 					reloadedAfterNoAccount = true;
 					const reloadedManager = await reloadRuntimeCredentials(state);
-					if (reloadedManager) {
+					if (reloadedManager && reloadedManager !== accountManager) {
 						accountManager = reloadedManager;
 						accountCount = accountManager.getAccountCount();
 						transientAttemptLimit = Math.max(

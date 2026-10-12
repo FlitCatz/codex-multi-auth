@@ -433,6 +433,32 @@ describe("runtime transcription proxy", () => {
 		expect(repaired.getAccountByIndex(0)?.rateLimitResetTimes.codex).toBe(concurrentRateLimit);
 	});
 
+	it("does not treat a deduped credential reload as a fresh selection pass", async () => {
+		const now = Date.now();
+		const manager = new AccountManager(undefined, createStorage(now, 1));
+		const stale = manager.getAccountByIndex(0);
+		if (!stale) throw new Error("missing stale test account");
+		manager.markAuthInvalidated(stale, "test_invalidated");
+
+		const stillInvalid = new AccountManager(undefined, createStorage(now, 1));
+		const reloadedAccount = stillInvalid.getAccountByIndex(0);
+		if (!reloadedAccount) throw new Error("missing reloaded test account");
+		stillInvalid.markAuthInvalidated(reloadedAccount, "still_invalid");
+		const loadFromDisk = vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(stillInvalid);
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "must not run" }), { status: HTTP_STATUS.OK }),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const first = await postTranscribe(proxy, Buffer.from("--first--\r\n"));
+		const second = await postTranscribe(proxy, Buffer.from("--second--\r\n"));
+
+		expect(first.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(second.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(loadFromDisk).toHaveBeenCalledTimes(1);
+		expect(calls).toHaveLength(0);
+	});
+
 	it("re-evaluates runtime policy after credential reload before routing audio", async () => {
 		const now = Date.now();
 		const manager = new AccountManager(undefined, createStorage(now, 1));
