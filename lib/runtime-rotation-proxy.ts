@@ -1324,6 +1324,7 @@ export async function startRuntimeRotationProxy(
 		getOpenConnectionCount: () => sockets.size,
 		getStatus: () => ({
 			...state.status,
+			schedulingStrategy: state.schedulingStrategy,
  websocketConnections: websocketGateway.stats.connections,
  websocketUpstreamRequests: websocketGateway.stats.upstreamRequests,
 			// Redact any email/token material that leaked into a raw upstream or

@@ -264,7 +264,7 @@ export async function runStatusCommand(
  const quotaPreferences = forecastQuotas.map(quota=>subscriptionQuotaPreference(quota,now));
  const automaticOrder = new Map<number,number>();
  if (appBindStatus?.nativeOpenai) {
-  const schedulingStrategy = getSchedulingStrategy(loadPluginConfig());
+  const schedulingStrategy = appBindStatus.schedulingStrategy ?? getSchedulingStrategy(loadPluginConfig());
   let candidates=storage.accounts.map((account,index)=>({account,index,quota:quotaPreferences[index] ?? subscriptionQuotaPreference(null,now),tier:accountPolicies.accounts[getAccountPolicyKey(account,index)]?.priority ?? 1}));
   const useSavedOrder = candidates.some(account => account.tier !== 1);
   candidates = candidates.filter(a=>forecastResults[a.index]?.availability === "ready" && !a.quota.exhausted);

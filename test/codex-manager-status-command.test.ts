@@ -627,11 +627,13 @@ it("shows reset-aware subscription order separately from configured tiers and ma
 });
 
 it.each([
- ["saved order", "sequential", [0, 0, 1], [1, 2, 3], 90],
- ["active cursor", "sequential", [1, 1, 1], [2, 3, 1], 90],
- ["quota order", "hybrid", [0, 0, 1], [2, 1, 3], 90],
- ["reserve fallback", "sequential", [0, 0, 1], [3, 1, 2], 5],
-] as const)("reports %s consistently in native status JSON and text", async (_name, strategy, priorities, expected, firstRemaining) => {
+ ["saved order", "sequential", [0, 0, 1], [1, 2, 3], 90, undefined],
+ ["active cursor", "sequential", [1, 1, 1], [2, 3, 1], 90, undefined],
+ ["quota order", "hybrid", [0, 0, 1], [2, 1, 3], 90, undefined],
+ ["reserve fallback", "sequential", [0, 0, 1], [3, 1, 2], 5, undefined],
+ ["running sequential order", "hybrid", [0, 0, 1], [1, 2, 3], 90, "sequential"],
+ ["running hybrid order", "sequential", [0, 0, 1], [2, 1, 3], 90, "hybrid"],
+] as const)("reports %s consistently in native status JSON and text", async (_name, strategy, priorities, expected, firstRemaining, reportedStrategy) => {
  vi.stubEnv("CODEX_AUTH_SCHEDULING_STRATEGY", strategy);
  try {
   const now = 2000;
@@ -647,7 +649,7 @@ it.each([
    loadAccounts:async()=>({version:3,activeIndex:2,activeIndexByFamily:{codex:2},accounts}),
    loadAccountPolicies:async()=>({version:1,accounts:policies}),
    loadQuotaCache:async()=>({byEmail:{},byAccountId:quota}),
-   loadAppBindStatus:async()=>({nativeOpenai:true,state:"running",pid:123,baseUrl:null,totalRequests:0,lastAccountIndex:null,lastAccountLabel:null,lastAccountEmail:null,lastAccountId:null,updatedAt:now,lastError:null}),
+   loadAppBindStatus:async()=>({nativeOpenai:true,schedulingStrategy:reportedStrategy,state:"running",pid:123,baseUrl:null,totalRequests:0,lastAccountIndex:null,lastAccountLabel:null,lastAccountEmail:null,lastAccountId:null,updatedAt:now,lastError:null}),
   });
   await runStatusCommand(deps);
   const result = JSON.parse(logInfo.mock.calls[0]![0]);

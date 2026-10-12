@@ -405,7 +405,8 @@ configured tiers. Hybrid mode ranks each tier by earliest limiting-window reset
 and remaining percentage. Sequential mode follows saved list order when any
 priority differs from `1`; with all priorities at `1`, it follows the active
 cursor and wraps the saved pool. The text `automatic order` and JSON
-`automaticOrder` fields use the configured scheduling strategy. Requested
+`automaticOrder` fields use the running router's scheduling strategy when
+reported; older routers fall back to the current configuration. Requested
 models/workspaces and live health can still change this cached estimate.
 API/ZDR pools are never automatic paid fallbacks for subscription
 requests, and explicit strict invocation pins bypass the whole order.
