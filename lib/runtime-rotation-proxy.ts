@@ -3545,35 +3545,60 @@ async function handleRequestInner(
 			const evaluatedAtMs = state.now();
 			// Both bounds come from a single pass over the account's records.
 			const pinnedRecoveryBounds =
-				pinnedAccount === null
-					? null
-					: getAccountRecoveryBoundsForFamily(
+				!isTranscribeRequest && pinnedAccount !== null
+					? getAccountRecoveryBoundsForFamily(
 							pinnedAccount,
 							evaluatedAtMs,
 							context.family,
 							context.model,
-						);
+						)
+					: null;
 			const pinnedStateRecoveryAtMs =
 				pinnedRecoveryBounds?.recoveryAtMs ?? null;
 			// An open circuit outlives the short failure cooldowns that tripped
 			// it; its deadline lives in the breaker, not the account record.
+			// Transcription intentionally ignores the inference circuit entirely.
 			const pinnedCircuitRecoveryAtMs =
-				pinnedAccount === null
-					? null
-					: accountManager.getCircuitRecoveryTime(pinnedAccount, evaluatedAtMs);
-			const pinnedResetAtMs =
-				pinnedBlockedPermanently ||
-				(pinnedStateRecoveryAtMs === null && pinnedCircuitRecoveryAtMs === null)
-					? null
-					: Math.max(
+				!isTranscribeRequest && pinnedAccount !== null
+					? accountManager.getCircuitRecoveryTime(pinnedAccount, evaluatedAtMs)
+					: null;
+			const pinnedTranscriptionRateLimitAtMs =
+				isTranscribeRequest && pinnedAccount?.recordId
+					? state.transcriptionRateLimitUntilByRecordId.get(pinnedAccount.recordId) ?? null
+					: null;
+			const livePinnedTranscriptionRateLimitAtMs =
+				typeof pinnedTranscriptionRateLimitAtMs === "number" &&
+				pinnedTranscriptionRateLimitAtMs > evaluatedAtMs
+					? pinnedTranscriptionRateLimitAtMs
+					: null;
+			const pinnedAuthCooldownAtMs =
+				isTranscribeRequest &&
+				pinnedAccount?.cooldownReason === "auth-failure" &&
+				typeof pinnedAccount.coolingDownUntil === "number" &&
+				pinnedAccount.coolingDownUntil > evaluatedAtMs
+					? pinnedAccount.coolingDownUntil
+					: null;
+			const pinnedResetAtMs = pinnedBlockedPermanently
+				? null
+				: isTranscribeRequest
+					? livePinnedTranscriptionRateLimitAtMs === null && pinnedAuthCooldownAtMs === null
+						? null
+						: Math.max(
+							livePinnedTranscriptionRateLimitAtMs ?? 0,
+							pinnedAuthCooldownAtMs ?? 0,
+						)
+					: pinnedStateRecoveryAtMs === null && pinnedCircuitRecoveryAtMs === null
+						? null
+						: Math.max(
 							pinnedStateRecoveryAtMs ?? 0,
 							pinnedCircuitRecoveryAtMs ?? 0,
 						);
 			// The message only words the recovery deadline as a rate-limit reset
-			// when the rate-limit records are in fact what supplies it — a
+			// when the rate-limit records are in fact what supplies it - a
 			// breaker or cooldown can end later and then bounds it instead.
-			const pinnedRateLimitResetAtMs =
-				pinnedRecoveryBounds?.rateLimitAtMs ?? null;
+			const pinnedRateLimitResetAtMs = isTranscribeRequest
+				? livePinnedTranscriptionRateLimitAtMs
+				: pinnedRecoveryBounds?.rateLimitAtMs ?? null;
 			const recoveryBound =
 				pinnedResetAtMs !== null &&
 				pinnedRateLimitResetAtMs !== null &&

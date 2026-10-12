@@ -247,6 +247,42 @@ describe("runtime transcription proxy", () => {
 		expect(proxy.getStatus().rotations).toBe(0);
 	});
 
+	it("reports a transcription backoff for a pinned credential", async () => {
+		const baseNow = Date.now();
+		vi.spyOn(Date, "now").mockReturnValue(baseNow);
+		const manager = new AccountManager(undefined, createStorage(baseNow, 1));
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager);
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ error: { code: "rate_limit_exceeded" } }), {
+				status: HTTP_STATUS.TOO_MANY_REQUESTS,
+				headers: { "content-type": "application/json", "retry-after": "60" },
+			}),
+		);
+		openManagers.push(manager);
+		const proxy = await startRuntimeRotationProxy({
+			accountManager: manager,
+			fetchImpl,
+			upstreamBaseUrl: "https://example.test/backend-api",
+			clientApiKey: CLIENT_KEY,
+			quotaRemainingPercentThreshold: 10,
+			forcedAccountIndex: 0,
+		});
+		openServers.push(proxy);
+
+		expect((await postTranscribe(proxy, Buffer.from("--first--\r\n"))).status)
+			.toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+		const pinned = await postTranscribe(proxy, Buffer.from("--second--\r\n"));
+		const payload = (await pinned.json()) as {
+			error: { reason: string | null; retry_after_ms: number | null; reset_at: string | null };
+		};
+
+		expect(pinned.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(payload.error).toMatchObject({ reason: "transcription-rate-limited", retry_after_ms: 60_000 });
+		expect(payload.error.retry_after_ms).toBe(60_000);
+		expect(payload.error.reset_at).toBe(new Date(baseNow + 60_000).toISOString());
+		expect(calls).toHaveLength(1);
+	});
+
 	it("reports the next transcription backoff when every credential is waiting", async () => {
 		const baseNow = Date.now();
 		vi.spyOn(Date, "now").mockReturnValue(baseNow);
