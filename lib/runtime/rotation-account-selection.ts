@@ -140,7 +140,7 @@ export function chooseAccount(params: {
    }
   }
 		// Re-evaluate tiers on every attempt. Never persist a temporary tier block.
-		return chooseAccount({
+		const selected = chooseAccount({
 			...params,
 			policy: {
 				...policy,
@@ -158,6 +158,8 @@ export function chooseAccount(params: {
 			fallbackPinnedIndex: null,
 			pinnedIndex: typeof preferred === "number" && tierIndexes.has(preferred) ? preferred : null,
 		});
+		if (selected && schedulingStrategy === "sequential") selected.lastUsed = now;
+		return selected;
 	}
 
 	// Manual pin (from `codex-multi-auth switch <n>`) overrides every other

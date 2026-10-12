@@ -477,6 +477,7 @@ describe("sequential order within priority tiers", () => {
 			subscriptionQuotaByAccount: { 0: quota(100, 1), 1: quota(remainingPercent, 5), 2: quota(90, 168) },
 		};
 		expect(chooseAccount({ ...params, attemptedIndexes: new Set([1]) })?.index).toBe(expected);
+		expect(accountManager.getAccountByIndex(expected)?.lastUsed).toBe(NOW);
 		expect(accountManager.getActiveIndexForFamily(FAMILY)).toBe(primary);
 		expect(chooseAccount(params)?.index).toBe(primary);
 	});
@@ -485,6 +486,19 @@ describe("sequential order within priority tiers", () => {
 		const accountManager = manager();
 		const policy = { ...policyWith(), priorityByAccount: { 0: 0, 1: 0, 2: 1 } };
 		expect(chooseAccount({ ...baseParams(accountManager), policy, preferredIndex: 1, schedulingStrategy: "sequential" })?.index).toBe(0);
+	});
+
+	it("updates saved-order activity without moving the cursor", () => {
+		const storage = storageWith(3);
+		storage.activeIndexByFamily = { [FAMILY]: 2 };
+		const accountManager = new AccountManager(undefined, storage);
+		const markSwitched = vi.spyOn(accountManager, "markSwitched");
+		const policy = { ...policyWith(), priorityByAccount: { 0: 0, 1: 0, 2: 1 } };
+		const selected = chooseAccount({ ...baseParams(accountManager), policy, preferredIndex: 2, schedulingStrategy: "sequential" });
+		expect(selected?.index).toBe(0);
+		expect(selected?.lastUsed).toBe(NOW);
+		expect(accountManager.getActiveIndexForFamily(FAMILY)).toBe(2);
+		expect(markSwitched).not.toHaveBeenCalled();
 	});
 
 	it.each(["attempted", "rate-limited", "disabled", "paused", "reserve", "exhausted"])(
