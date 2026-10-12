@@ -16,6 +16,7 @@ import {
 } from "./runtime-observability.js";
 import type { RuntimeRotationProxyStatus } from "./rotation-server-types.js";
 import type { SessionAffinityStore } from "../session-affinity.js";
+import { redirectRuntimeRefreshCommits, waitForRuntimeRefreshCommits } from "./rotation-token-refresh.js";
 
 /**
  * Per-instance configuration resolved once in `startRuntimeRotationProxy`,
@@ -180,11 +181,24 @@ export async function reloadRuntimeCredentials(
 		const authBeforeLoad = previousManager.getAccountsSnapshot();
 		const reloaded = await AccountManager.loadFromDisk();
 		reloaded.setRoutingMutexMode(state.routingMutexMode);
-		// Snapshot only after the disk read resolves. Inference can still update
-		// the old live manager while I/O is pending, and those observations must
-		// be carried into the replacement manager before it becomes active.
-		const previousAccounts = previousManager.getAccountsSnapshot();
 		const freshAccounts = reloaded.getAccountsSnapshot();
+		// loadFromDisk intentionally converts an unreadable/corrupt source with no
+		// usable WAL/backup into an empty manager. Do not let a transient read
+		// failure erase a healthy resident pool; a parsed empty/reset snapshot is
+		// still authoritative and may intentionally remove every account.
+		if (
+			authBeforeLoad.length > 0 &&
+			freshAccounts.length === 0 &&
+			!reloaded.hasLoadedAccountStorageSnapshot()
+		) {
+			state.lastCredentialReloadAt = Date.now();
+			return previousManager;
+		}
+		// A refresh can finish upstream while disk I/O is pending and then queue
+		// its auth commit against the resident manager. Let every commit already
+		// targeting that manager settle before taking the final live snapshot.
+		await waitForRuntimeRefreshCommits(previousManager);
+		const previousAccounts = previousManager.getAccountsSnapshot();
 		const credentialInventoryFingerprint = (
 			accounts: ReturnType<AccountManager["getAccountsSnapshot"]>,
 		): string => JSON.stringify(accounts.map((account) => ({
@@ -212,6 +226,25 @@ export async function reloadRuntimeCredentials(
 		// lastUsed state, and in-flight runtime observations while still bounding
 		// disk checks through lastCredentialReloadAt.
 		if (credentialInventoryFingerprint(authBeforeLoad) === credentialInventoryFingerprint(freshAccounts)) {
+			// Cooldown fields are deliberately excluded from the inventory fingerprint
+			// so a disk probe cannot reset inference selector state. Still absorb a
+			// newer persisted auth-failure cooldown from another proxy, but only when
+			// the credential itself is unchanged; a re-login/rotation repairs that wait.
+			for (const fresh of freshAccounts) {
+				const resident = previousManager.getAccountByIndex(fresh.index);
+				if (
+					resident &&
+					fresh.cooldownReason === "auth-failure" &&
+					typeof fresh.coolingDownUntil === "number" &&
+					fresh.coolingDownUntil > state.now() &&
+					resident.access === fresh.access &&
+					resident.refreshToken === fresh.refreshToken &&
+					fresh.coolingDownUntil > (resident.coolingDownUntil ?? 0)
+				) {
+					resident.coolingDownUntil = fresh.coolingDownUntil;
+					resident.cooldownReason = "auth-failure";
+				}
+			}
 			state.lastCredentialReloadAt = Date.now();
 			return previousManager;
 		}
@@ -349,6 +382,10 @@ export async function reloadRuntimeCredentials(
 				}
 			}
 		}
+		// Requests that captured the resident manager before this swap may finish
+		// refreshing afterward. Redirect those late auth commits to the replacement
+		// so rotated single-use refresh tokens cannot be stranded on the old object.
+		redirectRuntimeRefreshCommits(previousManager, reloaded);
 		state.activeAccountManager = reloaded;
 		state.knownAccountManagers.add(reloaded);
 		state.lastCredentialReloadAt = Date.now();

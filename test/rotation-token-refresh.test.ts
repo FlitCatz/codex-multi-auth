@@ -31,6 +31,7 @@ const {
 	applyMonotonicAuthCooldown,
 	DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
 	ensureFreshAccessToken,
+	redirectRuntimeRefreshCommits,
 } = await import("../lib/runtime/rotation-token-refresh.js");
 
 const NOW = Date.now();
@@ -197,6 +198,31 @@ describe("ensureFreshAccessToken", () => {
 			expect(result.accessToken).toBe("access-new");
 			expect(result.account).toBe(original);
 		}
+	});
+
+	it("redirects a late refresh commit from a superseded manager to its replacement", async () => {
+		const previous = managerWith(STALE_EXPIRES);
+		const replacement = managerWith(STALE_EXPIRES);
+		const previousCommit = vi.spyOn(previous, "commitRefreshedAuth");
+		const replacementAccount = replacement.getAccountByIndex(0);
+		if (!replacementAccount) throw new Error("replacement account missing");
+		const replacementCommit = vi
+			.spyOn(replacement, "commitRefreshedAuth")
+			.mockResolvedValue(replacementAccount);
+		redirectRuntimeRefreshCommits(previous, replacement);
+		queuedRefreshMock.mockResolvedValue({
+			type: "success",
+			access: "access-after-swap",
+			refresh: "refresh-after-swap",
+			expires: NOW + 7_200_000,
+		});
+
+		const result = await ensureFreshAccessToken(refreshParams(previous));
+
+		expect(previousCommit).not.toHaveBeenCalled();
+		expect(replacementCommit).toHaveBeenCalledTimes(1);
+		expect(result.ok).toBe(true);
+		if (result.ok) expect(result.account).toBe(replacementAccount);
 	});
 
 	it("deduplicates concurrent commits for the same refreshed account", async () => {

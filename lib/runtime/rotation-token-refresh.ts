@@ -48,26 +48,63 @@ const runtimeRefreshCommitQueues = new WeakMap<
 	AccountManager,
 	Map<string, Promise<ManagedAccount | null>>
 >();
+const runtimeRefreshManagerRedirects = new WeakMap<AccountManager, AccountManager>();
+
+function resolveRuntimeRefreshCommitManager(accountManager: AccountManager): AccountManager {
+	let current = accountManager;
+	const seen = new Set<AccountManager>();
+	while (!seen.has(current)) {
+		seen.add(current);
+		const next = runtimeRefreshManagerRedirects.get(current);
+		if (!next) return current;
+		current = next;
+	}
+	return current;
+}
+
+/** @internal Wait until every refresh-auth commit already targeting this manager settles. */
+export async function waitForRuntimeRefreshCommits(accountManager: AccountManager): Promise<void> {
+	const target = resolveRuntimeRefreshCommitManager(accountManager);
+	while (true) {
+		const queue = runtimeRefreshCommitQueues.get(target);
+		const pending = queue ? [...queue.values()] : [];
+		if (pending.length === 0) return;
+		await Promise.allSettled(pending);
+	}
+}
+
+/** @internal Redirect late commits from requests that captured a superseded manager. */
+export function redirectRuntimeRefreshCommits(
+	previousManager: AccountManager,
+	replacementManager: AccountManager,
+): void {
+	if (previousManager === replacementManager) return;
+	runtimeRefreshManagerRedirects.set(
+		previousManager,
+		resolveRuntimeRefreshCommitManager(replacementManager),
+	);
+}
 
 async function commitRefreshedAuthOnce(
 	accountManager: AccountManager,
 	account: ManagedAccount,
 	auth: OAuthAuthDetails,
 ): Promise<ManagedAccount | null> {
+	const commitManager = resolveRuntimeRefreshCommitManager(accountManager);
 	const key = [
 		account.index,
 		account.accountId ?? "",
 		account.email ?? "",
 		account.refreshToken,
 	].join("\0");
-	let queue = runtimeRefreshCommitQueues.get(accountManager);
+	let queue = runtimeRefreshCommitQueues.get(commitManager);
 	if (!queue) {
 		queue = new Map();
-		runtimeRefreshCommitQueues.set(accountManager, queue);
+		runtimeRefreshCommitQueues.set(commitManager, queue);
 	}
 	const existing = queue.get(key);
 	if (existing) return existing;
-	const pending = accountManager
+	const pending = commitManager
 		.commitRefreshedAuth(account, auth)
 		.finally(() => queue?.delete(key));
 	queue.set(key, pending);

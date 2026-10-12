@@ -312,6 +312,7 @@ export class AccountManager {
 	private readonly persistedWorkspaceSelections = new WeakMap<ManagedAccount, string | undefined>();
 	private readonly persistedWorkspaces = new WeakMap<ManagedAccount, Workspace[] | undefined>();
 	private hadPersistedStorage = false;
+	private readonly loadedAccountStorageSnapshot: boolean;
 	private cursorByFamily: Record<ModelFamily, number> = initFamilyState(0);
 	private currentAccountIndexByFamily: Record<ModelFamily, number> =
 		initFamilyState(-1);
@@ -379,6 +380,11 @@ export class AccountManager {
 		const manager = new AccountManager(authFallback, sourceOfTruthStorage);
 		await manager.hydrateFromCodexCli();
 		return manager;
+	}
+
+	/** @internal True when construction received a parsed/recovered storage snapshot. */
+	hasLoadedAccountStorageSnapshot(): boolean {
+		return this.loadedAccountStorageSnapshot;
 	}
 
 	hasRefreshToken(refreshToken: string): boolean {
@@ -460,6 +466,7 @@ export class AccountManager {
 		stored?: AccountStorageV3 | null,
 	) {
 		this.storagePathState = { ...getStoragePathState() };
+		this.loadedAccountStorageSnapshot = stored !== undefined && stored !== null;
 		this.hadPersistedStorage = existsSync(this.resolveSelectionStoragePath());
 		const fallbackAccountId =
 			extractAccountId(authFallback?.access)?.trim() || undefined;

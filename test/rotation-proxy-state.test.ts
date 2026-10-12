@@ -4,9 +4,10 @@ import { PreemptiveQuotaScheduler } from "../lib/preemptive-quota-scheduler.js";
 import type { RotationProxyStateInit } from "../lib/runtime/rotation-proxy-state.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
 
-const { recordRuntimeResetMock, recordRuntimeReloadMock } = vi.hoisted(() => ({
+const { recordRuntimeResetMock, recordRuntimeReloadMock, queuedRefreshMock } = vi.hoisted(() => ({
 	recordRuntimeResetMock: vi.fn(),
 	recordRuntimeReloadMock: vi.fn(),
+	queuedRefreshMock: vi.fn(),
 }));
 
 vi.mock("../lib/runtime/runtime-observability.js", async (importOriginal) => {
@@ -20,9 +21,15 @@ vi.mock("../lib/runtime/runtime-observability.js", async (importOriginal) => {
 	};
 });
 
+vi.mock("../lib/refresh-queue.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../lib/refresh-queue.js")>();
+	return { ...actual, queuedRefresh: queuedRefreshMock };
+});
+
 const { createRotationProxyState, recoverStaleRuntimeState, reloadRuntimeCredentials } = await import(
 	"../lib/runtime/rotation-proxy-state.js"
 );
+const { ensureFreshAccessToken } = await import("../lib/runtime/rotation-token-refresh.js");
 
 const NOW = Date.now();
 
@@ -121,6 +128,119 @@ describe("reloadRuntimeCredentials", () => {
 		expect(result).toBe(resident);
 		expect(state.activeAccountManager).toBe(resident);
 		expect(state.knownAccountManagers.has(duplicate)).toBe(false);
+	});
+
+	it("merges a newer persisted auth cooldown without replacing the resident manager", async () => {
+		const state = createRotationProxyState(stateInit());
+		const resident = state.activeAccountManager;
+		const diskStorage = storageWith(1);
+		diskStorage.accounts[0]!.coolingDownUntil = NOW + 90_000;
+		diskStorage.accounts[0]!.cooldownReason = "auth-failure";
+		loadFromDisk.mockResolvedValueOnce(new AccountManager(undefined, diskStorage));
+
+		const result = await reloadRuntimeCredentials(state);
+		const active = resident.getAccountByIndex(0);
+
+		expect(result).toBe(resident);
+		expect(state.activeAccountManager).toBe(resident);
+		expect(active?.coolingDownUntil).toBe(NOW + 90_000);
+		expect(active?.cooldownReason).toBe("auth-failure");
+	});
+
+	it("preserves a non-empty resident pool when disk loading produced no valid snapshot", async () => {
+		const state = createRotationProxyState(stateInit());
+		const resident = state.activeAccountManager;
+		const failedEmptyLoad = new AccountManager(undefined, null);
+		loadFromDisk.mockResolvedValueOnce(failedEmptyLoad);
+
+		const result = await reloadRuntimeCredentials(state);
+
+		expect(result).toBe(resident);
+		expect(state.activeAccountManager).toBe(resident);
+		expect(state.activeAccountManager.getAccountsSnapshot()).toHaveLength(1);
+		expect(state.knownAccountManagers.has(failedEmptyLoad)).toBe(false);
+	});
+
+	it("accepts a parsed empty snapshot as an intentional inventory change", async () => {
+		const state = createRotationProxyState(stateInit());
+		const emptyStorage: AccountStorageV3 = {
+			version: 3,
+			accounts: [],
+			activeIndex: 0,
+			activeIndexByFamily: {},
+		};
+		const intentionalEmpty = new AccountManager(undefined, emptyStorage);
+		loadFromDisk.mockResolvedValueOnce(intentionalEmpty);
+
+		const result = await reloadRuntimeCredentials(state);
+
+		expect(result).toBe(intentionalEmpty);
+		expect(state.activeAccountManager).toBe(intentionalEmpty);
+		expect(state.activeAccountManager.getAccountsSnapshot()).toHaveLength(0);
+	});
+
+	it("waits for a refresh commit that overlaps disk loading before publishing the replacement", async () => {
+		const state = createRotationProxyState(stateInit());
+		const resident = state.activeAccountManager;
+		const previous = resident.getAccountByIndex(0);
+		if (!previous) throw new Error("missing resident account");
+		previous.expires = NOW + 10_000;
+
+		const diskStorage = storageWith(2);
+		diskStorage.accounts[0]!.expiresAt = previous.expires;
+		const reloaded = new AccountManager(undefined, diskStorage);
+		let signalLoadStarted!: () => void;
+		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
+		let releaseLoad!: () => void;
+		const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+		loadFromDisk.mockImplementationOnce(async () => {
+			signalLoadStarted();
+			await loadGate;
+			return reloaded;
+		});
+
+		let releaseCommit!: () => void;
+		const commitGate = new Promise<void>((resolve) => { releaseCommit = resolve; });
+		vi.spyOn(resident, "commitRefreshedAuth").mockImplementationOnce(async (_source, auth) => {
+			await commitGate;
+			previous.access = auth.access;
+			previous.refreshToken = auth.refresh;
+			previous.expires = auth.expires;
+			return previous;
+		});
+		queuedRefreshMock.mockResolvedValueOnce({
+			type: "success",
+			access: "access-rotated-after-load",
+			refresh: "refresh-rotated-after-load",
+			expires: NOW + 7_200_000,
+		});
+
+		const reloadPending = reloadRuntimeCredentials(state);
+		await loadStarted;
+		const refreshPending = ensureFreshAccessToken({
+			accountManager: resident,
+			account: previous,
+			family: "gpt-5-codex",
+			model: null,
+			now: NOW,
+			tokenRefreshSkewMs: 30_000,
+			tokenInvalidationCooldownMs: 300_000,
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		releaseLoad();
+		let reloadResolved = false;
+		void reloadPending.then(() => { reloadResolved = true; });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(reloadResolved).toBe(false);
+
+		releaseCommit();
+		await refreshPending;
+		const active = (await reloadPending)?.getAccountByIndex(0);
+
+		expect(active?.access).toBe("access-rotated-after-load");
+		expect(active?.refreshToken).toBe("refresh-rotated-after-load");
+		expect(active?.expires).toBe(NOW + 7_200_000);
+		expect(state.activeAccountManager).toBe(reloaded);
 	});
 
 	it("reserves the surviving same-email workspace before carrying runtime waits", async () => {
