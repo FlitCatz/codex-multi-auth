@@ -421,20 +421,46 @@ describe("sequential order within priority tiers", () => {
 	});
 
 	it.each([
-		["sequential", 0],
-		["hybrid", 1],
-	] as const)("%s respects its account ordering strategy", (schedulingStrategy, expected) => {
+		["sequential", 0, 1],
+		["hybrid", 1, 0],
+	] as const)("%s respects its account ordering strategy", (schedulingStrategy, expected, preferredIndex) => {
 		const accountManager = manager();
+		const markSwitched = vi.spyOn(accountManager, "markSwitched");
 		const policy = { ...policyWith(), priorityByAccount: { 0: 0, 1: 0, 2: 1 } };
 		const selected = chooseAccount({
 			...baseParams(accountManager),
 			policy,
-			preferredIndex: 1,
+			preferredIndex,
 			schedulingStrategy,
 			subscriptionQuotaByAccount: { 0: quota(100, 5), 1: quota(50, 1), 2: quota(90, 168) },
 		});
 
 		expect(selected?.index).toBe(expected);
+		expect(markSwitched).not.toHaveBeenCalled();
+	});
+
+	it.each([undefined, 1])("keeps the active cursor for default priorities with preference %s", (preferredIndex) => {
+		const storage = storageWith(3);
+		storage.activeIndexByFamily = { [FAMILY]: 1 };
+		const accountManager = new AccountManager(undefined, storage);
+		const policy = { ...policyWith(), priorityByAccount: { 0: 1, 1: 1, 2: 1 } };
+		const selected = chooseAccount({
+			...baseParams(accountManager), policy, preferredIndex, schedulingStrategy: "sequential",
+			subscriptionQuotaByAccount: { 0: quota(100, 1), 1: quota(50, 5), 2: quota(90, 168) },
+		});
+		expect(selected?.index).toBe(1);
+		expect(accountManager.getActiveIndexForFamily(FAMILY)).toBe(1);
+	});
+
+	it("returns to the earlier configured account after it recovers", () => {
+		const accountManager = manager(3, { 0: { rateLimitResetTimes: { [FAMILY]: NOW + 600_000 } } });
+		const policy = { ...policyWith(), priorityByAccount: { 0: 0, 1: 0, 2: 1 } };
+		const params = { ...baseParams(accountManager), policy, preferredIndex: 1, schedulingStrategy: "sequential" as const };
+		expect(chooseAccount(params)?.index).toBe(1);
+		const first = accountManager.getAccountByIndex(0);
+		if (!first) throw new Error("fixture account missing");
+		delete first.rateLimitResetTimes[FAMILY];
+		expect(chooseAccount({ ...params, attemptedIndexes: new Set() })?.index).toBe(0);
 	});
 
 	it("uses saved order even when quota measurements are unavailable", () => {

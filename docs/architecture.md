@@ -83,7 +83,7 @@ Details worth knowing:
 
 Per request the proxy tries, in order: a soft pin left by `codex-multi-auth switch`, policy priority tiers (lower `account priority` numbers first), a hard pin from `--account`/`CODEX_MULTI_AUTH_FORCE_ACCOUNT`, the sequential stick-until-exhausted cursor, session affinity (20-minute sticky sessions), a hybrid score (`health*2 + tokens*5 + hoursSinceUsed*2 + capability boost`), and finally a linear scan. An account is skipped when it is disabled, workspace-disabled, token-invalid, rate-limited, cooling down, or has an open circuit breaker.
 
-Within an eligible policy priority tier, sequential scheduling uses saved account list order instead of quota reset ranking or active-account preference. Exhaustion and reserve filtering still apply before the tier is selected.
+When any policy priority differs from the default `1`, sequential scheduling uses saved account list order within the eligible tier instead of quota reset ranking or active-account preference. Runtime policy supplies priority `1` for every account by default; an all-default map preserves the healthy active cursor. Exhaustion and reserve filtering still apply before the tier is selected.
 
 ---
 

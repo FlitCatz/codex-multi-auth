@@ -167,11 +167,13 @@ The proxy preserves request bodies and streaming responses, replaces outbound au
 `schedulingStrategy` controls how the proxy picks an account for each request:
 
 - `hybrid` (default) spreads load across all available accounts using a weighted health/token/freshness score. Both accounts tend to consume quota at a similar pace.
-- `sequential` (drain-first) uses accounts one at a time. When policy priority tiers are present, it picks the first eligible account in saved list order within the lowest eligible tier. Quota reset timing and active-account preference do not reorder that tier. An earlier account regains preference when it becomes eligible again. Without priority tiers, the active cursor stays on its account until it is unavailable, then scans forward and wraps the pool.
+- `sequential` (drain-first) uses accounts one at a time. Runtime policy assigns every account priority `1` by default, so a priority map is normally present even without user configuration. When all priorities are `1`, the active cursor stays on its healthy account until it is unavailable, then scans forward and wraps the pool. Quota reset timing does not override that cursor.
 
-Sequential routing still respects model eligibility, disabled workspaces/accounts, policy blocks, rate limits, cooldowns, circuit breakers, exhausted quota, and the subscription reserve. It falls back through the saved order and subsequent priority tiers when an account is unavailable.
+Setting at least one account priority to a value other than `1` enables saved list order within the lowest eligible priority tier in sequential mode. Quota reset timing and active-account preference do not reorder that tier. An earlier configured account regains preference when it becomes eligible again. For example, priorities `0, 0, 1` use the first eligible priority-0 account in saved order before falling back to priority 1.
 
-In `sequential` mode a manual pin (`codex-multi-auth switch <index>`) still takes precedence and is never overridden. Sequential mode intentionally ignores per-session affinity: once the active account changes, all subsequent requests follow the new active account regardless of which account originally handled a conversation. Enable it with `schedulingStrategy: "sequential"` in settings or `CODEX_AUTH_SCHEDULING_STRATEGY=sequential` for a per-process trial.
+Sequential routing still respects model eligibility, disabled workspaces/accounts, policy blocks, rate limits, cooldowns, circuit breakers, exhausted quota, and the subscription reserve. With customized priorities, it falls back through saved order and subsequent priority tiers when an account is unavailable.
+
+In `sequential` mode a manual pin (`codex-multi-auth switch <index>`) still takes precedence and is never overridden. Sequential mode intentionally ignores per-session affinity: every conversation follows the configured order or active cursor, regardless of which account originally handled it. Enable it with `schedulingStrategy: "sequential"` in settings or `CODEX_AUTH_SCHEDULING_STRATEGY=sequential` for a per-process trial.
 
 ### Many parallel agents / high concurrency
 

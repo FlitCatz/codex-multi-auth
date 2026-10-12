@@ -119,8 +119,10 @@ export function chooseAccount(params: {
   }
 		const tier = Math.min(...candidates.map(a => priorities[a.index] ?? 1));
 		const tierIndexes = new Set(candidates.filter(a => (priorities[a.index] ?? 1) === tier).map(a => a.index));
-		// Sequential priority ties follow saved order, not quota reset timing.
-		let preferred = schedulingStrategy === "sequential"
+		// Runtime policy fills default priority 1 even without a configured order.
+		const useSavedOrder = schedulingStrategy === "sequential" &&
+			Object.values(priorities).some(priority => priority !== 1);
+		let preferred = useSavedOrder
 			? candidates.find(account => tierIndexes.has(account.index))?.index
 			: params.preferredIndex;
   if (quotaByAccount && schedulingStrategy !== "sequential") {
