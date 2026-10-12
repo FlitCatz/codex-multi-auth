@@ -262,6 +262,61 @@ describe("runtime transcription proxy", () => {
 		expect(proxy.getStatus().rotations).toBe(0);
 	});
 
+	it("honors auth-failure cooldowns while selecting a transcription credential", async () => {
+		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const first = manager.getAccountByIndex(0);
+		if (!first) throw new Error("missing first test account");
+		manager.markAccountCoolingDown(first, 60_000, "auth-failure");
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "healthy credential" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const response = await postTranscribe(proxy, Buffer.from("--x--\r\n"));
+
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-2");
+		expect(first.cooldownReason).toBe("auth-failure");
+	});
+
+	it("reloads repaired credentials without clearing inference limits", async () => {
+		const now = Date.now();
+		const manager = new AccountManager(undefined, createStorage(now, 1));
+		const stale = manager.getAccountByIndex(0);
+		if (!stale) throw new Error("missing stale test account");
+		manager.markRateLimitedWithReason(stale, 60_000, "codex", "quota", null);
+		manager.markAuthInvalidated(stale, "test_invalidated");
+		const expectedRateLimit = stale.rateLimitResetTimes.codex;
+
+		const repairedStorage = createStorage(now, 1);
+		const repairedRow = repairedStorage.accounts[0];
+		if (!repairedRow) throw new Error("missing repaired storage row");
+		repairedRow.accessToken = "repaired-access";
+		const repaired = new AccountManager(undefined, repairedStorage);
+		const loadFromDisk = vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(repaired);
+		const resetVolatile = vi.spyOn(AccountManager, "resetVolatileRuntimeState");
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "repaired" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const response = await postTranscribe(proxy, Buffer.from("--x--\r\n"));
+
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		expect(loadFromDisk).toHaveBeenCalledTimes(1);
+		expect(resetVolatile).not.toHaveBeenCalled();
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer repaired-access");
+		expect(repaired.getAccountByIndex(0)?.rateLimitResetTimes.codex).toBe(expectedRateLimit);
+	});
+
 	it("ignores inference rate limits and preserves them after transcription", async () => {
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
 		const account = manager.getAccountByIndex(0);

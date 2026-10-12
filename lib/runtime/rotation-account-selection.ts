@@ -25,6 +25,7 @@ export function chooseTranscriptionAccount(params: {
 	attemptedIndexes: ReadonlySet<number>;
 	policy: RuntimePolicyDecision | null;
 	pinnedIndex: number | null;
+	now: number;
 	preferredIndex?: number | null;
 	fallbackPinnedIndex?: number | null;
 	skipReasons?: Map<number, string>;
@@ -34,6 +35,7 @@ export function chooseTranscriptionAccount(params: {
 		attemptedIndexes,
 		policy,
 		pinnedIndex,
+		now,
 		preferredIndex,
 		fallbackPinnedIndex,
 		skipReasons,
@@ -46,6 +48,11 @@ export function chooseTranscriptionAccount(params: {
 		if (account.enabled === false) return "disabled";
 		if (!accountManager.hasEnabledWorkspaces(account)) return "workspace-disabled";
 		if (accountManager.isAccountAuthInvalidated(account)) return AUTH_INVALIDATION_MARKER;
+		if (
+			account.cooldownReason === "auth-failure" &&
+			typeof account.coolingDownUntil === "number" &&
+			account.coolingDownUntil > now
+		) return "cooling-down:auth-failure";
 		if (policy?.blockedAccountIndexes.has(index)) return "policy-blocked";
 		if (attemptedIndexes.has(index)) return "already-attempted";
 		return null;

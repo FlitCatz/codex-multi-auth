@@ -7,7 +7,7 @@ import type { ApiModelCapabilities } from "./api-model-capabilities.js";
 import type { ApiModelRuntime } from "./api-model-runtime.js";
 import type { ApiRouteCredential } from "../api-route-store.js";
 import type { AccountModelCatalog } from "./account-model-catalog.js";
-import { AccountManager } from "../accounts.js";
+import { AccountManager, sanitizeEmail } from "../accounts.js";
 import type { ContextBudgetGuard } from "../context-budget-guard.js";
 import type { PreemptiveQuotaScheduler } from "../preemptive-quota-scheduler.js";
 import {
@@ -96,6 +96,8 @@ export interface RotationProxyState extends RotationProxyStateInit {
 	lastGlobalSwitchAt: number;
 	staleRuntimeReloadPromise: Promise<AccountManager | null> | null;
 	lastStaleRuntimeReloadAt: number;
+	credentialReloadPromise: Promise<AccountManager | null> | null;
+	lastCredentialReloadAt: number;
 }
 
 const STALE_RUNTIME_RELOAD_DEDUPE_MS = 1_000;
@@ -125,7 +127,90 @@ export function createRotationProxyState(
 		lastGlobalSwitchAt: 0,
 		staleRuntimeReloadPromise: null,
 		lastStaleRuntimeReloadAt: 0,
+		credentialReloadPromise: null,
+		lastCredentialReloadAt: 0,
 	};
+}
+
+/**
+ * Reload account credentials without resetting inference runtime state.
+ *
+ * This is intentionally narrower than {@link recoverStaleRuntimeState}: it is
+ * used when a non-inference operation discovers that its in-memory credential
+ * inventory is stale after an external login/enable action. Fresh credential,
+ * workspace, enabled and auth-invalidation fields come from disk, while live
+ * inference rate-limit windows and non-auth cooldowns are carried forward by
+ * stable account identity. An auth-failure cooldown is carried only while the
+ * access token is unchanged, so a genuine re-login can repair the credential.
+ * Process-global health/token trackers and circuit breakers are never reset.
+ *
+ * @internal
+ */
+export async function reloadRuntimeCredentials(
+	state: RotationProxyState,
+): Promise<AccountManager | null> {
+	if (Date.now() - state.lastCredentialReloadAt <= STALE_RUNTIME_RELOAD_DEDUPE_MS) {
+		return state.activeAccountManager;
+	}
+	if (state.credentialReloadPromise) return state.credentialReloadPromise;
+
+	state.credentialReloadPromise = (async () => {
+		const previousManager = state.activeAccountManager;
+		const previousAccounts = previousManager.getAccountsSnapshot();
+		const reloaded = await AccountManager.loadFromDisk();
+		reloaded.setRoutingMutexMode(state.routingMutexMode);
+		const freshAccounts = reloaded.getAccountsSnapshot();
+		const claimed = new Set<number>();
+		/** Stable matching key for carrying only runtime observations between credential snapshots. */
+		const identityOf = (account: { accountId?: string; email?: string; refreshToken?: string }) => {
+			const accountId = account.accountId?.trim();
+			const email = sanitizeEmail(account.email);
+			return accountId || email
+				? JSON.stringify([accountId ?? null, email ?? null])
+				: account.refreshToken?.trim()
+					? `refresh:${account.refreshToken.trim()}`
+					: null;
+		};
+		for (const previous of previousAccounts) {
+			const candidates = freshAccounts.filter((account) => !claimed.has(account.index));
+			const identity = identityOf(previous);
+			const matched = candidates.find((account) =>
+				account.recordId && account.recordId === previous.recordId,
+			) ?? (identity === null
+				? undefined
+				: candidates.find((account) => identityOf(account) === identity));
+			if (!matched) continue;
+			claimed.add(matched.index);
+			const live = reloaded.getAccountByIndex(matched.index);
+			if (!live) continue;
+			for (const [key, until] of Object.entries(previous.rateLimitResetTimes)) {
+				if (typeof until === "number" && until > state.now()) {
+					live.rateLimitResetTimes[key] = Math.max(live.rateLimitResetTimes[key] ?? 0, until);
+				}
+			}
+			if ((previous.coolingDownUntil ?? 0) > (live.coolingDownUntil ?? 0)) {
+				const repairedAuth =
+					previous.cooldownReason === "auth-failure" && previous.access !== live.access;
+				if (!repairedAuth) {
+					live.coolingDownUntil = previous.coolingDownUntil;
+					live.cooldownReason = previous.cooldownReason;
+				}
+			}
+		}
+		state.activeAccountManager = reloaded;
+		state.knownAccountManagers.add(reloaded);
+		state.lastCredentialReloadAt = Date.now();
+		recordRuntimeReload("credential-inventory-refresh");
+		return reloaded;
+	})()
+		.catch((error) => {
+			state.status.lastError = error instanceof Error ? error.message : String(error);
+			return null;
+		})
+		.finally(() => {
+			state.credentialReloadPromise = null;
+		});
+	return state.credentialReloadPromise;
 }
 
 /** @internal */

@@ -123,6 +123,7 @@ import { chooseAccount, chooseTranscriptionAccount } from "./runtime/rotation-ac
 import {
 	createRotationProxyState,
 	recoverStaleRuntimeState,
+	reloadRuntimeCredentials,
 	type RotationProxyState,
 } from "./runtime/rotation-proxy-state.js";
 import type {
@@ -2350,6 +2351,7 @@ async function handleRequestInner(
 						attemptedIndexes: attemptedForSelection,
 						policy: policyDecision,
 						pinnedIndex,
+						now: state.now(),
 						preferredIndex,
 						fallbackPinnedIndex: state.nativeOpenai ? storageMeta.pinnedAccountIndex : null,
 						skipReasons: accountSkipReasons,
@@ -2411,6 +2413,26 @@ async function handleRequestInner(
 					: selectAccount();
             for (const index of catalogExcludedIndexes()) accountSkipReasons.set(index, "model-not-supported");
 			if (!selected) {
+				if (
+					isTranscribeRequest &&
+					!state.nativeOpenai &&
+					!reloadedAfterNoAccount &&
+					(policyDecision?.blockedAccountIndexes.size ?? 0) === 0
+				) {
+					reloadedAfterNoAccount = true;
+					const reloadedManager = await reloadRuntimeCredentials(state);
+					if (reloadedManager) {
+						accountManager = reloadedManager;
+						accountCount = accountManager.getAccountCount();
+						transientAttemptLimit = Math.max(
+							1,
+							Math.min(accountCount, state.maxRuntimeAccountAttempts),
+						);
+						accountSkipReasons.clear();
+						attemptedIndexes.clear();
+						continue;
+					}
+				}
 				if (
 					!isTranscribeRequest &&
 					!reloadedAfterNoAccount &&
