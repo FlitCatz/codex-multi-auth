@@ -401,8 +401,13 @@ soft preference inside its first eligible tier; a stored `switch` pin is strict.
 
 For native subscription requests, `automatic order` estimates routing order
 from the last check: eligible accounts above a 5% quota reserve go first, then
-configured tiers, earliest limiting-window reset, and remaining percentage as
-tie-breaker. API/ZDR pools are never automatic paid fallbacks for subscription
+configured tiers. Hybrid mode ranks each tier by earliest limiting-window reset
+and remaining percentage. Sequential mode follows saved list order when any
+priority differs from `1`; with all priorities at `1`, it follows the active
+cursor and wraps the saved pool. The text `automatic order` and JSON
+`automaticOrder` fields use the configured scheduling strategy. Requested
+models/workspaces and live health can still change this cached estimate.
+API/ZDR pools are never automatic paid fallbacks for subscription
 requests, and explicit strict invocation pins bypass the whole order.
 
 ---
