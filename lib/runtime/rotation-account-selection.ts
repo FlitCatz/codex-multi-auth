@@ -147,7 +147,12 @@ export function chooseAccount(params: {
 				priorityByAccount: undefined,
 				blockedAccountIndexes: new Set([
 					...policy.blockedAccountIndexes,
-					...accountManager.getAccountsSnapshot().filter(a => !tierIndexes.has(a.index)).map(a => a.index),
+					// A retry alone must not make a healthy sequential primary unusable.
+					...accountManager.getAccountsSnapshot().filter(a => !tierIndexes.has(a.index) && (
+						schedulingStrategy !== "sequential" || !attemptedIndexes.has(a.index) ||
+						quotaByAccount?.[a.index]?.exhausted ||
+						(hasNonReserve && usesSubscriptionReserve(quotaByAccount?.[a.index]))
+					)).map(a => a.index),
 				]),
 			},
 			fallbackPinnedIndex: null,

@@ -463,6 +463,24 @@ describe("sequential order within priority tiers", () => {
 		expect(chooseAccount({ ...params, attemptedIndexes: new Set() })?.index).toBe(0);
 	});
 
+	it.each([
+		["healthy", 50, 0, 1],
+		["exhausted", 0, 2, 2],
+		["reserved", 5, 2, 2],
+	] as const)("retries a %s default-priority account with the correct primary", (_state, remainingPercent, expected, primary) => {
+		const storage = storageWith(3);
+		storage.activeIndexByFamily = { [FAMILY]: 1 };
+		const accountManager = new AccountManager(undefined, storage);
+		const policy = { ...policyWith(), priorityByAccount: { 0: 1, 1: 1, 2: 1 } };
+		const params = {
+			...baseParams(accountManager), policy, preferredIndex: 1, schedulingStrategy: "sequential" as const,
+			subscriptionQuotaByAccount: { 0: quota(100, 1), 1: quota(remainingPercent, 5), 2: quota(90, 168) },
+		};
+		expect(chooseAccount({ ...params, attemptedIndexes: new Set([1]) })?.index).toBe(expected);
+		expect(accountManager.getActiveIndexForFamily(FAMILY)).toBe(primary);
+		expect(chooseAccount(params)?.index).toBe(primary);
+	});
+
 	it("uses saved order even when quota measurements are unavailable", () => {
 		const accountManager = manager();
 		const policy = { ...policyWith(), priorityByAccount: { 0: 0, 1: 0, 2: 1 } };
