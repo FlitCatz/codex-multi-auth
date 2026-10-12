@@ -247,6 +247,34 @@ describe("runtime transcription proxy", () => {
 		expect(proxy.getStatus().rotations).toBe(0);
 	});
 
+	it("reports the next transcription backoff when every credential is waiting", async () => {
+		const baseNow = Date.now();
+		vi.spyOn(Date, "now").mockReturnValue(baseNow);
+		const manager = new AccountManager(undefined, createStorage(baseNow, 2));
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager);
+		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) =>
+			new Response(JSON.stringify({ error: { code: "rate_limit_exceeded" } }), {
+				status: HTTP_STATUS.TOO_MANY_REQUESTS,
+				headers: {
+					"content-type": "application/json",
+					"retry-after": attempt === 1 ? "60" : "30",
+				},
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		expect((await postTranscribe(proxy, Buffer.from("--first--\r\n"))).status)
+			.toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+		expect((await postTranscribe(proxy, Buffer.from("--second--\r\n"))).status)
+			.toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+		const exhausted = await postTranscribe(proxy, Buffer.from("--third--\r\n"));
+		const payload = (await exhausted.json()) as { error: { retry_after_ms: number } };
+
+		expect(exhausted.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(payload.error.retry_after_ms).toBe(30_000);
+		expect(calls).toHaveLength(2);
+	});
+
 	it("clamps a huge transcription Retry-After to the shared maximum", async () => {
 		const baseNow = Date.now();
 		let clock = baseNow;
@@ -642,6 +670,38 @@ describe("runtime transcription proxy", () => {
 		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
 		expect(policySpy).toHaveBeenCalledTimes(2);
 		expect(calls).toHaveLength(0);
+	});
+
+	it("reloads a new healthy credential even when the old inventory is policy-blocked", async () => {
+		const now = Date.now();
+		const manager = new AccountManager(undefined, createStorage(now, 1));
+		const repaired = new AccountManager(undefined, createStorage(now, 2));
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(repaired);
+		const baseDecision = {
+			allowed: true,
+			statusCode: 200,
+			errorCode: null,
+			reasons: [],
+			projectKey: null,
+			scoreBoostByAccount: {},
+			budgetEvaluations: [],
+		};
+		const policySpy = vi.spyOn(runtimePolicy, "evaluateRuntimePolicy")
+			.mockResolvedValue({ ...baseDecision, blockedAccountIndexes: new Set<number>([0]) });
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "new healthy account" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const response = await postTranscribe(proxy, Buffer.from("--policy-reload--\r\n"));
+
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		expect(policySpy).toHaveBeenCalledTimes(2);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-2");
 	});
 
 	it("ignores inference rate limits and preserves them after transcription", async () => {

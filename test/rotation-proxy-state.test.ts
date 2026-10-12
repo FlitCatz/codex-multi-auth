@@ -109,6 +109,38 @@ describe("createRotationProxyState", () => {
 	});
 });
 
+describe("reloadRuntimeCredentials", () => {
+	it("carries a token rotation that lands while disk loading is pending", async () => {
+		const state = createRotationProxyState(stateInit());
+		const previous = state.activeAccountManager.getAccountByIndex(0);
+		if (!previous) throw new Error("missing previous account");
+		const reloaded = new AccountManager(undefined, storageWith(1));
+		let signalLoadStarted!: () => void;
+		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
+		let releaseLoad!: () => void;
+		const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+		loadFromDisk.mockImplementationOnce(async () => {
+			signalLoadStarted();
+			await loadGate;
+			return reloaded;
+		});
+
+		const pending = reloadRuntimeCredentials(state);
+		await loadStarted;
+		previous.access = "rotated-access";
+		previous.refreshToken = "rotated-refresh";
+		previous.expires = NOW + 7_200_000;
+		releaseLoad();
+
+		const result = await pending;
+		const active = result?.getAccountByIndex(0);
+		expect(active?.access).toBe("rotated-access");
+		expect(active?.refreshToken).toBe("rotated-refresh");
+		expect(active?.expires).toBe(NOW + 7_200_000);
+		expect(state.activeAccountManager).toBe(reloaded);
+	});
+});
+
 describe("recoverStaleRuntimeState", () => {
 	it("reloads from disk, swaps the active manager, and records observability", async () => {
 		const state = createRotationProxyState(stateInit());

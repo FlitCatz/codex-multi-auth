@@ -1090,9 +1090,10 @@ function writePoolExhausted(params: {
 	model: string | null;
 	reason: ExhaustionReason;
 	accountSkipReasons?: Record<string, string>;
+	retryAfterMs?: number;
 }): void {
 	const { res, accountManager, family, model, reason } = params;
-	const waitMs = accountManager.getMinWaitTimeForFamily(family, model);
+	const waitMs = params.retryAfterMs ?? accountManager.getMinWaitTimeForFamily(family, model);
 	const accountCount = accountManager.getAccountCount();
 	const accountSkipReasons = params.accountSkipReasons ?? {};
 	recordRuntimePoolExhaustion({
@@ -2424,8 +2425,7 @@ async function handleRequestInner(
 				if (
 					isTranscribeRequest &&
 					!state.nativeOpenai &&
-					!reloadedAfterNoAccount &&
-					(policyDecision?.blockedAccountIndexes.size ?? 0) === 0
+					!reloadedAfterNoAccount
 				) {
 					reloadedAfterNoAccount = true;
 					const reloadedManager = await reloadRuntimeCredentials(state);
@@ -3621,12 +3621,33 @@ async function handleRequestInner(
 		if (isThreadGoalRequest && context.upstreamPath.endsWith("/get")) {
 			writeJson(res, HTTP_STATUS.OK, { goal: null });
 		} else {
+			const transcriptionRetryAfterMs = isTranscribeRequest
+				? (() => {
+					const now = state.now();
+					let minWaitMs: number | null = null;
+					for (const [index, skipReason] of accountSkipReasons) {
+						const account = accountManager.getAccountByIndex(index);
+						if (!account) continue;
+						let until: number | undefined;
+						if (skipReason === "transcription-rate-limited" && account.recordId) {
+							until = state.transcriptionRateLimitUntilByRecordId.get(account.recordId);
+						} else if (skipReason === "cooling-down:auth-failure") {
+							until = account.coolingDownUntil;
+						}
+						if (typeof until !== "number" || until <= now) continue;
+						const waitMs = until - now;
+						minWaitMs = minWaitMs === null ? waitMs : Math.min(minWaitMs, waitMs);
+					}
+					return minWaitMs ?? 0;
+				})()
+				: undefined;
 			writePoolExhausted({
 				res,
 				accountManager,
 				family: context.family,
 				model: context.model,
 				reason: exhaustionReason,
+				retryAfterMs: transcriptionRetryAfterMs,
 				accountSkipReasons: Object.fromEntries(
 					[...accountSkipReasons.entries()].map(([index, reason]) => [
 						String(index),

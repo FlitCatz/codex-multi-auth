@@ -164,14 +164,6 @@ export async function reloadRuntimeCredentials(
 
 	state.credentialReloadPromise = (async () => {
 		const previousManager = state.activeAccountManager;
-		const reloaded = await AccountManager.loadFromDisk();
-		reloaded.setRoutingMutexMode(state.routingMutexMode);
-		// Snapshot only after the disk read resolves. Inference can still update
-		// the old live manager while I/O is pending, and those observations must
-		// be carried into the replacement manager before it becomes active.
-		const previousAccounts = previousManager.getAccountsSnapshot();
-		const freshAccounts = reloaded.getAccountsSnapshot();
-		const claimed = new Set<number>();
 		/** Stable matching key for carrying only runtime observations between credential snapshots. */
 		const identityOf = (account: { accountId?: string; email?: string; refreshToken?: string }) => {
 			const accountId = account.accountId?.trim();
@@ -182,18 +174,49 @@ export async function reloadRuntimeCredentials(
 					? `refresh:${account.refreshToken.trim()}`
 					: null;
 		};
+		// Capture auth before I/O so a token rotation that lands while loadFromDisk
+		// is suspended can be distinguished from credentials intentionally changed
+		// on disk by another login. Only the former is carried into the replacement.
+		const authBeforeLoad = previousManager.getAccountsSnapshot();
+		const reloaded = await AccountManager.loadFromDisk();
+		reloaded.setRoutingMutexMode(state.routingMutexMode);
+		// Snapshot only after the disk read resolves. Inference can still update
+		// the old live manager while I/O is pending, and those observations must
+		// be carried into the replacement manager before it becomes active.
+		const previousAccounts = previousManager.getAccountsSnapshot();
+		const freshAccounts = reloaded.getAccountsSnapshot();
+		const claimed = new Set<number>();
 		for (const previous of previousAccounts) {
 			const candidates = freshAccounts.filter((account) => !claimed.has(account.index));
-			const identity = identityOf(previous);
+			const baseline = authBeforeLoad.find((account) =>
+				(account.recordId && account.recordId === previous.recordId) ||
+				account.index === previous.index,
+			);
+			const identities = new Set(
+				[identityOf(previous), baseline ? identityOf(baseline) : null].filter(
+					(identity): identity is string => identity !== null,
+				),
+			);
 			const matched = candidates.find((account) =>
 				account.recordId && account.recordId === previous.recordId,
-			) ?? (identity === null
-				? undefined
-				: candidates.find((account) => identityOf(account) === identity));
+			) ?? candidates.find((account) => {
+				const identity = identityOf(account);
+				return identity !== null && identities.has(identity);
+			});
 			if (!matched) continue;
 			claimed.add(matched.index);
 			const live = reloaded.getAccountByIndex(matched.index);
 			if (!live) continue;
+			const authRotatedDuringLoad = baseline !== undefined && (
+				baseline.access !== previous.access ||
+				baseline.refreshToken !== previous.refreshToken ||
+				baseline.expires !== previous.expires
+			);
+			if (authRotatedDuringLoad) {
+				live.access = previous.access;
+				live.refreshToken = previous.refreshToken;
+				live.expires = previous.expires;
+			}
 			for (const [key, until] of Object.entries(previous.rateLimitResetTimes)) {
 				if (typeof until === "number" && until > state.now()) {
 					live.rateLimitResetTimes[key] = Math.max(live.rateLimitResetTimes[key] ?? 0, until);
