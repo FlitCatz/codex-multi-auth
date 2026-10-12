@@ -2898,14 +2898,22 @@ async function handleRequestInner(
 			if (upstream.status === HTTP_STATUS.TOO_MANY_REQUESTS) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
 				if (isTranscribeRequest) {
+					const now = state.now();
 					const retryAfterMs =
-						parseRetryAfterHeaderMs(upstream.headers, state.now()) ??
-						parseRetryAfterBodyMs(bodyText, state.now()) ??
+						parseRetryAfterHeaderMs(upstream.headers, now) ??
+						parseRetryAfterBodyMs(bodyText, now) ??
 						60_000;
+					for (const [recordId, until] of state.transcriptionRateLimitUntilByRecordId) {
+						if (until <= now) state.transcriptionRateLimitUntilByRecordId.delete(recordId);
+					}
 					if (refreshed.account.recordId) {
+						const boundedDelayMs = Math.min(
+							MAX_RATE_LIMIT_DELAY_MS,
+							Math.max(1_000, Math.floor(retryAfterMs)),
+						);
 						state.transcriptionRateLimitUntilByRecordId.set(
 							refreshed.account.recordId,
-							state.now() + Math.max(1_000, Math.floor(retryAfterMs)),
+							now + boundedDelayMs,
 						);
 					}
 					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));

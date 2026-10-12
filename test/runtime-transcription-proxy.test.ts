@@ -1,7 +1,7 @@
 ﻿import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountManager } from "../lib/accounts.js";
 import { clearCircuitBreakers } from "../lib/circuit-breaker.js";
-import { HTTP_STATUS, OPENAI_HEADERS } from "../lib/constants.js";
+import { HTTP_STATUS, MAX_RATE_LIMIT_DELAY_MS, OPENAI_HEADERS } from "../lib/constants.js";
 import * as runtimePolicy from "../lib/policy/runtime-policy.js";
 import { resetRefreshQueue } from "../lib/refresh-queue.js";
 import { resetTrackers } from "../lib/rotation.js";
@@ -245,6 +245,41 @@ describe("runtime transcription proxy", () => {
 		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-1");
 		expect(calls[1]?.headers.get("authorization")).toBe("Bearer access-2");
 		expect(proxy.getStatus().rotations).toBe(0);
+	});
+
+	it("clamps a huge transcription Retry-After to the shared maximum", async () => {
+		const baseNow = Date.now();
+		let clock = baseNow;
+		vi.spyOn(Date, "now").mockImplementation(() => clock);
+		const storage = createStorage(baseNow, 2);
+		for (const account of storage.accounts) {
+			account.expiresAt = baseNow + MAX_RATE_LIMIT_DELAY_MS + 86_400_000;
+		}
+		const manager = new AccountManager(undefined, storage);
+		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) => {
+			if (attempt === 1) {
+				return new Response(JSON.stringify({ error: { code: "rate_limit_exceeded" } }), {
+					status: HTTP_STATUS.TOO_MANY_REQUESTS,
+					headers: { "content-type": "application/json", "retry-after": "999999999" },
+				});
+			}
+			return new Response(JSON.stringify({ text: "ok" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const first = await postTranscribe(proxy, Buffer.from("--first--\r\n"));
+		expect(first.status).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+		const second = await postTranscribe(proxy, Buffer.from("--second--\r\n"));
+		expect(second.status).toBe(HTTP_STATUS.OK);
+		expect(calls[1]?.headers.get("authorization")).toBe("Bearer access-2");
+
+		clock = baseNow + MAX_RATE_LIMIT_DELAY_MS + 1;
+		const third = await postTranscribe(proxy, Buffer.from("--third--\r\n"));
+		expect(third.status).toBe(HTTP_STATUS.OK);
+		expect(calls[2]?.headers.get("authorization")).toBe("Bearer access-1");
 	});
 
 	it("forwards Cloudflare 403 once without rotating or disabling accounts", async () => {
