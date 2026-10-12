@@ -185,38 +185,130 @@ export async function reloadRuntimeCredentials(
 		// be carried into the replacement manager before it becomes active.
 		const previousAccounts = previousManager.getAccountsSnapshot();
 		const freshAccounts = reloaded.getAccountsSnapshot();
-		const claimed = new Set<number>();
-		for (const previous of previousAccounts) {
-			const candidates = freshAccounts.filter((account) => !claimed.has(account.index));
-			const baseline = authBeforeLoad.find((account) =>
+		const credentialInventoryFingerprint = (
+			accounts: ReturnType<AccountManager["getAccountsSnapshot"]>,
+		): string => JSON.stringify(accounts.map((account) => ({
+			recordId: account.recordId ?? null,
+			accountId: account.accountId?.trim() ?? null,
+			accountIdSource: account.accountIdSource ?? null,
+			email: sanitizeEmail(account.email) ?? null,
+			refreshToken: account.refreshToken,
+			access: account.access ?? null,
+			expires: account.expires ?? null,
+			enabled: account.enabled !== false,
+			authInvalidatedAt: account.authInvalidatedAt ?? null,
+			authInvalidationErrorCode: account.authInvalidationErrorCode ?? null,
+			workspaces: (account.workspaces ?? []).map((workspace) => ({
+				id: workspace.id.trim(),
+				name: workspace.name ?? null,
+				enabled: workspace.enabled !== false,
+				disabledAt: workspace.disabledAt ?? null,
+				isDefault: workspace.isDefault ?? null,
+			})),
+			currentWorkspaceIndex: account.currentWorkspaceIndex ?? null,
+		})));
+		// A credential probe that finds the exact same inventory must not swap the
+		// live manager. Returning the resident object preserves inference cursors,
+		// lastUsed state, and in-flight runtime observations while still bounding
+		// disk checks through lastCredentialReloadAt.
+		if (credentialInventoryFingerprint(authBeforeLoad) === credentialInventoryFingerprint(freshAccounts)) {
+			state.lastCredentialReloadAt = Date.now();
+			return previousManager;
+		}
+
+		const baselineFor = (previous: (typeof previousAccounts)[number]) =>
+			authBeforeLoad.find((account) =>
 				(account.recordId && account.recordId === previous.recordId) ||
 				account.index === previous.index,
 			);
+		const workspaceIds = (account: {
+			accountId?: string;
+			workspaces?: Array<{ id: string }>;
+		}): Set<string> => new Set([
+			account.accountId?.trim(),
+			...(account.workspaces ?? []).map((workspace) => workspace.id.trim()),
+		].filter((value): value is string => Boolean(value)));
+		const hasWorkspaceConflict = (
+			previous: (typeof previousAccounts)[number],
+			baseline: (typeof authBeforeLoad)[number] | undefined,
+			candidate: (typeof freshAccounts)[number],
+		): boolean => {
+			const sourceIds = workspaceIds(previous);
+			if (baseline) {
+				for (const id of workspaceIds(baseline)) sourceIds.add(id);
+			}
+			const candidateIds = workspaceIds(candidate);
+			return sourceIds.size > 0 && candidateIds.size > 0 &&
+				![...sourceIds].some((id) => candidateIds.has(id));
+		};
+		const claimed = new Set<number>();
+		const matchedFreshIndexByPrevious = new Map<number, number>();
+		const reserve = (
+			previous: (typeof previousAccounts)[number],
+			candidate: (typeof freshAccounts)[number] | undefined,
+		): boolean => {
+			if (!candidate || claimed.has(candidate.index)) return false;
+			claimed.add(candidate.index);
+			matchedFreshIndexByPrevious.set(previous.index, candidate.index);
+			return true;
+		};
+
+		// Reserve every strong match for every old row before considering fuzzy
+		// fallbacks. This prevents an earlier deleted row from stealing the only
+		// surviving same-email workspace before that survivor can claim itself.
+		for (const previous of previousAccounts) {
+			if (!previous.recordId) continue;
+			const matches = freshAccounts.filter((account) =>
+				!claimed.has(account.index) && account.recordId === previous.recordId,
+			);
+			if (matches.length === 1) reserve(previous, matches[0]);
+		}
+		for (const previous of previousAccounts) {
+			if (matchedFreshIndexByPrevious.has(previous.index)) continue;
+			const baseline = baselineFor(previous);
 			const identities = new Set(
 				[identityOf(previous), baseline ? identityOf(baseline) : null].filter(
 					(identity): identity is string => identity !== null,
 				),
 			);
-			const identityMatched = candidates.find((account) => {
+			const matches = freshAccounts.filter((account) => {
+				if (claimed.has(account.index)) return false;
 				const identity = identityOf(account);
 				return identity !== null && identities.has(identity);
 			});
-			const stableEmail = sanitizeEmail(previous.email) ?? sanitizeEmail(baseline?.email);
-			const emailMatches = stableEmail
-				? candidates.filter((account) => sanitizeEmail(account.email) === stableEmail)
-				: [];
-			const refreshMatches = candidates.filter((account) =>
-				account.refreshToken === previous.refreshToken ||
-				(baseline !== undefined && account.refreshToken === baseline.refreshToken),
+			if (matches.length === 1) reserve(previous, matches[0]);
+		}
+		for (const previous of previousAccounts) {
+			if (matchedFreshIndexByPrevious.has(previous.index)) continue;
+			const baseline = baselineFor(previous);
+			const refreshTokens = new Set(
+				[previous.refreshToken, baseline?.refreshToken].filter(
+					(value): value is string => Boolean(value),
+				),
 			);
-			const matched = candidates.find((account) =>
-				account.recordId && account.recordId === previous.recordId,
-			) ?? identityMatched
-				?? (emailMatches.length === 1 ? emailMatches[0] : undefined)
-				?? (refreshMatches.length === 1 ? refreshMatches[0] : undefined);
-			if (!matched) continue;
-			claimed.add(matched.index);
-			const live = reloaded.getAccountByIndex(matched.index);
+			const matches = freshAccounts.filter((account) =>
+				!claimed.has(account.index) && refreshTokens.has(account.refreshToken),
+			);
+			if (matches.length === 1) reserve(previous, matches[0]);
+		}
+		for (const previous of previousAccounts) {
+			if (matchedFreshIndexByPrevious.has(previous.index)) continue;
+			const baseline = baselineFor(previous);
+			const stableEmail = sanitizeEmail(previous.email) ?? sanitizeEmail(baseline?.email);
+			if (!stableEmail) continue;
+			const matches = freshAccounts.filter((account) =>
+				!claimed.has(account.index) &&
+				sanitizeEmail(account.email) === stableEmail &&
+				!hasWorkspaceConflict(previous, baseline, account),
+			);
+			if (matches.length === 1) reserve(previous, matches[0]);
+		}
+
+		for (const previous of previousAccounts) {
+			const matchedIndex = matchedFreshIndexByPrevious.get(previous.index);
+			if (matchedIndex === undefined) continue;
+			const baseline = baselineFor(previous);
+			const live = reloaded.getAccountByIndex(matchedIndex);
 			if (!live) continue;
 			const authRotatedDuringLoad = baseline !== undefined && (
 				baseline.access !== previous.access ||

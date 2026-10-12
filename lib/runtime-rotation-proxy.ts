@@ -2424,18 +2424,10 @@ async function handleRequestInner(
 					: selectAccount();
             for (const index of catalogExcludedIndexes()) accountSkipReasons.set(index, "model-not-supported");
 			if (!selected) {
-				const transcriptionBlockedOnlyByEndpointBackoff =
-					isTranscribeRequest &&
-					accountSkipReasons.size > 0 &&
-					(policyDecision?.blockedAccountIndexes.size ?? 0) === 0 &&
-					[...accountSkipReasons.values()].every(
-						(reason) => reason === "transcription-rate-limited",
-					);
 				if (
 					isTranscribeRequest &&
 					!state.nativeOpenai &&
-					!reloadedAfterNoAccount &&
-					!transcriptionBlockedOnlyByEndpointBackoff
+					!reloadedAfterNoAccount
 				) {
 					reloadedAfterNoAccount = true;
 					const reloadedManager = await reloadRuntimeCredentials(state);

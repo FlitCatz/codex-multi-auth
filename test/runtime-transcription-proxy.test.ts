@@ -309,7 +309,37 @@ describe("runtime transcription proxy", () => {
 		expect(exhausted.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
 		expect(payload.error.retry_after_ms).toBe(30_000);
 		expect(calls).toHaveLength(2);
-		expect(reloadSpy).not.toHaveBeenCalled();
+		expect(reloadSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("discovers a newly logged-in credential while resident credentials are transcription-rate-limited", async () => {
+		const baseNow = Date.now();
+		vi.spyOn(Date, "now").mockReturnValue(baseNow);
+		const manager = new AccountManager(undefined, createStorage(baseNow, 1));
+		const refreshed = new AccountManager(undefined, createStorage(baseNow, 2));
+		const loadFromDisk = vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(refreshed);
+		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) =>
+			attempt === 1
+				? new Response(JSON.stringify({ error: { code: "rate_limit_exceeded" } }), {
+					status: HTTP_STATUS.TOO_MANY_REQUESTS,
+					headers: { "content-type": "application/json", "retry-after": "60" },
+				})
+				: new Response(JSON.stringify({ text: "new login" }), {
+					status: HTTP_STATUS.OK,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		expect((await postTranscribe(proxy, Buffer.from("--limited--\r\n"))).status)
+			.toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+		const recovered = await postTranscribe(proxy, Buffer.from("--after-login--\r\n"));
+
+		expect(recovered.status).toBe(HTTP_STATUS.OK);
+		expect(loadFromDisk).toHaveBeenCalledTimes(1);
+		expect(calls).toHaveLength(2);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-1");
+		expect(calls[1]?.headers.get("authorization")).toBe("Bearer access-2");
 	});
 
 	it("waits for the latest auth and transcription deadline on one credential", async () => {
@@ -406,7 +436,7 @@ describe("runtime transcription proxy", () => {
 		const after = await postTranscribe(proxy, Buffer.from("--after--\r\n"));
 		expect(after.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
 		expect(calls).toHaveLength(2);
-		expect(loadFromDisk).not.toHaveBeenCalled();
+		expect(loadFromDisk).toHaveBeenCalledTimes(1);
 	});
 
 	it("keeps the longest overlapping transcription backoff window", async () => {
@@ -446,7 +476,7 @@ describe("runtime transcription proxy", () => {
 		const afterShortWindow = await postTranscribe(proxy, Buffer.from("--after-short--\r\n"));
 		expect(afterShortWindow.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
 		expect(calls).toHaveLength(2);
-		expect(loadFromDisk).not.toHaveBeenCalled();
+		expect(loadFromDisk).toHaveBeenCalledTimes(1);
 	});
 
 	it("forwards Cloudflare 403 once without rotating or disabling accounts", async () => {

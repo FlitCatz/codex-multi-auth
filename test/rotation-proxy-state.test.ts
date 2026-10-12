@@ -110,6 +110,52 @@ describe("createRotationProxyState", () => {
 });
 
 describe("reloadRuntimeCredentials", () => {
+	it("keeps the resident manager when a credential probe finds no inventory change", async () => {
+		const state = createRotationProxyState(stateInit());
+		const resident = state.activeAccountManager;
+		const duplicate = new AccountManager(undefined, storageWith(1));
+		loadFromDisk.mockResolvedValueOnce(duplicate);
+
+		const result = await reloadRuntimeCredentials(state);
+
+		expect(result).toBe(resident);
+		expect(state.activeAccountManager).toBe(resident);
+		expect(state.knownAccountManagers.has(duplicate)).toBe(false);
+	});
+
+	it("reserves the surviving same-email workspace before carrying runtime waits", async () => {
+		const initialStorage = storageWith(2);
+		initialStorage.accounts[0]!.recordId = "row-a";
+		initialStorage.accounts[0]!.email = "shared@example.com";
+		initialStorage.accounts[0]!.accountId = "workspace-a";
+		initialStorage.accounts[0]!.workspaces = [{ id: "workspace-a", enabled: true }];
+		initialStorage.accounts[1]!.recordId = "row-b";
+		initialStorage.accounts[1]!.email = "shared@example.com";
+		initialStorage.accounts[1]!.accountId = "workspace-b";
+		initialStorage.accounts[1]!.workspaces = [{ id: "workspace-b", enabled: true }];
+		const resident = new AccountManager(undefined, initialStorage);
+		const state = createRotationProxyState({ ...stateInit(), activeAccountManager: resident });
+		const removed = resident.getAccountByIndex(0);
+		const survivor = resident.getAccountByIndex(1);
+		if (!removed || !survivor) throw new Error("missing same-email test accounts");
+		removed.rateLimitResetTimes["codex:workspace-a"] = NOW + 60_000;
+		survivor.rateLimitResetTimes["codex:workspace-b"] = NOW + 120_000;
+
+		const diskStorage = storageWith(1);
+		diskStorage.accounts[0] = structuredClone(initialStorage.accounts[1]!);
+		diskStorage.accounts[0]!.rateLimitResetTimes = {};
+		const reloaded = new AccountManager(undefined, diskStorage);
+		loadFromDisk.mockResolvedValueOnce(reloaded);
+
+		const result = await reloadRuntimeCredentials(state);
+		const active = result?.getAccountByIndex(0);
+
+		expect(active?.recordId).toBe("row-b");
+		expect(active?.accountId).toBe("workspace-b");
+		expect(active?.rateLimitResetTimes["codex:workspace-b"]).toBe(NOW + 120_000);
+		expect(active?.rateLimitResetTimes["codex:workspace-a"]).toBeUndefined();
+	});
+
 	it("carries a token rotation that lands while disk loading is pending", async () => {
 		const state = createRotationProxyState(stateInit());
 		const previous = state.activeAccountManager.getAccountByIndex(0);
