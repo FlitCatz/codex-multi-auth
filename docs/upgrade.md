@@ -68,7 +68,10 @@ checks share persisted results; program evidence expires after 24 hours even
 when other capabilities were checked recently. Each claimed daily pass refreshes
 program evidence that would expire before its next run, so it can repeat a full
 capability pass even after a recently completed live check. An overlapping probe completed after the daily pass
-started is reused. No credential, workspace,
+started is reused. The next run follows persisted daily claim deadlines rather
+than waiting another day after a slow pass completes; overdue runs catch up
+without overlapping. Credential resets also remove automatic-check history.
+No credential, workspace,
 subscription priming, or request-program setting is migrated.
 
 `status`, `status --json`, and `rotation status` expose sanitized historical

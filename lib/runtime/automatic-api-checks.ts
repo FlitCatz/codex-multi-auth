@@ -19,8 +19,12 @@ const eligible=(route:ApiRouteCredential)=>route.enabled&&route.probeCapabilitie
 function claimKey(route:ApiRouteCredential){return createHash("sha256").update(JSON.stringify([route.id,route.kind,route.apiKey])).digest("hex");}
 function sameRoute(a:ApiRouteCredential,b:ApiRouteCredential){return JSON.stringify(Object.entries(a).sort(([x],[y])=>x.localeCompare(y)))===JSON.stringify(Object.entries(b).sort(([x],[y])=>x.localeCompare(y)));}
 
-export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>Promise<ApiRouteCredential[]>;check:(route:ApiRouteCredential,signal:AbortSignal)=>Promise<void>;now?:()=>number;signal?:AbortSignal}){
+export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>Promise<ApiRouteCredential[]>;check:(route:ApiRouteCredential,signal:AbortSignal,programRefreshBefore:number)=>Promise<void>;now?:()=>number;signal?:AbortSignal}){
  const signal=options.signal??new AbortController().signal;
+ // Claims name the scheduled pass, so I/O and later routes cannot move its horizon.
+ const startedAt=options.now?.()??Date.now();
+ let nextRunAt:number|undefined;
+ const includeDeadline=(at:number)=>{nextRunAt=Math.min(nextRunAt??Infinity,at+AUTOMATIC_API_CHECK_INTERVAL_MS);};
  if(signal.aborted)return;
  const routes=(await options.loadRoutes()).filter(eligible);
  if(!routes.length)return;
@@ -29,7 +33,10 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
   const current=(await options.loadRoutes()).find(r=>eligible(r)&&key(r)===key(route));
   if(!current)continue;
   // Commit the claim before network I/O. Concurrent routers and restarts share it.
+  let programRefreshBefore=startedAt+AUTOMATIC_API_CHECK_INTERVAL_MS;
   const claimed=await withFileTransactionLock(options.path,async()=>{
+   // A credential wipe can finish while this checker is queued for the lock.
+   if(signal.aborted||!(await options.loadRoutes()).some(r=>eligible(r)&&sameRoute(r,current)))return false;
    let attempts:Record<string,number>={};
    let raw:string|undefined,repairHistory=false;
    try{raw=await withRetry(()=>fs.readFile(options.path,"utf8"),retry);}catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;}
@@ -39,24 +46,27 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
    // Seed every eligible route so a restart can resume normally the next day.
    if(repairHistory)attempts=Object.fromEntries((await options.loadRoutes()).filter(eligible).map(route=>[claimKey(route),now]));
    const last=attempts[id] ?? attempts[key(current)];
-   if(signal.aborted||(!repairHistory&&last!==undefined&&last<=now+300_000&&now-last<AUTOMATIC_API_CHECK_INTERVAL_MS))return false;
+   if(signal.aborted)return false;
+   if(!repairHistory&&last!==undefined&&last<=now+300_000&&now-last<AUTOMATIC_API_CHECK_INTERVAL_MS){includeDeadline(last);return false;}
    // Keep other processes' claims; prune only the oldest history at a fixed bound.
    for(const [old] of Object.entries(attempts).sort((a,b)=>b[1]-a[1]).slice(999))delete attempts[old];
-   attempts[id]=now;const temp=tempPathFor(options.path);
+   const claimedAt=repairHistory?now:Math.min(startedAt,now);
+   attempts[id]=claimedAt;programRefreshBefore=claimedAt+AUTOMATIC_API_CHECK_INTERVAL_MS;
+   includeDeadline(claimedAt);const temp=tempPathFor(options.path);
    await fs.mkdir(dirname(options.path),{recursive:true,mode:0o700});
    try{await fs.writeFile(temp,JSON.stringify(attempts)+"\n",{mode:0o600,flag:"wx"});await withRetry(()=>fs.rename(temp,options.path),retry);}finally{await withRetry(()=>fs.rm(temp,{force:true}),retry);}
    if(repairHistory)logWarn("Automatic API check history repaired; billable checks deferred for one daily interval.");
    return !repairHistory;
   },{signal});
   if(!claimed||signal.aborted)continue;
-  try{await options.check(current,signal);}catch{if(!signal.aborted)logWarn("Automatic API capability check failed; retry deferred until the next daily interval.");}
+  try{await options.check(current,signal,programRefreshBefore);}catch{if(!signal.aborted)logWarn("Automatic API capability check failed; retry deferred until the next daily interval.");}
  }
+ return nextRunAt;
 }
 export function createAutomaticApiCheck(){return async(signal:AbortSignal)=>{
- const programRefreshBefore=Date.now()+AUTOMATIC_API_CHECK_INTERVAL_MS;
  return runAutomaticApiChecks({
  path:join(getCodexMultiAuthDir(),"automatic-api-checks.json"),loadRoutes:loadApiRoutes,signal,
- check:async(route,stop)=>{
+ check:async(route,stop,programRefreshBefore)=>{
   let acceptedRoute=route, discoveryAccepted=true;
   const updateDiscovery:typeof updateApiModelDiscovery=async(original,models)=>{
    discoveryAccepted=false;
@@ -82,10 +92,16 @@ export function createAutomaticApiCheck(){return async(signal:AbortSignal)=>{
   if(current)await saveModelInventory(inventory,{mergeEntries:true});
  },
 });};}
-/** Daily checks run off startup, never overlap, and drain on shutdown. */
-export function startAutomaticApiChecks(run:(signal:AbortSignal)=>Promise<void>){
+/** Daily checks follow persisted claim deadlines, never overlap, and drain on shutdown. */
+export function startAutomaticApiChecks(run:(signal:AbortSignal)=>Promise<number|void>){
  const controller=new AbortController();let pending:Promise<void>|undefined;let timer:ReturnType<typeof setTimeout>|undefined;
  const schedule=(delay:number)=>{if(!controller.signal.aborted){timer=setTimeout(tick,delay);timer.unref();}};
- const tick=()=>{timer=undefined;if(controller.signal.aborted)return;pending=Promise.resolve().then(()=>run(controller.signal)).catch(()=>{if(!controller.signal.aborted)logWarn("Automatic API capability checks unavailable; retry deferred.");}).finally(()=>{pending=undefined;schedule(AUTOMATIC_API_CHECK_INTERVAL_MS);});};
+ const tick=()=>{
+  timer=undefined;if(controller.signal.aborted)return;
+  let nextRunAt=Date.now()+AUTOMATIC_API_CHECK_INTERVAL_MS;
+  pending=Promise.resolve().then(()=>run(controller.signal)).then(due=>{if(typeof due==="number"&&Number.isFinite(due))nextRunAt=due;})
+   .catch(()=>{if(!controller.signal.aborted)logWarn("Automatic API capability checks unavailable; retry deferred.");})
+   .finally(()=>{pending=undefined;schedule(Math.min(AUTOMATIC_API_CHECK_INTERVAL_MS,Math.max(0,nextRunAt-Date.now())));});
+ };
  schedule(5000);return{async stop(){clearTimeout(timer);controller.abort();await pending;}};
 }

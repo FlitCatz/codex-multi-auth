@@ -28,6 +28,7 @@ export async function clearCredentialSidecars(): Promise<void> {
 	for (const path of [
 		join(dir, "reset-credits.json"),
 		join(dir, "api-capability-probes.json"),
+		join(dir, "automatic-api-checks.json"),
 	]) {
 		await withFileTransactionLock(path, () =>
 			withRetry(() => fs.rm(path, { force: true }), retry),

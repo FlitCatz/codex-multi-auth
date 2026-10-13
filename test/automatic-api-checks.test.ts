@@ -216,3 +216,144 @@ it.each([undefined, "EBUSY", "EPERM"])("stops daily discovery and drains owner c
  expect(cleanupFailures).toBe(cleanupCode?1:0);
  expect((await fs.readdir(join(root,"api-probe-locks"))).filter(name=>name.includes("candidate")||name.endsWith("write-lock"))).toEqual([]);
 });
+
+it.each([false, true])("keeps the next tick anchored when a slow run rejects: %s", async (reject) => {
+ vi.useFakeTimers();
+ let release!: () => void;
+ const gate = new Promise<void>(resolve => { release = resolve; });
+ const run = vi.fn(async () => { await gate; if (reject) throw Error("fixture"); });
+ const scheduler = startAutomaticApiChecks(run);
+ try {
+  await vi.advanceTimersByTimeAsync(5000);
+  await vi.advanceTimersByTimeAsync(60_000);
+  release(); await vi.advanceTimersByTimeAsync(0);
+  await vi.advanceTimersByTimeAsync(AUTOMATIC_API_CHECK_INTERVAL_MS - 60_000 - 1);
+  expect(run).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(run).toHaveBeenCalledTimes(2);
+ } finally { release(); await scheduler.stop(); }
+});
+
+it("uses persisted claim deadlines despite slow claim I/O and later routes", async () => {
+ const path = await fixture();
+ vi.useFakeTimers(); vi.setSystemTime(1000);
+ let releaseLoad!: () => void, releaseLater!: () => void;
+ const loadGate = new Promise<void>(resolve => { releaseLoad = resolve; });
+ const laterGate = new Promise<void>(resolve => { releaseLater = resolve; });
+ let loads = 0, completions = 0;
+ const routes = [route("early"), route("later")];
+ const check = vi.fn(async (current: ApiRouteCredential, _signal: AbortSignal, _horizon: number) => { if (current.id === "later") await laterGate; });
+ const run = vi.fn(async (signal: AbortSignal) => {
+  const next = await runAutomaticApiChecks({path, signal, check, loadRoutes: async () => {
+   if (++loads === 1) await loadGate;
+   return routes;
+  }});
+  completions++;
+  return next;
+ });
+ const scheduler = startAutomaticApiChecks(run);
+ try {
+  await vi.advanceTimersByTimeAsync(5000);
+  const start = Date.now();
+  await vi.advanceTimersByTimeAsync(10_000);
+  releaseLoad();
+  await vi.waitFor(() => expect(check).toHaveBeenCalledTimes(2));
+  const claims = JSON.parse(await readFile(path, "utf8"));
+  expect(Object.values(claims)).toEqual([start, start]);
+  expect(check.mock.calls[0]?.[2]).toBe(start + AUTOMATIC_API_CHECK_INTERVAL_MS);
+  await vi.advanceTimersByTimeAsync(60_000);
+  releaseLater();
+  await vi.waitFor(() => expect(completions).toBe(1));
+  expect(await run.mock.results[0]!.value).toBe(start + AUTOMATIC_API_CHECK_INTERVAL_MS);
+  await vi.advanceTimersByTimeAsync(start + AUTOMATIC_API_CHECK_INTERVAL_MS - Date.now() - 1);
+  expect(run).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1);
+  await vi.waitFor(() => expect(completions).toBe(2));
+  expect(check).toHaveBeenCalledTimes(4);
+ } finally {
+  releaseLoad(); releaseLater();
+  let drained = false;
+  const stop = scheduler.stop().finally(() => { drained = true; });
+  try { await vi.waitFor(() => expect(drained).toBe(true)); await stop; }
+  finally { vi.useRealTimers(); }
+ }
+});
+
+it("returns an existing claim deadline when a restart runs before it is due", async () => {
+ const path = await fixture(), check = vi.fn(async () => {});
+ const options = {path, check, loadRoutes: async () => [route("existing")]};
+ await runAutomaticApiChecks({...options, now: () => 1000});
+ expect(await runAutomaticApiChecks({...options, now: () => 2000})).toBe(1000 + AUTOMATIC_API_CHECK_INTERVAL_MS);
+ expect(check).toHaveBeenCalledTimes(1);
+});
+
+it("does not recreate cleared history from a route snapshot queued behind the wipe lock", async () => {
+ const {withFileTransactionLock} = await import("../lib/storage/file-lock.js");
+ const path = await fixture();
+ let routes = [route("removed")], release!: () => void, entered!: () => void;
+ const gate = new Promise<void>(resolve => { release = resolve; });
+ const enteredGate = new Promise<void>(resolve => { entered = resolve; });
+ const owner = withFileTransactionLock(path, async () => { entered(); await gate; routes = []; await fs.rm(path, {force: true}); });
+ await enteredGate;
+ let contended = false;
+ const rename = fs.rename.bind(fs);
+ const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+  try { return await rename(from, to); }
+  catch (error) { if (String(to).endsWith(".write-lock")) contended = true; throw error; }
+ });
+ const check = vi.fn(async () => {});
+ vi.useFakeTimers();
+ const waiting = runAutomaticApiChecks({path, check, loadRoutes: async () => routes});
+ try {
+  await vi.waitFor(() => expect(contended).toBe(true));
+  release();
+  let drained = false;
+  const done = Promise.all([owner, waiting]).finally(() => { drained = true; });
+  await vi.waitFor(() => expect(drained).toBe(true)); await done;
+  expect(check).not.toHaveBeenCalled();
+  await expect(readFile(path, "utf8")).rejects.toMatchObject({code: "ENOENT"});
+ } finally {
+  release();
+  let drained = false;
+  const done = Promise.allSettled([owner, waiting]).finally(() => { drained = true; });
+  try { await vi.waitFor(() => expect(drained).toBe(true)); await done; }
+  finally { vi.useRealTimers(); renameSpy.mockRestore(); }
+ }
+});
+
+it("bounds a pending run's next timer after a large clock rollback", async () => {
+ vi.useFakeTimers(); vi.setSystemTime(40 * AUTOMATIC_API_CHECK_INTERVAL_MS);
+ let release!: () => void;
+ const gate = new Promise<void>(resolve => { release = resolve; });
+ const run = vi.fn(async () => { await gate; });
+ const scheduler = startAutomaticApiChecks(run);
+ try {
+  await vi.advanceTimersByTimeAsync(5000);
+  vi.setSystemTime(1000);
+  release(); await vi.advanceTimersByTimeAsync(0);
+  await vi.advanceTimersByTimeAsync(AUTOMATIC_API_CHECK_INTERVAL_MS - 1);
+  expect(run).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(run).toHaveBeenCalledTimes(2);
+ } finally { release(); await scheduler.stop(); }
+});
+
+it("drains an overdue run before one immediate catch-up without overlap", async () => {
+ vi.useFakeTimers();
+ let release!: () => void;
+ const gate = new Promise<void>(resolve => { release = resolve; });
+ const starts: number[] = [];
+ const run = vi.fn(async () => { starts.push(Date.now()); if (run.mock.calls.length === 1) await gate; });
+ const scheduler = startAutomaticApiChecks(run);
+ try {
+  await vi.advanceTimersByTimeAsync(5000);
+  await vi.advanceTimersByTimeAsync(2 * AUTOMATIC_API_CHECK_INTERVAL_MS);
+  expect(run).toHaveBeenCalledTimes(1);
+  release(); await vi.advanceTimersByTimeAsync(1);
+  expect(run).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(starts[1]! + AUTOMATIC_API_CHECK_INTERVAL_MS - Date.now() - 1);
+  expect(run).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(run).toHaveBeenCalledTimes(3);
+ } finally { release(); await scheduler.stop(); }
+});

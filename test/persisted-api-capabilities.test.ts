@@ -211,28 +211,35 @@ it("does not put non-probing inference metadata behind a paid probe lease", asyn
     const fetcher: typeof fetch = async (_input, init) => { if (init?.method !== "POST")
         return new Response("missing", { status: 404 }); started(); await gate; return Response.json({ output: [] }); };
     let paid: Promise<unknown> | undefined;
-    let hangGuard: ReturnType<typeof setTimeout> | undefined;
+    let metadata: Promise<unknown> | undefined;
+    vi.useFakeTimers();
     try {
         paid = enrichPersistedApiCapabilities([apiPickerModel("fixture")], false, route, false, { fetchImpl: fetcher });
         await first;
-        // A generous hang guard only: success must arrive before releasing the paid gate.
-        const result = await Promise.race([
-            enrichPersistedApiCapabilities([apiPickerModel("fixture")], false, { ...route, probeCapabilities: false }, false, { fetchImpl: fetcher }),
-            new Promise<never>((_, reject) => { hangGuard = setTimeout(() => reject(Error("non-probing metadata blocked behind paid lease")), 10000); hangGuard.unref(); }),
-        ]);
-        expect(result).toHaveLength(1);
+        // Keep the paid request held while only fake retry time advances.
+        let result: unknown;
+        metadata = enrichPersistedApiCapabilities([apiPickerModel("fixture")], false, { ...route, probeCapabilities: false }, false, { fetchImpl: fetcher })
+            .then(value => { result = value; });
+        await vi.waitFor(() => expect(result).toHaveLength(1), { timeout: 1000, interval: 50 });
     }
     finally {
-        clearTimeout(hangGuard);
         release();
-        await paid;
-        if (previous === undefined)
-            delete process.env.CODEX_MULTI_AUTH_DIR;
-        else
-            process.env.CODEX_MULTI_AUTH_DIR = previous;
-        await removeWithRetry(root, { recursive: true, force: true });
+        let drained = false;
+        const pending = Promise.allSettled([paid, metadata]).then(() => { drained = true; });
+        try {
+            // Keep advancing fake time for lock/backoff cleanup, including the
+            // failure path where a regressed metadata call waits on the lease.
+            await vi.waitFor(() => expect(drained).toBe(true), { timeout: 2000, interval: 50 });
+            await pending;
+        } finally {
+            vi.useRealTimers();
+            if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+            else process.env.CODEX_MULTI_AUTH_DIR = previous;
+            await removeWithRetry(root, { recursive: true, force: true });
+        }
     }
-}, 15000);
+});
+
 it("caps paid probes across independent routes at four", async () => {
     const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
     const { apiPickerModel } = await import("../lib/runtime/api-model-runtime.js");

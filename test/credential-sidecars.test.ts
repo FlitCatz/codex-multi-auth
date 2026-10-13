@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -11,11 +12,13 @@ beforeEach(async () => {
 	vi.stubEnv("CODEX_MULTI_AUTH_DIR", dir);
 });
 afterEach(async () => {
+	vi.useRealTimers();
+	vi.restoreAllMocks();
 	vi.unstubAllEnvs();
-	await fs.rm(dir, { recursive: true, force: true });
+	await removeWithRetry(dir, { recursive: true, force: true });
 });
 
-it.each(["reset-credits.json", "api-capability-probes.json", "api-routes.json"])(
+it.each(["reset-credits.json", "api-capability-probes.json", "automatic-api-checks.json", "api-routes.json"])(
 	"waits for an in-flight %s writer so its old state cannot reappear after the reset",
 	async (name) => {
 		const path = join(dir, name);
@@ -34,22 +37,34 @@ it.each(["reset-credits.json", "api-capability-probes.json", "api-routes.json"])
 		// Fresh spies for this case only, created after the writer owns the lock.
 		const rm = vi.spyOn(fs, "rm");
 		const rename = vi.spyOn(fs, "rename");
+		let cleared: Promise<void> | undefined;
+		vi.useFakeTimers();
 		try {
 			const removedThisPath = () => rm.mock.calls.some(([target]) => String(target) === path);
-			const cleared = clearCredentialSidecars();
+			cleared = clearCredentialSidecars();
 			// A waiter repeatedly tries to publish its candidate as this path's
 			// lock directory: proof the clear is blocked on the held lock itself.
-			await vi.waitFor(() => expect(rename.mock.calls.some(([, to]) => String(to).endsWith(`${name}.write-lock`))).toBe(true), { timeout: 5000 });
+			await vi.waitFor(() => expect(rename.mock.calls.some(([, to]) => String(to).endsWith(`${name}.write-lock`))).toBe(true), { timeout: 1000, interval: 50 });
 			expect(removedThisPath()).toBe(false);
 			release();
-			await writer;
-			await cleared;
+			let drained = false;
+			const done = Promise.all([writer, cleared]).finally(() => { drained = true; });
+			await vi.waitFor(() => expect(drained).toBe(true));
+			await done;
 			expect(removedThisPath()).toBe(true);
 			await expect(fs.stat(path)).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
 			release();
-			rm.mockRestore();
-			rename.mockRestore();
+			let drained = false;
+			const done = Promise.allSettled([writer, cleared]).finally(() => { drained = true; });
+			try {
+				await vi.waitFor(() => expect(drained).toBe(true));
+				await done;
+			} finally {
+				vi.useRealTimers();
+				rm.mockRestore();
+				rename.mockRestore();
+			}
 		}
 	},
 );
