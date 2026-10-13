@@ -1871,12 +1871,52 @@ async function handleRequestInner(
   const readSubscriptionQuota = state.readSubscriptionQuota;
   const subscriptionQuotaCache = state.nativeOpenai && isResponsesRequest && readSubscriptionQuota ? await cachedRead(state, "subscription-quota", readSubscriptionQuota).catch(()=>null) ?? null : null;
   const subscriptionQuotaByAccount: Record<number, SubscriptionQuotaPreference> = {};
+		const workspaceIds = (account: ManagedAccount): Set<string> =>
+			new Set(
+				[
+					account.accountId?.trim(),
+					...(account.workspaces ?? []).map((workspace) => workspace.id.trim()),
+				].filter((value): value is string => Boolean(value)),
+			);
+		const uniqueAccount = (candidates: ManagedAccount[]): ManagedAccount | null =>
+			candidates.length === 1 ? candidates[0] ?? null : null;
+		const matchReplacementAccount = (
+			previous: ManagedAccount,
+			replacementManager: AccountManager,
+		): ManagedAccount | null => {
+			const replacementAccounts = replacementManager.getAccountsSnapshot();
+			if (previous.recordId) {
+				return uniqueAccount(replacementAccounts.filter((candidate) => candidate.recordId === previous.recordId));
+			}
+			const sourceIds = workspaceIds(previous);
+			const compatible = replacementAccounts.filter((candidate) => {
+				const candidateIds = workspaceIds(candidate);
+				return !(
+					sourceIds.size > 0 &&
+					candidateIds.size > 0 &&
+					![...sourceIds].some((id) => candidateIds.has(id))
+				);
+			});
+			const sourceEmail = sanitizeEmail(previous.email);
+			return (
+				uniqueAccount(compatible.filter((candidate) => candidate.refreshToken === previous.refreshToken)) ??
+				(previous.accountId && sourceEmail
+					? uniqueAccount(compatible.filter((candidate) =>
+						candidate.accountId === previous.accountId && sanitizeEmail(candidate.email) === sourceEmail))
+					: null) ??
+				(previous.accountId
+					? uniqueAccount(compatible.filter((candidate) => candidate.accountId === previous.accountId))
+					: null) ??
+				(sourceEmail
+					? uniqueAccount(compatible.filter((candidate) => sanitizeEmail(candidate.email) === sourceEmail))
+					: null)
+			);
+		};
 		const remapRequestWorkspaceState = (
 			previousManager: AccountManager,
 			replacementManager: AccountManager,
 		): void => {
 			const previousAccounts = previousManager.getAccountsSnapshot();
-			const replacementAccounts = replacementManager.getAccountsSnapshot();
 			const oldCandidates = [...workspaceCandidates.entries()];
 			const oldQuota = { ...subscriptionQuotaByAccount };
 			workspaceCandidates.clear();
@@ -1884,48 +1924,10 @@ async function handleRequestInner(
 				delete subscriptionQuotaByAccount[Number(key)];
 			}
 
-			const workspaceIds = (account: ManagedAccount): Set<string> =>
-				new Set(
-					[
-						account.accountId?.trim(),
-						...(account.workspaces ?? []).map((workspace) => workspace.id.trim()),
-					].filter((value): value is string => Boolean(value)),
-				);
-			const unique = (candidates: ManagedAccount[]): ManagedAccount | null =>
-				candidates.length === 1 ? candidates[0] ?? null : null;
-			const matchReplacement = (previous: ManagedAccount): ManagedAccount | null => {
-				if (previous.recordId) {
-					return unique(replacementAccounts.filter((candidate) => candidate.recordId === previous.recordId));
-				}
-				const sourceIds = workspaceIds(previous);
-				const compatible = replacementAccounts.filter((candidate) => {
-					const candidateIds = workspaceIds(candidate);
-					return !(
-						sourceIds.size > 0 &&
-						candidateIds.size > 0 &&
-						![...sourceIds].some((id) => candidateIds.has(id))
-					);
-				});
-				const sourceEmail = sanitizeEmail(previous.email);
-				return (
-					unique(compatible.filter((candidate) => candidate.refreshToken === previous.refreshToken)) ??
-					(previous.accountId && sourceEmail
-						? unique(compatible.filter((candidate) =>
-							candidate.accountId === previous.accountId && sanitizeEmail(candidate.email) === sourceEmail))
-						: null) ??
-					(previous.accountId
-						? unique(compatible.filter((candidate) => candidate.accountId === previous.accountId))
-						: null) ??
-					(sourceEmail
-						? unique(compatible.filter((candidate) => sanitizeEmail(candidate.email) === sourceEmail))
-						: null)
-				);
-			};
-
 			for (const [previousIndex, scopes] of oldCandidates) {
 				const previous = previousAccounts.find((account) => account.index === previousIndex);
 				if (!previous) continue;
-				const replacement = matchReplacement(previous);
+				const replacement = matchReplacementAccount(previous, replacementManager);
 				if (!replacement) continue;
 				const live = replacementManager.getAccountByIndex(replacement.index);
 				if (!live) continue;
@@ -1956,8 +1958,65 @@ async function handleRequestInner(
   // A stored `switch` pin is a hard constraint in native mode too (#702), not a
   // preference: it fails with codex_pinned_account_unavailable rather than
   // silently serving from another account.
-  const pinnedIndex = state.forcedAccountIndex ?? storageMeta.pinnedAccountIndex;
+  let pinnedIndex = state.forcedAccountIndex ?? storageMeta.pinnedAccountIndex;
 		const isPinned = typeof pinnedIndex === "number";
+		let pinnedIdentityAccount = isPinned && typeof pinnedIndex === "number"
+			? accountManager.getAccountByIndex(pinnedIndex) ?? null
+			: null;
+		let pinnedIdentityMissing = false;
+		const matchPinnedReplacementAccount = (
+			previous: ManagedAccount,
+			replacementManager: AccountManager,
+		): ManagedAccount | null => {
+			const replacements = replacementManager.getAccountsSnapshot();
+			if (previous.recordId) {
+				return uniqueAccount(replacements.filter((candidate) => candidate.recordId === previous.recordId));
+			}
+			const sourceIds = workspaceIds(previous);
+			const compatible = replacements.filter((candidate) => {
+				const candidateIds = workspaceIds(candidate);
+				return !(
+					sourceIds.size > 0 &&
+					candidateIds.size > 0 &&
+					![...sourceIds].some((id) => candidateIds.has(id))
+				);
+			});
+			const sourceEmail = sanitizeEmail(previous.email);
+			// Hard pins deliberately omit the email-only fallback used by request-local
+			// workspace remapping. Same-email sibling logins are not interchangeable.
+			return (
+				uniqueAccount(compatible.filter((candidate) => candidate.refreshToken === previous.refreshToken)) ??
+				(previous.accountId && sourceEmail
+					? uniqueAccount(compatible.filter((candidate) =>
+						candidate.accountId === previous.accountId && sanitizeEmail(candidate.email) === sourceEmail))
+					: null) ??
+				(previous.accountId
+					? uniqueAccount(compatible.filter((candidate) => candidate.accountId === previous.accountId))
+					: null)
+			);
+		};
+		const remapPinnedAccount = (
+			previousManager: AccountManager,
+			replacementManager: AccountManager,
+		): void => {
+			if (!isPinned || typeof pinnedIndex !== "number" || pinnedIdentityMissing) return;
+			// If the pin resolved when this request began, bind the request to that
+			// account identity rather than to an index that can be reused after a
+			// concurrent inventory change. A pin that was already out of range keeps
+			// the legacy numeric behavior because there is no identity to preserve.
+			const source = pinnedIdentityAccount ?? previousManager.getAccountByIndex(pinnedIndex) ?? null;
+			if (!source) return;
+			const replacement = matchPinnedReplacementAccount(source, replacementManager);
+			const live = replacement ? replacementManager.getAccountByIndex(replacement.index) ?? null : null;
+			if (!live) {
+				pinnedIdentityMissing = true;
+				pinnedIdentityAccount = source;
+				accountSkipReasons.set(pinnedIndex, "missing");
+				return;
+			}
+			pinnedIndex = live.index;
+			pinnedIdentityAccount = live;
+		};
 		let requestModelCatalog: AccountModelCatalog | undefined;
 		/** Rebuild native routing scopes after Luna is rewritten to separately metered Reserve. */
 		const rebuildReserveWorkspaceCandidates = async (): Promise<void> => {
@@ -2233,7 +2292,7 @@ async function handleRequestInner(
 			isPinned &&
 			(context.model === "gpt-6-luna" || context.model === "gpt-5.6-luna")
 		) {
-			const pinnedAccount = accountManager.getAccountByIndex(pinnedIndex);
+			const pinnedAccount = typeof pinnedIndex === "number" ? accountManager.getAccountByIndex(pinnedIndex) : null;
 			const now = state.now();
 			const familyResetAt = pinnedAccount?.rateLimitResetTimes[getQuotaKey(context.family)];
 			const modelResetAt = pinnedAccount?.rateLimitResetTimes[getQuotaKey(context.family, context.model)];
@@ -2414,6 +2473,10 @@ async function handleRequestInner(
 			// calls inside `chooseAccount` are used unchanged and no lock is taken,
 			// so default behavior and perf are identical to before.
 			const selectAccount = (): ManagedAccount | null => {
+				if (pinnedIdentityMissing && typeof pinnedIndex === "number") {
+					accountSkipReasons.set(pinnedIndex, "missing");
+					return null;
+				}
     if (context.model !== LUNA_RESERVE_MODEL) {
      for(const [index,scopes] of workspaceCandidates){
       const account=accountManager.getAccountByIndex(index);
@@ -2508,6 +2571,8 @@ async function handleRequestInner(
 					reloadedAfterNoAccount = true;
 					const reloadedManager = await reloadRuntimeCredentials(state);
 					if (reloadedManager && reloadedManager !== accountManager) {
+						const previousManager = accountManager;
+						remapPinnedAccount(previousManager, reloadedManager);
 						accountManager = reloadedManager;
 						accountCount = accountManager.getAccountCount();
 						transientAttemptLimit = Math.max(
@@ -2686,6 +2751,7 @@ async function handleRequestInner(
 			if (refreshed.accountManager !== accountManager) {
 				const previousManager = accountManager;
 				remapRequestWorkspaceState(previousManager, refreshed.accountManager);
+				remapPinnedAccount(previousManager, refreshed.accountManager);
 				accountManager = refreshed.accountManager;
 				accountCount = accountManager.getAccountCount();
 				transientAttemptLimit = Math.max(
@@ -3649,9 +3715,11 @@ async function handleRequestInner(
 		// account was selected but no skip reason was recorded) — see #486.
 		if (isPinned) {
 			const pinnedAccount =
-				typeof pinnedIndex === "number"
-					? accountManager.getAccountByIndex(pinnedIndex)
-					: null;
+				pinnedIdentityMissing
+					? null
+					: typeof pinnedIndex === "number"
+						? accountManager.getAccountByIndex(pinnedIndex)
+						: null;
 			const pinnedSkipReason =
 				typeof pinnedIndex === "number"
 					? accountSkipReasons.get(pinnedIndex) ?? null

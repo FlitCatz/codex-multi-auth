@@ -3452,6 +3452,64 @@ describe("runtime rotation proxy", () => {
 		expect(inference[0]?.headers.get("authorization")).toBe("Bearer healthy-access");
 	});
 
+	it("fails closed when a hard-pinned row disappears during refresh", async () => {
+		const now = Date.now();
+		const oldStorage = createStorage(now, 1);
+		const old = oldStorage.accounts[0];
+		if (!old) throw new Error("expected old account");
+		old.recordId = "row-pinned";
+		old.accessToken = "expired-pinned";
+		old.expiresAt = now - 60_000;
+		const previous = new AccountManager(undefined, oldStorage);
+
+		const replacementStorage = createStorage(now, 1);
+		const other = replacementStorage.accounts[0];
+		if (!other) throw new Error("expected replacement account");
+		other.recordId = "row-other";
+		other.accessToken = "other-access";
+		other.refreshToken = "other-refresh";
+		other.expiresAt = now + 3_600_000;
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(replacement);
+
+		const refresh = vi
+			.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken")
+			.mockImplementation(async ({ accountManager, account }) => {
+				if (accountManager === previous) {
+					return {
+						ok: false,
+						retryable: true,
+						selectionRestart: true,
+						accountManager: replacement,
+					};
+				}
+				return {
+					ok: true,
+					accessToken: account.access!,
+					account,
+					accountManager,
+				};
+			});
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager: previous,
+			fetchImpl,
+			options: { forcedAccountIndex: 0 },
+		});
+		try {
+			const response = await postResponses(proxy, { model: "gpt-5-codex", input: "fixture" });
+			expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+			const payload = await response.json() as { error: { code?: string; pinnedAccountIndex?: number | null; reason?: string | null } };
+			expect(payload.error.code).toBe("codex_pinned_account_unavailable");
+			expect(payload.error.pinnedAccountIndex).toBe(0);
+			expect(payload.error.reason).toBe("missing");
+		} finally {
+			refresh.mockRestore();
+		}
+		const inference = calls.filter((call) => call.url.endsWith("/responses"));
+		expect(inference).toHaveLength(0);
+	});
+
 	it("deduplicates pending refresh commits per account when OAuth tuples differ", async () => {
 		const now = Date.now();
 		const storage = createStorage(now, 1);
