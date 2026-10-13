@@ -973,6 +973,9 @@ per-account priority/forecast/reset-credit fields.
 
 `status` and `rotation status` show the last recorded WebSocket interruption,
 when present: timestamp, cause, response stage, and optional close code.
+New records also include the route kind (`oauth`, `api`, or `zdr`), upstream
+connection age in milliseconds, and the number of valid events received for
+the interrupted request. Older records remain readable without these fields.
 `status --json` exposes it as `lastWebsocketDisconnect`. Local cancellation and
 request timeouts are excluded; raw upstream messages and payloads are not stored.
 

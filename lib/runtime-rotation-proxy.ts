@@ -16,6 +16,7 @@ import { RuntimeCapabilityFailures, classifyCapabilityFailure } from "./runtime/
 import { ResponseOutcome } from "./request/response-outcome.js";
 import { ResponsesWebSocketGateway } from "./runtime/responses-websocket.js";
 import { enrichPersistedApiCapabilities } from "./runtime/persisted-api-capabilities.js";
+import { ApiModelCapabilities } from "./runtime/api-model-capabilities.js";
 import { saveModelInventory } from "./runtime/model-discovery-status.js";
 import { loadApiRoutes, updateApiModelDiscovery } from "./api-route-store.js";
 import { ApiModelRuntime } from "./runtime/api-model-runtime.js";
@@ -456,7 +457,9 @@ const MODEL_CAPACITY_RETRY_ENV = "CODEX_MULTI_AUTH_MODEL_CAPACITY_RETRY_MS";
 function getApiModelRuntime(state:RotationProxyState):ApiModelRuntime {
  if(state.apiModelRuntime)return state.apiModelRuntime;
  const production=state.readApiRoutes===loadApiRoutes;
- state.apiModelRuntime=new ApiModelRuntime(state.fetchImpl,state.now,production?updateApiModelDiscovery:undefined,production?(models,refresh,route,force)=>enrichPersistedApiCapabilities(models,refresh,route,force,{now:state.now}):undefined,()=>{
+ // Public documentation survives refresh outages without retaining paid probe state.
+ if(production)state.apiModelCapabilities??=new ApiModelCapabilities(fetch,state.now);
+ state.apiModelRuntime=new ApiModelRuntime(state.fetchImpl,state.now,production?updateApiModelDiscovery:undefined,production?(models,refresh,route,force)=>enrichPersistedApiCapabilities(models,refresh,route,force,{now:state.now,metadata:state.apiModelCapabilities}):undefined,()=>{
   const runtime=state.apiModelRuntime;
   if(!runtime)return;
   const models=[...(state.catalogOAuthModels??[]),...buildVisibleModelUnion(runtime.cachedCatalogs())];

@@ -789,3 +789,32 @@ describe("program cache invalidation",()=>{
   expect(f.programs).toEqual([]);
  });
 });
+
+it.each(["effort", "program"])("caches conclusive model denial during %s probes beyond the transient retry window", async (phase) => {
+	let now = 1000;
+	let posts = 0;
+	const service = new ApiModelCapabilities(async (_url, init) => {
+		if (init?.method !== "POST") return new Response("missing", { status: 404 });
+		posts++;
+		const body = JSON.parse(String(init.body));
+		if (phase === "effort" || body.access_programs) {
+			return Response.json({ error: { code: "model_access_denied" } }, { status: 403 });
+		}
+		return Response.json({ reasoning: body.reasoning, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+	}, () => now);
+	const route = { id: "fixture", kind: "api" as const, label: "fixture", apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, accessPrograms: { cyber: ["standard", "daybreak_blue"] } };
+	const [first] = await service.enrich([{ slug: "fixture" }], false, route);
+	expect(first.capability_probe_status).toMatchObject({ responses: "unsupported", "program:cyber:standard": "unsupported", "program:cyber:daybreak_blue": "unsupported" });
+	expect(first.program_checked_at).toBe(now);
+	expect(service.exportProbes()[0][1].programRetry).not.toBe(true);
+	expect(service.exportProbes()[0][1].status.retry).toBeUndefined();
+	const count = posts;
+	now += 60_001;
+	// Exercise persisted-cache import too: separate consumers must honour the denial.
+	const restarted = new ApiModelCapabilities(async (_url, init) => { if (init?.method === "POST") posts++; return new Response("missing", { status: 404 }); }, () => now);
+	restarted.importProbes(service.exportProbes());
+	const [cached] = await restarted.enrich([{ slug: "fixture" }], false, route);
+	// Public documentation may be read, but no authenticated capability request is needed.
+	expect(cached.capability_probe_status).toEqual(first.capability_probe_status);
+	expect(posts).toBe(count);
+});

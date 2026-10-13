@@ -2218,6 +2218,9 @@ describe("reviewed provider transitions",()=>{
 });
 
 it.each([
+ {stored:{at:123,cause:"close",stage:"streaming",routeKind:"zdr",connectionAgeMs:42,eventCount:3},expected:{at:123,cause:"close",stage:"streaming",routeKind:"zdr",connectionAgeMs:42,eventCount:3}},
+ {stored:{at:123,cause:"close",stage:"streaming",routeKind:"secret"},expected:null},
+ {stored:{at:123,cause:"close",stage:"streaming",eventCount:-1},expected:null},
  {stored:{at:123,cause:"close",stage:"streaming",closeCode:1011,reason:"secret"},expected:{at:123,cause:"close",stage:"streaming",closeCode:1011}},
  {stored:{at:123,cause:"secret",stage:"streaming"},expected:null},
  {stored:{at:"123",cause:"close",stage:"streaming"},expected:null},
@@ -2271,7 +2274,7 @@ it.each([true,false])("shows safe WebSocket disconnect details for native=%s", (
 		},
 	};
  status.state!.nativeOpenai=nativeOpenai;
- const withDiagnostic = {...status,router:{lastWebsocketDisconnect:{at:1000,cause:"transport_error" as const,stage:"streaming" as const,closeCode:1006}}};
- expect(formatAppBindStatus(withDiagnostic)).toContain("Last WebSocket disconnect: 1970-01-01T00:00:01.000Z; cause=transport_error; stage=streaming; closeCode=1006");
+ const withDiagnostic = {...status,router:{lastWebsocketDisconnect:{at:1000,cause:"transport_error" as const,stage:"streaming" as const,closeCode:1006,routeKind:"api" as const,connectionAgeMs:42,eventCount:7}}};
+ expect(formatAppBindStatus(withDiagnostic)).toContain("Last WebSocket disconnect: 1970-01-01T00:00:01.000Z; cause=transport_error; stage=streaming; closeCode=1006; route=api; connectionAgeMs=42; events=7");
  expect(formatAppBindStatus(status)).not.toContain("Last WebSocket disconnect:");
 });

@@ -412,11 +412,16 @@ async function readAppBindBackup(path: string): Promise<AppBindBackup | null> {
 
 function readWebsocketDisconnect(value: unknown): WebSocketDisconnectDiagnostic | null {
  if (!isRecord(value) || typeof value.at !== "number" || !Number.isFinite(value.at) || value.at < 0) return null;
- const { cause, stage, closeCode } = value;
+ const { cause, stage, closeCode, routeKind, connectionAgeMs, eventCount } = value;
+ if (routeKind !== undefined && routeKind !== "oauth" && routeKind !== "api" && routeKind !== "zdr") return null;
+ for (const count of [connectionAgeMs, eventCount]) if (count !== undefined && (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0)) return null;
  if (cause !== "close" && cause !== "transport_error" && cause !== "invalid_event" && cause !== "buffer_limit" && cause !== "send_error") return null;
  if (stage !== "awaiting_first_event" && stage !== "streaming") return null;
  if (closeCode !== undefined && (typeof closeCode !== "number" || !Number.isInteger(closeCode) || closeCode < 1000 || closeCode > 4999)) return null;
- return {at:value.at,cause,stage,...(typeof closeCode === "number" ? {closeCode} : {})};
+ return {at:value.at,cause,stage,...(typeof closeCode === "number" ? {closeCode} : {}),
+ ...(routeKind === "oauth" || routeKind === "api" || routeKind === "zdr" ? {routeKind} : {}),
+ ...(typeof connectionAgeMs === "number" ? {connectionAgeMs} : {}),
+ ...(typeof eventCount === "number" ? {eventCount} : {})};
 }
 
 async function readRouterStatus(path: string): Promise<AppBindRouterStatus | null> {
@@ -1888,7 +1893,7 @@ async function unbindCodexAppRuntimeRotationLocked(
 export function formatWebsocketDisconnect(value: unknown): string | null {
  const diagnostic = readWebsocketDisconnect(value);
  if (!diagnostic || diagnostic.at > 8.64e15) return null;
- return `Last WebSocket disconnect: ${new Date(diagnostic.at).toISOString()}; cause=${diagnostic.cause}; stage=${diagnostic.stage}${diagnostic.closeCode !== undefined ? `; closeCode=${diagnostic.closeCode}` : ""}`;
+ return `Last WebSocket disconnect: ${new Date(diagnostic.at).toISOString()}; cause=${diagnostic.cause}; stage=${diagnostic.stage}${diagnostic.closeCode !== undefined ? `; closeCode=${diagnostic.closeCode}` : ""}${diagnostic.routeKind !== undefined ? `; route=${diagnostic.routeKind}` : ""}${diagnostic.connectionAgeMs !== undefined ? `; connectionAgeMs=${diagnostic.connectionAgeMs}` : ""}${diagnostic.eventCount !== undefined ? `; events=${diagnostic.eventCount}` : ""}`;
 }
 
 export function formatAppBindStatus(status: AppBindStatus): string {

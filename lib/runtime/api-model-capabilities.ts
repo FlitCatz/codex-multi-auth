@@ -450,6 +450,14 @@ export class ApiModelCapabilities {
 			result.tiers = [];
 			for (const name of Object.keys(result.status)) result.status[name] = "unsupported";
 			result.status.responses = "unsupported";
+			if (!lostAccess) {
+				// A structured model denial conclusively denies every candidate,
+				// including checks skipped after the denial. Do not retry it as a
+				// transport failure merely because those POSTs were unnecessary.
+				delete result.status.retry;
+				delete result.programRetry;
+				if (programs.length) result.programCheckedAt = this.now();
+			}
 		}
 		if (lostAccess) {
 			result.levels = [];

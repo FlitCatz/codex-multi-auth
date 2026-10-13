@@ -6,19 +6,55 @@ import {
 import { promises as isolationFs } from "node:fs";
 import { tmpdir as isolationTmpdir } from "node:os";
 import { join as isolationJoin } from "node:path";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
 // Inventory writes merge with whatever is already on disk, so every test gets
 // its own multi-auth directory instead of the worker's shared one.
 let previousMultiAuthDir: string | undefined;
 let multiAuthDir: string;
+it("drains inventory writes before resetting their test queue", async () => {
+	const inventory = await import("../lib/runtime/model-discovery-status.js");
+	const locks = await import("../lib/storage/file-lock.js");
+	let release!: () => void;
+	let entered!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const started = new Promise<void>(resolve => { entered = resolve; });
+	const original = locks.withFileTransactionLock;
+	const lock = vi.spyOn(locks, "withFileTransactionLock").mockImplementationOnce(async (...args) => {
+		entered();
+		await gate;
+		return original(...args);
+	});
+	let first: Promise<void> | undefined;
+	let second: Promise<void> | undefined;
+	try {
+		first = inventory.saveModelInventory({ version: 1, checkedAt: 1, entries: [] });
+		await started;
+		let resetFinished = false;
+		const reset = inventory.resetModelInventoryWritesForTests().then(() => { resetFinished = true; });
+		second = inventory.saveModelInventory({ version: 1, checkedAt: 2, entries: [] });
+		await Promise.resolve();
+		expect(resetFinished).toBe(false);
+		release();
+		await Promise.all([first, second, reset]);
+		expect((await inventory.loadModelInventory())?.checkedAt).toBe(2);
+		await inventory.resetModelInventoryWritesForTests();
+	} finally {
+		release();
+		await Promise.allSettled([first, second]);
+		lock.mockRestore();
+	}
+});
 beforeEach(async () => {
 	previousMultiAuthDir = process.env.CODEX_MULTI_AUTH_DIR;
 	multiAuthDir = await isolationFs.mkdtemp(isolationJoin(isolationTmpdir(), "model-discovery-"));
 	process.env.CODEX_MULTI_AUTH_DIR = multiAuthDir;
 });
 afterEach(async () => {
+	const { resetModelInventoryWritesForTests } = await import("../lib/runtime/model-discovery-status.js");
+	await resetModelInventoryWritesForTests();
 	if (previousMultiAuthDir === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
 	else process.env.CODEX_MULTI_AUTH_DIR = previousMultiAuthDir;
-	await isolationFs.rm(multiAuthDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	await removeWithRetry(multiAuthDir, { recursive: true, force: true });
 });
 describe("model discovery reporting", () => {
 	it.each(["api", "zdr"] as const)("labels %s programs as local configuration", async (kind) => {

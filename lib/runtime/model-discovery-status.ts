@@ -190,6 +190,17 @@ export async function loadModelInventory(): Promise<ModelInventory | null> {
 	}
 }
 let inventoryWrites: Promise<void> = Promise.resolve();
+/** Drain queued writes before resetting process-local test state. */
+export async function resetModelInventoryWritesForTests(): Promise<void> {
+	for (;;) {
+		const pending = inventoryWrites;
+		await pending;
+		if (inventoryWrites === pending) {
+			inventoryWrites = Promise.resolve();
+			return;
+		}
+	}
+}
 export function saveModelInventory(value: ModelInventory, options: { mergeEntries?: boolean } = {}): Promise<void> {
 	const path = inventoryPath();
 	const pending = inventoryWrites.then(() =>

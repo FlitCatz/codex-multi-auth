@@ -259,12 +259,13 @@ it("does not replay after generation starts and the upstream disconnects", async
 	expect(events.at(-1)?.type).toBe("error");
 	expect(f.calls).toHaveLength(1);
 });
-it("records a sanitized upstream close without replaying generation", async () => {
+it.each(["oauth", "api", "zdr"] as const)("records sanitized %s close context without replaying generation", async (routeKind) => {
  const f = await fixture(ws => { ws.close(1011, "secret fixture reason"); return true; });
  const ws = await f.connect();
  const before = Date.now();
- await turn(ws, {model:"shared",input:[]});
- expect(f.stats.lastDisconnect).toEqual({at:expect.any(Number),cause:"close",stage:"streaming",closeCode:1011});
+ await turn(ws, {model:routeKind === "oauth" ? "shared" : `${routeKind}/shared`,input:[]});
+ expect(f.stats.lastDisconnect).toEqual({at:expect.any(Number),cause:"close",stage:"streaming",closeCode:1011,routeKind,connectionAgeMs:expect.any(Number),eventCount:1});
+ expect(f.stats.lastDisconnect?.connectionAgeMs).toBeGreaterThanOrEqual(0);
  expect(f.stats.lastDisconnect?.at).toBeGreaterThanOrEqual(before);
  expect(JSON.stringify(f.stats)).not.toContain("secret fixture reason");
  expect(f.calls).toHaveLength(1);
@@ -273,7 +274,7 @@ it("distinguishes invalid upstream events from transport disconnects", async () 
  const f = await fixture(ws => { ws.send("not JSON: secret"); return true; });
  const ws = await f.connect();
  await turn(ws,{model:"shared",input:[]});
- expect(f.stats.lastDisconnect).toEqual({at:expect.any(Number),cause:"invalid_event",stage:"streaming"});
+ expect(f.stats.lastDisconnect).toEqual({at:expect.any(Number),cause:"invalid_event",stage:"streaming",routeKind:"oauth",connectionAgeMs:expect.any(Number),eventCount:1});
  expect(JSON.stringify(f.stats)).not.toContain("secret");
 });
 it("does not report an idle close after completion as an interrupted response", async () => {

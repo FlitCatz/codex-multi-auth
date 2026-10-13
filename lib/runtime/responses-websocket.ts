@@ -15,6 +15,9 @@ export interface WebSocketDisconnectDiagnostic {
  cause: "close" | "transport_error" | "invalid_event" | "buffer_limit" | "send_error";
  stage: "awaiting_first_event" | "streaming";
  closeCode?: number;
+ routeKind?: "oauth" | "api" | "zdr";
+ connectionAgeMs?: number;
+ eventCount?: number;
 }
 interface WebSocketStats {
  connections: number;
@@ -32,7 +35,7 @@ const terminal = new Set([
 ]);
 type Json = Record<string, unknown>;
 type Chain = { body: Json; output: unknown[]; pool: string; bytes: number };
-type Context = { signal: AbortSignal; session: SocketSession; previousId?: string; delta?: unknown; clientBeta?: string };
+type Context = { routeKind: "oauth" | "api" | "zdr"; signal: AbortSignal; session: SocketSession; previousId?: string; delta?: unknown; clientBeta?: string };
 /** Headers that describe the synthetic body or the upgrade itself, never the upstream decision. */
 const LOCAL_ONLY_HEADERS = /^(connection|upgrade|keep-alive|sec-websocket-.*|content-length|content-encoding|content-type|transfer-encoding|set-cookie)$/i;
 function upstreamHeaders(source: unknown): Record<string, string> {
@@ -79,6 +82,7 @@ function bodyJson(body: RequestInit["body"]): Json {
 /** Per-client memory only; credentials never leave the existing routing boundary. */
 class SocketSession {
 	readonly channels = new Map<string, WebSocket>();
+	private readonly openedAt = new WeakMap<WebSocket, number>();
 	readonly owners = new Map<string, WebSocket>();
 	readonly chains = new Map<string, Chain>();
 	/** Credentials whose WebSocket handshake was refused; they use HTTP for the session. */
@@ -240,6 +244,7 @@ class SocketSession {
 				this.httpOnly.add(key);
 				return this.httpFetch(input, init);
 			}
+			this.openedAt.set(socket, Date.now());
 			this.channels.set(key, socket);
 		}
 		const active = socket;
@@ -247,6 +252,7 @@ class SocketSession {
 			let accepted = false,
 				finished = false;
 			let bodyCancelled = false;
+			let eventCount = 0;
 			let streamController: ReadableStreamDefaultController<Uint8Array>;
 			const stream = new ReadableStream<Uint8Array>(
 				{
@@ -273,10 +279,15 @@ class SocketSession {
 				cleanup();
 				this.channels.delete(key);
                 const cancelled = bodyCancelled || init.signal?.aborted || context.signal.aborted || this.closed;
-                if (!cancelled) this.stats.lastDisconnect = {
-                    at: Date.now(), cause, stage: accepted ? "streaming" : "awaiting_first_event",
-                    ...(typeof closeCode === "number" ? {closeCode} : {}),
-                };
+                if (!cancelled) {
+                    const at = Date.now();
+                    this.stats.lastDisconnect = {
+                        at, cause, routeKind: context.routeKind,
+                        connectionAgeMs: Math.max(0, at - (this.openedAt.get(active) ?? at)), eventCount,
+                        stage: accepted ? "streaming" : "awaiting_first_event",
+                        ...(typeof closeCode === "number" ? {closeCode} : {}),
+                    };
+                }
                 // Once create has been sent, a disconnect cannot prove generation
                 // did not start. Never replay it, even before the first event.
                 const error = cancelled
@@ -303,6 +314,7 @@ class SocketSession {
 					const event: unknown = JSON.parse(text);
 					if (!isRecord(event) || typeof event.type !== "string")
 						throw Error("Invalid response event");
+					eventCount++;
 					if (event.type === "error" && !accepted) {
 						finished = true;
 						cleanup();
@@ -587,7 +599,7 @@ export class ResponsesWebSocketGateway {
 						const controller = new AbortController();
                         session.controller = controller;
                         const clientBeta = req.headers["openai-beta"];
-                        this.contexts.set(id, { session, previousId, delta: event.input, signal: controller.signal, clientBeta: typeof clientBeta === "string" ? clientBeta : undefined });
+                        this.contexts.set(id, { routeKind: pool, session, previousId, delta: event.input, signal: controller.signal, clientBeta: typeof clientBeta === "string" ? clientBeta : undefined });
 						const headers = new Headers();
 						for (const [key, value] of Object.entries(req.headers)) {
 							if (
