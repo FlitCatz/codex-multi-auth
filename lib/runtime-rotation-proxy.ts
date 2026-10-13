@@ -140,6 +140,7 @@ import {
 	applyMonotonicAuthCooldown,
 	DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
 	ensureFreshAccessToken,
+	redirectRuntimeRefreshCommits,
 } from "./runtime/rotation-token-refresh.js";
 import { SessionAffinityStore } from "./session-affinity.js";
 import type { RequestBody } from "./types.js";
@@ -1428,8 +1429,10 @@ async function handleRequestInner(
 			const accounts = accountManager.getAccountsSnapshot();
 			const sameInventory = accounts.length === disk.accounts.length && accounts.every((a, i) => isSameNativeAccount(a, disk.accounts[i]));
 			if (!sameInventory) {
+				const previousManager = accountManager;
 				accountManager = new AccountManager(undefined, disk);
 				accountManager.setRoutingMutexMode(state.routingMutexMode);
+				redirectRuntimeRefreshCommits(previousManager, accountManager);
                 // Preserve independently learned limits by identity, never by the old index.
                 // A record id survives an email change; the account identity survives a
                 // re-login that re-derives an unstored record id. Rows with neither an
@@ -2603,6 +2606,20 @@ async function handleRequestInner(
 				tokenRefreshSkewMs: state.tokenRefreshSkewMs,
 				tokenInvalidationCooldownMs: state.tokenInvalidationCooldownMs,
 			});
+			// A credential reload may have published a replacement manager while this
+			// request was awaiting refresh. Keep the refreshed account and its owner
+			// together for every later mutation/persist; account indexes are local to
+			// one manager and can shift when rows are removed or reordered.
+			if (refreshed.accountManager !== accountManager) {
+				accountManager = refreshed.accountManager;
+				accountCount = accountManager.getAccountCount();
+				transientAttemptLimit = Math.max(
+					1,
+					Math.min(accountCount, state.maxRuntimeAccountAttempts),
+				);
+				accountSkipReasons.clear();
+				attemptedIndexes.clear();
+			}
 			if (!refreshed.ok) {
 				refundConsumedPoolToken(selected);
 				// No accountSkipReasons write here: ensureFreshAccessToken always

@@ -763,6 +763,7 @@ export class AccountManager {
 				_runtimeTrackerKey: trackerKey,
 				circuitKeyId,
 				rateLimitResetTimes: { ...account.rateLimitResetTimes },
+				workspaces: account.workspaces?.map((workspace) => ({ ...workspace })),
 			};
 		});
 	}

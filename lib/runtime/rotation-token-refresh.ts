@@ -1,4 +1,4 @@
-import type { AccountManager, ManagedAccount } from "../accounts.js";
+import { sanitizeEmail, type AccountManager, type ManagedAccount } from "../accounts.js";
 import type { ModelFamily } from "../prompts/codex.js";
 import { queuedRefresh } from "../refresh-queue.js";
 import {
@@ -44,11 +44,21 @@ function hasUsableAccessToken(
 	);
 }
 
-const runtimeRefreshCommitQueues = new WeakMap<
+type RuntimeRefreshTarget = {
+	accountManager: AccountManager;
+	account: ManagedAccount;
+};
+
+type RuntimeRefreshCommitResult = {
+	accountManager: AccountManager;
+	account: ManagedAccount | null;
+};
+
+let runtimeRefreshCommitQueues = new WeakMap<
 	AccountManager,
-	Map<string, Promise<ManagedAccount | null>>
+	Map<string, Promise<RuntimeRefreshCommitResult>>
 >();
-const runtimeRefreshManagerRedirects = new WeakMap<AccountManager, AccountManager>();
+let runtimeRefreshManagerRedirects = new WeakMap<AccountManager, AccountManager>();
 
 function resolveRuntimeRefreshCommitManager(accountManager: AccountManager): AccountManager {
 	let current = accountManager;
@@ -62,6 +72,55 @@ function resolveRuntimeRefreshCommitManager(accountManager: AccountManager): Acc
 	return current;
 }
 
+function uniqueMatch(
+	accounts: ManagedAccount[],
+	predicate: (candidate: ManagedAccount) => boolean,
+): ManagedAccount | null {
+	const matches = accounts.filter(predicate);
+	return matches.length === 1 ? matches[0] ?? null : null;
+}
+
+function resolveRuntimeRefreshTarget(
+	accountManager: AccountManager,
+	account: ManagedAccount,
+): RuntimeRefreshTarget | null {
+	const targetManager = resolveRuntimeRefreshCommitManager(accountManager);
+	if (targetManager === accountManager) return { accountManager, account };
+
+	const accounts = targetManager.getAccountsSnapshot();
+	const sourceEmail = sanitizeEmail(account.email);
+	const snapshot =
+		(account.recordId
+			? uniqueMatch(accounts, (candidate) => candidate.recordId === account.recordId)
+			: null) ??
+		uniqueMatch(accounts, (candidate) => candidate.refreshToken === account.refreshToken) ??
+		(account.accountId && sourceEmail
+			? uniqueMatch(
+				accounts,
+				(candidate) =>
+					candidate.accountId === account.accountId && sanitizeEmail(candidate.email) === sourceEmail,
+			)
+			: null) ??
+		(account.accountId
+			? uniqueMatch(accounts, (candidate) => candidate.accountId === account.accountId)
+			: null) ??
+		(sourceEmail
+			? uniqueMatch(accounts, (candidate) => sanitizeEmail(candidate.email) === sourceEmail)
+			: null);
+	if (!snapshot) return null;
+	const live = targetManager.getAccountByIndex(snapshot.index);
+	return live ? { accountManager: targetManager, account: live } : null;
+}
+
+/** @internal Test-only reset for process-global refresh commit/redirect state. */
+export function resetRuntimeRefreshStateForTests(): void {
+	runtimeRefreshCommitQueues = new WeakMap<
+		AccountManager,
+		Map<string, Promise<RuntimeRefreshCommitResult>>
+	>();
+	runtimeRefreshManagerRedirects = new WeakMap<AccountManager, AccountManager>();
+}
+
 /** @internal Wait until every refresh-auth commit already targeting this manager settles. */
 export async function waitForRuntimeRefreshCommits(accountManager: AccountManager): Promise<void> {
 	const target = resolveRuntimeRefreshCommitManager(accountManager);
@@ -73,7 +132,7 @@ export async function waitForRuntimeRefreshCommits(accountManager: AccountManage
 	}
 }
 
-/** @internal Redirect late commits from requests that captured a superseded manager. */
+/** @internal Redirect late refresh state from requests that captured a superseded manager. */
 export function redirectRuntimeRefreshCommits(
 	previousManager: AccountManager,
 	replacementManager: AccountManager,
@@ -89,10 +148,10 @@ async function commitRefreshedAuthOnce(
 	accountManager: AccountManager,
 	account: ManagedAccount,
 	auth: OAuthAuthDetails,
-): Promise<ManagedAccount | null> {
+): Promise<RuntimeRefreshCommitResult> {
 	const commitManager = resolveRuntimeRefreshCommitManager(accountManager);
 	const key = [
-		account.index,
+		account.recordId ?? "",
 		account.accountId ?? "",
 		account.email ?? "",
 		account.refreshToken,
@@ -106,6 +165,7 @@ async function commitRefreshedAuthOnce(
 	if (existing) return existing;
 	const pending = commitManager
 		.commitRefreshedAuth(account, auth)
+		.then((updatedAccount) => ({ accountManager: commitManager, account: updatedAccount }))
 		.finally(() => queue?.delete(key));
 	queue.set(key, pending);
 	return pending;
@@ -121,8 +181,14 @@ export async function ensureFreshAccessToken(params: {
 	tokenRefreshSkewMs: number;
 	tokenInvalidationCooldownMs: number;
 }): Promise<
-	| { ok: true; accessToken: string; account: ManagedAccount }
-	| { ok: false; retryable: boolean; invalidated?: boolean }
+	| { ok: true; accessToken: string; account: ManagedAccount; accountManager: AccountManager }
+	| {
+		ok: false;
+		retryable: boolean;
+		invalidated?: boolean;
+		account: ManagedAccount;
+		accountManager: AccountManager;
+	}
 > {
 	const {
 		accountManager,
@@ -133,29 +199,46 @@ export async function ensureFreshAccessToken(params: {
 		tokenRefreshSkewMs,
 		tokenInvalidationCooldownMs,
 	} = params;
-	if (hasUsableAccessToken(account, now, tokenRefreshSkewMs)) {
-		return { ok: true, accessToken: account.access ?? "", account };
+	const initialTarget = resolveRuntimeRefreshTarget(accountManager, account) ?? {
+		accountManager,
+		account,
+	};
+	if (hasUsableAccessToken(initialTarget.account, now, tokenRefreshSkewMs)) {
+		return {
+			ok: true,
+			accessToken: initialTarget.account.access ?? "",
+			account: initialTarget.account,
+			accountManager: initialTarget.accountManager,
+		};
 	}
 
-	const refreshResult = await queuedRefresh(account.refreshToken);
+	const refreshResult = await queuedRefresh(initialTarget.account.refreshToken);
+	const latestTarget =
+		resolveRuntimeRefreshTarget(initialTarget.accountManager, initialTarget.account) ?? initialTarget;
 	if (refreshResult.type === "failed") {
-		accountManager.recordFailure(account, family, model);
-		accountManager.incrementAuthFailures(account);
+		latestTarget.accountManager.recordFailure(latestTarget.account, family, model);
+		latestTarget.accountManager.incrementAuthFailures(latestTarget.account);
 		// If the refresh endpoint itself returns an explicit invalidation message
 		// (e.g. Microsoft/Outlook SSO revokes the refresh token server-side), apply
 		// the long cooldown and signal to the caller to stop rotating rather than
 		// presenting other accounts' tokens from the same IP.
 		const invalidated = isTokenInvalidationError(refreshResult.message ?? "");
 		if (invalidated) {
-			accountManager.markAuthInvalidated(account);
+			latestTarget.accountManager.markAuthInvalidated(latestTarget.account);
 		}
 		applyMonotonicAuthCooldown(
-			accountManager,
-			account,
+			latestTarget.accountManager,
+			latestTarget.account,
 			invalidated ? tokenInvalidationCooldownMs : DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
 		);
-		accountManager.saveToDiskDebounced();
-		return { ok: false, retryable: isTokenRefreshRetryable(refreshResult), invalidated };
+		latestTarget.accountManager.saveToDiskDebounced();
+		return {
+			ok: false,
+			retryable: isTokenRefreshRetryable(refreshResult),
+			invalidated,
+			account: latestTarget.account,
+			accountManager: latestTarget.accountManager,
+		};
 	}
 
 	const auth: OAuthAuthDetails = {
@@ -165,36 +248,44 @@ export async function ensureFreshAccessToken(params: {
 		expires: refreshResult.expires,
 	};
 	try {
-		const updatedAccount = await commitRefreshedAuthOnce(
-			accountManager,
-			account,
+		const committed = await commitRefreshedAuthOnce(
+			latestTarget.accountManager,
+			latestTarget.account,
 			auth,
 		);
 		// If commit succeeded, use the stored access token from the committed
-		// account — this also handles the dedup case where two concurrent callers
+		// account ? this also handles the dedup case where two concurrent callers
 		// share one commit and both end up with the same committed token.
 		// If commit returned null (account missing from storage after persist),
-		// fall back to the original account object but always use refreshResult.access:
-		// the original account may carry an expired token, and using that would
-		// cause a downstream 401 and incorrectly trigger invalidation-cooldown logic.
-		const resolvedAccount = updatedAccount ?? account;
+		// fall back to the account that initiated the commit but always use
+		// refreshResult.access; that account may still carry an expired token.
+		const resolvedAccount = committed.account ?? latestTarget.account;
+		const resolvedManager = committed.account ? committed.accountManager : latestTarget.accountManager;
 		const accessToken =
-			updatedAccount !== null
-				? (updatedAccount.access ?? refreshResult.access)
+			committed.account !== null
+				? (committed.account.access ?? refreshResult.access)
 				: refreshResult.access;
 		return {
 			ok: true,
 			accessToken,
 			account: resolvedAccount,
+			accountManager: resolvedManager,
 		};
 	} catch {
-		accountManager.recordFailure(account, family, model);
-		accountManager.markAccountCoolingDown(
-			account,
+		const failureTarget =
+			resolveRuntimeRefreshTarget(latestTarget.accountManager, latestTarget.account) ?? latestTarget;
+		failureTarget.accountManager.recordFailure(failureTarget.account, family, model);
+		failureTarget.accountManager.markAccountCoolingDown(
+			failureTarget.account,
 			DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
 			"auth-failure",
 		);
-		accountManager.saveToDiskDebounced();
-		return { ok: false, retryable: true };
+		failureTarget.accountManager.saveToDiskDebounced();
+		return {
+			ok: false,
+			retryable: true,
+			account: failureTarget.account,
+			accountManager: failureTarget.accountManager,
+		};
 	}
 }

@@ -32,6 +32,7 @@ const {
 	DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
 	ensureFreshAccessToken,
 	redirectRuntimeRefreshCommits,
+	resetRuntimeRefreshStateForTests,
 } = await import("../lib/runtime/rotation-token-refresh.js");
 
 const NOW = Date.now();
@@ -98,6 +99,7 @@ function refreshParams(accountManager: AccountManager) {
 beforeEach(() => {
 	vi.clearAllMocks();
 	AccountManager.resetVolatileRuntimeState();
+	resetRuntimeRefreshStateForTests();
 	saveAccountsMock.mockResolvedValue(undefined);
 	withAccountStorageTransactionMock.mockImplementation(async (handler) =>
 		handler(null, async () => undefined),
@@ -223,6 +225,103 @@ describe("ensureFreshAccessToken", () => {
 		expect(replacementCommit).toHaveBeenCalledTimes(1);
 		expect(result.ok).toBe(true);
 		if (result.ok) expect(result.account).toBe(replacementAccount);
+	});
+
+	it("returns the replacement owner when a redirected account moves to a new index", async () => {
+		const first = storageWith(STALE_EXPIRES).accounts[0]!;
+		const second = {
+			...structuredClone(first),
+			recordId: "row-b",
+			email: "account-2@example.com",
+			accountId: "acc_2",
+			refreshToken: "refresh-2",
+			accessToken: "access-2",
+		};
+		first.recordId = "row-a";
+		const previousStorage: AccountStorageV3 = {
+			version: 3,
+			activeIndex: 1,
+			activeIndexByFamily: { [FAMILY]: 1 },
+			accounts: [first, second],
+		};
+		const replacementStorage: AccountStorageV3 = {
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { [FAMILY]: 0 },
+			accounts: [structuredClone(second)],
+		};
+		const previous = new AccountManager(undefined, previousStorage);
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(previous, replacement);
+		const source = previous.getAccountByIndex(1);
+		if (!source) throw new Error("source account missing");
+		redirectRuntimeRefreshCommits(previous, replacement);
+		queuedRefreshMock.mockResolvedValue({
+			type: "success",
+			access: "access-2-new",
+			refresh: "refresh-2-new",
+			expires: NOW + 7_200_000,
+		});
+
+		const result = await ensureFreshAccessToken({
+			...refreshParams(previous),
+			account: source,
+		});
+
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.accountManager).toBe(replacement);
+			expect(result.account.index).toBe(0);
+			expect(result.account.recordId).toBe("row-b");
+			expect(result.account.access).toBe("access-2-new");
+		}
+	});
+
+	it("records a redirected refresh invalidation on the replacement manager", async () => {
+		const previous = managerWith(STALE_EXPIRES);
+		const replacement = managerWith(STALE_EXPIRES);
+		redirectRuntimeRefreshCommits(previous, replacement);
+		queuedRefreshMock.mockResolvedValue({
+			type: "failed",
+			reason: "http_error",
+			statusCode: 401,
+			message: "OAuth token has been invalidated",
+		});
+
+		const result = await ensureFreshAccessToken(refreshParams(previous));
+
+		expect(result).toMatchObject({
+			ok: false,
+			invalidated: true,
+			accountManager: replacement,
+		});
+		expect(replacement.getAccountByIndex(0)).toMatchObject({
+			authInvalidatedAt: expect.any(Number),
+			authInvalidationErrorCode: "token_invalidated",
+		});
+		expect(previous.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
+	});
+
+	it("clears refresh-manager redirects between tests", async () => {
+		const previous = managerWith(STALE_EXPIRES);
+		const replacement = managerWith(STALE_EXPIRES);
+		const previousCommit = vi.spyOn(previous, "commitRefreshedAuth");
+		const replacementCommit = vi.spyOn(replacement, "commitRefreshedAuth");
+		redirectRuntimeRefreshCommits(previous, replacement);
+		resetRuntimeRefreshStateForTests();
+		queuedRefreshMock.mockResolvedValue({
+			type: "success",
+			access: "access-after-reset",
+			refresh: "refresh-after-reset",
+			expires: NOW + 7_200_000,
+		});
+
+		const result = await ensureFreshAccessToken(refreshParams(previous));
+
+		expect(result.ok).toBe(true);
+		expect(previousCommit).toHaveBeenCalledTimes(1);
+		expect(replacementCommit).not.toHaveBeenCalled();
+		if (result.ok) expect(result.accountManager).toBe(previous);
 	});
 
 	it("deduplicates concurrent commits for the same refreshed account", async () => {

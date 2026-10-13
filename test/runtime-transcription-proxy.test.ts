@@ -4,6 +4,7 @@ import { clearCircuitBreakers } from "../lib/circuit-breaker.js";
 import { HTTP_STATUS, MAX_RATE_LIMIT_DELAY_MS, OPENAI_HEADERS } from "../lib/constants.js";
 import * as runtimePolicy from "../lib/policy/runtime-policy.js";
 import { resetRefreshQueue } from "../lib/refresh-queue.js";
+import * as tokenRefreshRuntime from "../lib/runtime/rotation-token-refresh.js";
 import { resetTrackers } from "../lib/rotation.js";
 import {
 	startRuntimeRotationProxy,
@@ -118,6 +119,7 @@ beforeEach(() => {
 	resetTrackers();
 	clearCircuitBreakers();
 	resetRefreshQueue();
+	tokenRefreshRuntime.resetRuntimeRefreshStateForTests();
 });
 
 afterEach(async () => {
@@ -126,6 +128,7 @@ afterEach(async () => {
 	resetTrackers();
 	clearCircuitBreakers();
 	resetRefreshQueue();
+	tokenRefreshRuntime.resetRuntimeRefreshStateForTests();
 	vi.restoreAllMocks();
 });
 

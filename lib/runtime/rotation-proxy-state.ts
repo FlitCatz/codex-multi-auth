@@ -416,6 +416,7 @@ export async function recoverStaleRuntimeState(
 		return state.activeAccountManager;
 	}
 	state.staleRuntimeReloadPromise = (async () => {
+		const previousManager = state.activeAccountManager;
 		AccountManager.resetVolatileRuntimeState();
 		recordRuntimeReset("pool-exhausted-no-account");
 		const reloaded = await AccountManager.loadFromDisk();
@@ -444,6 +445,10 @@ export async function recoverStaleRuntimeState(
 		// durable across a restart, not just best-effort. Recovery is rare
 		// (full-pool exhaustion), so the extra synchronous write is cheap.
 		await reloaded.flushPendingSave();
+		// Keep refresh ownership chains current across destructive recovery too.
+		// Requests that captured the previous manager before this swap must never
+		// persist a late refresh/cooldown into an object that is no longer active.
+		redirectRuntimeRefreshCommits(previousManager, reloaded);
 		state.activeAccountManager = reloaded;
 		state.knownAccountManagers.add(reloaded);
 		state.lastStaleRuntimeReloadAt = Date.now();

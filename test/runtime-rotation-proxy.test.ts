@@ -315,6 +315,7 @@ beforeEach(() => {
 	resetTrackers();
 	clearCircuitBreakers();
 	resetRefreshQueue();
+	tokenRefreshRuntime.resetRuntimeRefreshStateForTests();
 	__resetRoutingMutexForTests();
 	refreshAccessTokenMock.mockReset();
 	saveAccountsMock.mockReset();
@@ -3198,6 +3199,74 @@ describe("runtime rotation proxy", () => {
 		await accountManager.flushPendingSave();
 	});
 
+	it("persists redirected refresh bookkeeping on the replacement manager when indexes shift", async () => {
+		const now = Date.now();
+		const storage = createStorage(now, 2);
+		const removed = storage.accounts[0];
+		const refreshing = storage.accounts[1];
+		if (!removed || !refreshing) throw new Error("expected accounts");
+		removed.recordId = "row-a";
+		removed.enabled = false;
+		refreshing.recordId = "row-b";
+		refreshing.accessToken = "expired-access-2";
+		refreshing.expiresAt = now - 60_000;
+
+		const previous = new AccountManager(undefined, storage);
+		const replacementStorage: AccountStorageV3 = {
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [structuredClone(refreshing)],
+		};
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(replacement);
+		vi.spyOn(previous, "saveToDiskDebounced").mockImplementation(() => undefined);
+		vi.spyOn(replacement, "saveToDiskDebounced").mockImplementation(() => undefined);
+		const previousSync = vi
+			.spyOn(previous, "syncCodexCliActiveSelectionForIndex")
+			.mockResolvedValue();
+		const replacementSync = vi
+			.spyOn(replacement, "syncCodexCliActiveSelectionForIndex")
+			.mockResolvedValue();
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(null, async () => undefined),
+		);
+
+		let releaseRefresh!: () => void;
+		const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+		refreshAccessTokenMock.mockImplementation(async () => {
+			await refreshGate;
+			return {
+				type: "success",
+				access: "fresh-access-2",
+				refresh: "refresh-2-new",
+				expires: now + 3_600_000,
+			};
+		});
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager: previous, fetchImpl });
+
+		const pending = postResponses(proxy, { model: "gpt-5-codex" });
+		await vi.waitFor(() => expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1));
+		tokenRefreshRuntime.redirectRuntimeRefreshCommits(previous, replacement);
+		releaseRefresh();
+		const response = await pending;
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		await response.text();
+
+		expect(previousSync).not.toHaveBeenCalled();
+		expect(replacementSync).toHaveBeenCalledWith(0);
+		expect(replacement.getAccountByIndex(0)).toMatchObject({
+			recordId: "row-b",
+			access: "fresh-access-2",
+			refreshToken: "refresh-2-new",
+		});
+		expect(calls.filter((call) => call.url.endsWith("/responses"))).toHaveLength(1);
+		expect(calls.find((call) => call.url.endsWith("/responses"))?.headers.get("authorization")).toBe(
+			"Bearer fresh-access-2",
+		);
+	});
+
 	it("deduplicates pending refresh commits per account when OAuth tuples differ", async () => {
 		const now = Date.now();
 		const storage = createStorage(now, 1);
@@ -5687,9 +5756,9 @@ it("stops a stored pin after refresh disables its only workspace",async()=>{
  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"shared"}]}):textEventStream());
  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>structuredClone(stored)}});
  await (await getModels(proxy,"/models?refresh_capabilities=1")).text();
- const refresh=vi.spyOn(tokenRefreshRuntime,"ensureFreshAccessToken").mockImplementation(async({account})=>{
+ const refresh=vi.spyOn(tokenRefreshRuntime,"ensureFreshAccessToken").mockImplementation(async({accountManager,account})=>{
   account.workspaces![0]!.enabled=false;
-  return {ok:true,accessToken:account.access!,account};
+  return {ok:true,accessToken:account.access!,account,accountManager};
  });
  const response=await postResponses(proxy,{model:"shared",input:"hello"});
  const body=await response.json();

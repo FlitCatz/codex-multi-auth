@@ -29,7 +29,9 @@ vi.mock("../lib/refresh-queue.js", async (importOriginal) => {
 const { createRotationProxyState, recoverStaleRuntimeState, reloadRuntimeCredentials } = await import(
 	"../lib/runtime/rotation-proxy-state.js"
 );
-const { ensureFreshAccessToken } = await import("../lib/runtime/rotation-token-refresh.js");
+const { ensureFreshAccessToken, resetRuntimeRefreshStateForTests } = await import(
+	"../lib/runtime/rotation-token-refresh.js"
+);
 
 const NOW = Date.now();
 
@@ -82,6 +84,7 @@ let loadFromDisk: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
 	vi.clearAllMocks();
+	resetRuntimeRefreshStateForTests();
 	loadFromDisk = vi.spyOn(AccountManager, "loadFromDisk");
 });
 
@@ -241,6 +244,44 @@ describe("reloadRuntimeCredentials", () => {
 		expect(active?.refreshToken).toBe("refresh-rotated-after-load");
 		expect(active?.expires).toBe(NOW + 7_200_000);
 		expect(state.activeAccountManager).toBe(reloaded);
+	});
+
+	it("freezes workspace state captured before disk loading", async () => {
+		const initialStorage = storageWith(1);
+		initialStorage.accounts[0]!.recordId = "row-a";
+		initialStorage.accounts[0]!.accountId = "workspace-a";
+		initialStorage.accounts[0]!.workspaces = [{ id: "workspace-a", enabled: true }];
+		initialStorage.accounts[0]!.currentWorkspaceIndex = 0;
+		const resident = new AccountManager(undefined, initialStorage);
+		const state = createRotationProxyState({ ...stateInit(), activeAccountManager: resident });
+		const duplicate = new AccountManager(undefined, structuredClone(initialStorage));
+		let signalLoadStarted!: () => void;
+		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
+		let releaseLoad!: () => void;
+		const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+		loadFromDisk.mockImplementationOnce(async () => {
+			signalLoadStarted();
+			await loadGate;
+			return duplicate;
+		});
+
+		const pending = reloadRuntimeCredentials(state);
+		await loadStarted;
+		const live = resident.getAccountByIndex(0);
+		if (!live?.workspaces?.[0]) throw new Error("workspace missing");
+		live.workspaces[0].enabled = false;
+		live.workspaces[0].disabledAt = NOW;
+		releaseLoad();
+
+		const result = await pending;
+
+		expect(result).toBe(resident);
+		expect(state.activeAccountManager).toBe(resident);
+		expect(resident.getAccountByIndex(0)?.workspaces?.[0]).toMatchObject({
+			enabled: false,
+			disabledAt: NOW,
+		});
+		expect(state.knownAccountManagers.has(duplicate)).toBe(false);
 	});
 
 	it("reserves the surviving same-email workspace before carrying runtime waits", async () => {
