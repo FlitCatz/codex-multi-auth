@@ -47,7 +47,7 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
    try{await fs.writeFile(temp,JSON.stringify(attempts)+"\n",{mode:0o600,flag:"wx"});await withRetry(()=>fs.rename(temp,options.path),retry);}finally{await withRetry(()=>fs.rm(temp,{force:true}),retry);}
    if(repairHistory)logWarn("Automatic API check history repaired; billable checks deferred for one daily interval.");
    return !repairHistory;
-  });
+  },{signal});
   if(!claimed||signal.aborted)continue;
   try{await options.check(current,signal);}catch{if(!signal.aborted)logWarn("Automatic API capability check failed; retry deferred until the next daily interval.");}
  }
@@ -74,7 +74,7 @@ export function createAutomaticApiCheck(){return async(signal:AbortSignal)=>runA
    signal.throwIfAborted();
    return fetch(input,{...init,signal});
   };
-  const inventory=await discoverModelInventory(null,[route],{fetchImpl:fetcher,persistProbes:true,updateApiDiscovery:updateDiscovery});
+  const inventory=await discoverModelInventory(null,[route],{fetchImpl:fetcher,signal:stop,persistProbes:true,updateApiDiscovery:updateDiscovery});
   if(stop.aborted||!discoveryAccepted)return;
   const current=(await loadApiRoutes()).find(r=>eligible(r)&&sameRoute(r,acceptedRoute));
   if(current)await saveModelInventory(inventory,{mergeEntries:true});

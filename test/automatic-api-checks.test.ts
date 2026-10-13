@@ -159,3 +159,37 @@ it("refreshes expired program evidence before consuming the daily pass despite f
   expect(programPosts).toBe(2);
  }finally{clock.mockRestore();network.mockRestore();if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;}
 });
+
+it("stops daily discovery waiting on a real probe lease without paid or late work", async () => {
+ const {withFileTransactionLock}=await import("../lib/storage/file-lock.js");
+ const {saveApiRoutes}=await import("../lib/api-route-store.js");
+ const {createAutomaticApiCheck}=await import("../lib/runtime/automatic-api-checks.js");
+ const root=await mkdtemp(join(tmpdir(),"daily-lease-stop-"));roots.push(root);
+ const previous=process.env.CODEX_MULTI_AUTH_DIR;process.env.CODEX_MULTI_AUTH_DIR=root;
+ const credential={...route("fixture"),visibleModels:["fixture"],knownModels:["fixture"]};
+ const key=createHash("sha256").update(credential.id).update("\0").update(credential.apiKey).update("\0fixture").digest("hex");
+ const lease=join(root,"api-probe-locks",key);
+ let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>{release=r;}),started=new Promise<void>(r=>{entered=r;});
+ let posts=0;
+ const mock=vi.spyOn(globalThis,"fetch").mockImplementation(async(input,init)=>{
+  if(init?.method==="POST"){posts++;return Response.json({output:[]});}
+  if(String(input).includes("/models"))return Response.json({data:[{id:"fixture"}]});
+  return new Response("missing",{status:404});
+ });
+ const owner=withFileTransactionLock(lease,async()=>{entered();await gate;});await started;
+ let scheduler:ReturnType<typeof startAutomaticApiChecks>|undefined,timer:ReturnType<typeof setTimeout>|undefined;
+ let stop:Promise<void>|undefined;
+ try{
+  await saveApiRoutes([credential]);
+  vi.useFakeTimers();scheduler=startAutomaticApiChecks(createAutomaticApiCheck());await vi.advanceTimersByTimeAsync(5000);vi.useRealTimers();
+  await vi.waitFor(async()=>expect((await fs.readdir(join(root,"api-probe-locks"))).some(name=>name.includes("candidate"))).toBe(true));
+  stop=scheduler.stop();
+  expect(await Promise.race([stop.then(()=>"stopped"),new Promise(resolve=>{timer=setTimeout(()=>resolve("blocked"),1000);})])).toBe("stopped");
+  expect(posts).toBe(0);
+ }finally{
+  clearTimeout(timer);vi.useRealTimers();release();await owner;await(stop??scheduler?.stop());mock.mockRestore();
+  if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;
+ }
+ expect(posts).toBe(0);
+ expect((await fs.readdir(join(root,"api-probe-locks"))).filter(name=>name.includes("candidate")||name.endsWith("write-lock"))).toEqual([]);
+});

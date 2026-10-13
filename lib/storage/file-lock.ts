@@ -138,11 +138,14 @@ async function recoverDeadCandidates(lock: string): Promise<void> {
  */
 export async function withFileTransactionLock<T>(path: string, action: () => Promise<T>, options: {
     waitMs?: number;
+    signal?: AbortSignal;
 } = {}): Promise<T> {
+    options.signal?.throwIfAborted();
     const absolute = resolve(path);
     await fs.mkdir(dirname(absolute), { recursive: true, mode: 0o700 });
     // Canonicalize the existing parent so /tmp and its symlink aliases share a lock.
     const key = join(await fs.realpath(dirname(absolute)), absolute.slice(dirname(absolute).length + 1));
+    options.signal?.throwIfAborted();
     if (leases.getStore()?.get(key)?.active)
         return action();
     const lock = `${key}.write-lock`;
@@ -154,6 +157,7 @@ export async function withFileTransactionLock<T>(path: string, action: () => Pro
         await fs.chmod(candidate, 0o700);
         await fs.writeFile(join(candidate, owner), "", { flag: "wx", mode: 0o600 });
         await withRetry(async () => {
+            options.signal?.throwIfAborted();
             try {
                 await fs.rename(candidate, lock);
                 published = true;
@@ -179,6 +183,7 @@ export async function withFileTransactionLock<T>(path: string, action: () => Pro
             jitterMs: LOCK_RETRY_JITTER_MS,
             retryableCodes: ["ELOCKED", "EBUSY", "EPERM", "EACCES", "EAGAIN"],
         });
+        options.signal?.throwIfAborted();
         const lease = { active: true };
         const context = new Map(leases.getStore());
         context.set(key, lease);

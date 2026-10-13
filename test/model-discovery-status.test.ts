@@ -700,3 +700,26 @@ it("persists program-specific transient retries without renewing old evidence",a
  expect(programRequests).toBe(3);
  expect(inventory.entries[0].entitlements?.[0]).toMatchObject({programCheckedAt:now,probes:{"program:cyber:daybreak_blue":"verified"}});
 });
+
+it("replaces future inventory evidence after clock rollback while preserving valid newer and unrelated rows", async () => {
+	const { saveModelInventory, loadModelInventory } = await import("../lib/runtime/model-discovery-status.js");
+	const clock = vi.spyOn(Date, "now").mockReturnValue(2000);
+	const entry = (id: string, checkedAt: number, model: string) => ({ id, label: id, kind: "api" as const, checkedAt, enabled: true, error: false, models: [model], visibleModels: [model] });
+	try {
+		await saveModelInventory({ version: 1, checkedAt: 2000, entries: [entry("rollback", 2000, "old"), entry("valid", 900, "newer"), entry("unrelated", 800, "keep")] });
+		const unrelated = (await loadModelInventory())!.entries.find(row => row.id === "unrelated");
+		clock.mockReturnValue(1000);
+		await saveModelInventory({ version: 1, checkedAt: 1000, entries: [entry("rollback", 1000, "fresh"), entry("valid", 850, "stale")] }, { mergeEntries: true });
+		const saved = (await loadModelInventory())!;
+		expect(saved.checkedAt).toBe(1000);
+		expect(saved.entries.find(row => row.id === "rollback")).toMatchObject({ checkedAt: 1000, models: ["fresh"] });
+		expect(saved.entries.find(row => row.id === "valid")).toMatchObject({ checkedAt: 900, models: ["newer"] });
+		expect(saved.entries.find(row => row.id === "unrelated")).toEqual(unrelated);
+		// A delayed partial result must still leave a genuinely newer global timestamp alone.
+		clock.mockReturnValue(1100);
+		await saveModelInventory({ version: 1, checkedAt: 950, entries: [] }, { mergeEntries: true });
+		expect((await loadModelInventory())!.checkedAt).toBe(1000);
+	} finally {
+		clock.mockRestore();
+	}
+});

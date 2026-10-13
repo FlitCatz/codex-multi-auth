@@ -131,6 +131,8 @@ export class ApiModelCapabilities {
 		private readonly fetchImpl: typeof fetch = fetch,
 		private readonly now: () => number = Date.now,
 		private readonly probeSlot?: <T>(operation: () => Promise<T>) => Promise<T>,
+		// Keep public documentation across short-lived credential/model leases.
+		private readonly documentationSource?: ApiModelCapabilities,
 	) {}
 	/** Probe results keyed by an opaque hash, for a fresh CLI process to honour the 15-minute cache. */
 	exportProbes(): Array<[string, ProbeResult]> {
@@ -146,6 +148,7 @@ export class ApiModelCapabilities {
 		return (await this.documentation(id, refresh)).levels;
 	}
 	private async documentation(id: string, refresh = false): Promise<DocumentedCapabilities> {
+		if (this.documentationSource) return this.documentationSource.documentation(id, refresh);
 		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(id)) return { levels: [] };
 		const cached = this.cache.get(id);
 		if (!refresh && cached && cached.at + 60000 > this.now())

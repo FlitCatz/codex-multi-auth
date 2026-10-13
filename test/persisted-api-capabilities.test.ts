@@ -459,3 +459,139 @@ it.each([false, true])("replaces future-dated own evidence without repeating pai
 		await removeWithRetry(root, { recursive: true, force: true });
 	}
 });
+
+it.each(["throttled", "transport", "revoked"])("preserves shared documentation during leased probe refresh with %s responses", async (failure) => {
+    const { ApiModelCapabilities } = await import("../lib/runtime/api-model-capabilities.js");
+    const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
+    const { resolveModelRoute } = await import("../lib/model-route-policy.js");
+    const root = await mkdtemp(join(tmpdir(), "leased-documentation-"));
+    const previous = process.env.CODEX_MULTI_AUTH_DIR;
+    process.env.CODEX_MULTI_AUTH_DIR = root;
+    let outage = false, now = 1000, docs = 0;
+    const fetcher: typeof fetch = async (_input, init) => {
+        if (init?.method !== "POST") {
+            docs++;
+            expect(new Headers(init?.headers).has("authorization")).toBe(false);
+            return outage ? new Response("unavailable", { status: 503 }) : new Response("Model ID: `fixture`\nReasoning.effort supports: low, medium, high.\n## Model details\n- Input modalities: text, image\n");
+        }
+        if (outage) {
+            if (failure === "transport") throw Error("offline");
+            return Response.json({ error: { code: failure === "revoked" ? "invalid_api_key" : "rate_limit_exceeded" } }, { status: failure === "revoked" ? 401 : 429 });
+        }
+        const body = JSON.parse(String(init.body));
+        return Response.json({ reasoning: body.reasoning, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+    };
+    const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, visibleModels: ["fixture"] };
+    const metadata = new ApiModelCapabilities(fetcher, () => now);
+    const options = { fetchImpl: fetcher, now: () => now, metadata };
+    try {
+        const [first] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+        expect(first.supported_reasoning_levels).toContainEqual(expect.objectContaining({ effort: "high" }));
+        expect(first.capability_probe_status).not.toHaveProperty("effort:high");
+        now += 900_001;
+        outage = true;
+        const [second] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], true, route, false, options);
+        const resolved = resolveModelRoute("api/fixture", [{ ...route, models: [second] }], { reasoningEffort: "high" });
+        if (failure === "revoked") {
+            expect(second.supported_reasoning_levels).toEqual([]);
+            expect(resolved.candidates).toEqual([]);
+        } else {
+            expect(second.supported_reasoning_levels).toContainEqual(expect.objectContaining({ effort: "high" }));
+            expect(second.input_modalities).toEqual(["text", "image"]);
+            expect(resolved.candidates).toHaveLength(1);
+        }
+        expect(docs).toBe(2);
+    } finally {
+        if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+        else process.env.CODEX_MULTI_AUTH_DIR = previous;
+        await removeWithRetry(root, { recursive: true, force: true });
+    }
+});
+
+it.each(["EACCES", "ELOCKED"])("reuses only valid readable disk evidence when lease fails with %s", async (code) => {
+    const locks = await import("../lib/storage/file-lock.js");
+    const { promises: fs } = await import("node:fs");
+    const { createHash } = await import("node:crypto");
+    const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
+    const { resolveModelRoute } = await import("../lib/model-route-policy.js");
+    const root = await mkdtemp(join(tmpdir(), "lease-disk-evidence-"));
+    const previous = process.env.CODEX_MULTI_AUTH_DIR;
+    process.env.CODEX_MULTI_AUTH_DIR = root;
+    const path = join(root, "api-capability-probes.json");
+    const key = createHash("sha256").update("fixture\0fixture-key\0fixture").digest("hex");
+    const entry = { at: 1000, programCheckedAt: 1000, levels: ["high"], tiers: ["fast"], status: { responses: "verified", "program:cyber:standard": "verified" } };
+    const contents = JSON.stringify({ version: 1, entries: [[key, entry]] });
+    await fs.writeFile(path, contents);
+    const lock = vi.spyOn(locks, "withFileTransactionLock").mockRejectedValue(Object.assign(Error("unavailable"), { code }));
+    let posts = 0;
+    const fetcher: typeof fetch = async (_input, init) => { if (init?.method === "POST") posts++; return new Response("missing", { status: 404 }); };
+    const route = { id: "fixture", label: "fixture", kind: "zdr" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, visibleModels: ["fixture"], accessPrograms: { cyber: ["standard"] } };
+    try {
+        for (const scenario of ["fresh", "expired", "future", "changed-credential", "changed-programs"]) {
+            const now = scenario === "expired" ? 901_001 : scenario === "future" ? 999 : 1000;
+            const current = scenario === "changed-credential" ? { ...route, apiKey: "other-key" } : scenario === "changed-programs" ? { ...route, accessPrograms: { cyber: ["daybreak_blue"] } } : route;
+            const [model] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], true, current, true, { fetchImpl: fetcher, now: () => now });
+            const resolved = resolveModelRoute("zdr/fixture", [{ ...current, models: [model] }], { reasoningEffort: "high", serviceTier: "priority" });
+            if (scenario === "fresh") {
+                expect(model.capability_probe_status).toEqual(entry.status);
+                expect(model.capability_checked_at).toBe(1000);
+                expect(resolved.candidates).toHaveLength(1);
+            } else {
+                expect(model.capability_probe_status).toBeUndefined();
+                expect(resolved.candidates).toEqual([]);
+            }
+        }
+        expect(posts).toBe(0);
+        expect(await fs.readFile(path, "utf8")).toBe(contents);
+    } finally {
+        lock.mockRestore();
+        if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+        else process.env.CODEX_MULTI_AUTH_DIR = previous;
+        await removeWithRetry(root, { recursive: true, force: true });
+    }
+});
+
+it.each([1000, 1001])("prefers readable disk denial over retained positive evidence at %s", async (at) => {
+    const locks = await import("../lib/storage/file-lock.js");
+    const { promises: fs } = await import("node:fs");
+    const { createHash } = await import("node:crypto");
+    const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
+    const { resolveModelRoute } = await import("../lib/model-route-policy.js");
+    const root = await mkdtemp(join(tmpdir(), "lease-disk-denial-"));
+    const previous = process.env.CODEX_MULTI_AUTH_DIR;
+    process.env.CODEX_MULTI_AUTH_DIR = root;
+    const path = join(root, "api-capability-probes.json");
+    const rename = fs.rename.bind(fs);
+    const failedSave = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+        if (String(to) === path) throw Object.assign(Error("full"), { code: "ENOSPC" });
+        return rename(from, to);
+    });
+    let now = 1000, posts = 0;
+    const fetcher: typeof fetch = async (_input, init) => {
+        if (init?.method !== "POST") return new Response("missing", { status: 404 });
+        posts++;
+        const body = JSON.parse(String(init.body));
+        return Response.json({ reasoning: body.reasoning, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+    };
+    const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, visibleModels: ["fixture"] };
+    const options = { fetchImpl: fetcher, now: () => now };
+    try {
+        const [first] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+        expect(first.capability_probe_status).toMatchObject({ responses: "verified" });
+        const count = posts;
+        failedSave.mockRestore();
+        const key = createHash("sha256").update("fixture\0fixture-key\0fixture").digest("hex");
+        await fs.writeFile(path, JSON.stringify({ version: 1, entries: [[key, { at, levels: [], tiers: [], status: { responses: "unsupported" } }]] }));
+        now = at;
+        vi.spyOn(locks, "withFileTransactionLock").mockRejectedValue(Object.assign(Error("readonly"), { code: "EROFS" }));
+        const [second] = await enrichPersistedApiCapabilities([first], false, route, false, options);
+        expect(second.capability_probe_status).toEqual({ responses: "unsupported" });
+        expect(resolveModelRoute("api/fixture", [{ ...route, models: [second] }]).candidates).toEqual([]);
+        expect(posts).toBe(count);
+    } finally {
+        vi.restoreAllMocks();
+        if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+        else process.env.CODEX_MULTI_AUTH_DIR = previous;
+        await removeWithRetry(root, { recursive: true, force: true });
+    }
+});

@@ -71,10 +71,11 @@ async function loadProbeCache(): Promise<Array<[string, ProbeResult]>> {
 		return [];
 	}
 }
-async function persistProbe(key: string, value: ProbeResult | undefined, now: () => number): Promise<void> {
+async function persistProbe(key: string, value: ProbeResult | undefined, now: () => number, signal?: AbortSignal): Promise<void> {
 	if (!value) return;
 	const path = probeCachePath();
 	await withFileTransactionLock(path, async () => {
+		signal?.throwIfAborted();
 		const merged = new Map(await loadProbeCache());
 		const disk = merged.get(key);
 		if (!disk || disk.at > now() || disk.at <= value.at) merged.set(key, value);
@@ -87,7 +88,13 @@ async function persistProbe(key: string, value: ProbeResult | undefined, now: ()
 		} finally {
 			await withRetry(() => fs.rm(temp, { force: true }), retry);
 		}
-	});
+	}, { signal });
+}
+
+function latestProbe(key: string, retained: ProbeResult | undefined, entries: Array<[string, ProbeResult]>, now: number): ProbeResult | undefined {
+	const disk = entries.find(([id]) => id === key)?.[1];
+	const validDisk = disk && disk.at <= now ? disk : undefined;
+	return retained && retained.at <= now && (!validDisk || retained.at > validDisk.at) ? retained : validDisk;
 }
 
 /** Reload under a credential/model lease so independent consumers share paid evidence. */
@@ -96,8 +103,9 @@ async function enrichPersistedApiCapabilitiesImpl(
 	refresh: boolean,
 	route: ApiRouteCredential,
 	force: boolean,
-	options: { fetchImpl?: typeof fetch; now?: () => number; metadata?: ApiModelCapabilities } = {},
+	options: { fetchImpl?: typeof fetch; now?: () => number; metadata?: ApiModelCapabilities; signal?: AbortSignal } = {},
 ): Promise<RouteModel[]> {
+	options.signal?.throwIfAborted();
 	const fetcher = options.fetchImpl ?? fetch;
 	const now = options.now ?? Date.now;
 	const metadata = options.metadata ?? new ApiModelCapabilities(fetcher, now);
@@ -109,32 +117,42 @@ async function enrichPersistedApiCapabilitiesImpl(
 		const path = probeCachePath();
 		const key = createHash("sha256").update(route.id).update("\0").update(route.apiKey).update("\0").update(model.slug).digest("hex");
 		const memoryKey = `${path}\0${key}`;
-		const fallbackWithoutProbes = async (): Promise<RouteModel> => {
+		const fallbackWithoutProbes = async (readDisk = true): Promise<RouteModel> => {
+			options.signal?.throwIfAborted();
+			let entries: Array<[string, ProbeResult]> = [];
+			// Atomic cache reads are safe without the paid-probe lease; never write here.
+			if (readDisk) {
+				try { entries = await loadProbeCache(); } catch { /* Retained evidence may still be usable. */ }
+			}
+			options.signal?.throwIfAborted();
 			const retained = retainedProbes.get(memoryKey);
-			const [result] = await metadata.enrich([model], refresh, route, false, retained ? [[key, retained]] : []);
+			const value = latestProbe(key, retained, entries, now());
+			const [result] = await metadata.enrich([model], refresh, route, false, value ? [[key, value]] : []);
 			return result ?? model;
 		};
 		try {
 			return await withFileTransactionLock(join(dirname(path), "api-probe-locks", key), async () => {
-				const capabilities = new ApiModelCapabilities(fetcher, now, withSharedProbeSlot);
+				options.signal?.throwIfAborted();
+				const capabilities = new ApiModelCapabilities(fetcher, now, withSharedProbeSlot, metadata);
 				let entries: Array<[string, ProbeResult]>;
 				try {
 					entries = await loadProbeCache();
 				} catch {
 					logWarn("API capability cache unavailable; skipping paid probes.");
-					return fallbackWithoutProbes();
+					return fallbackWithoutProbes(false);
 				}
 				const retained = retainedProbes.get(memoryKey);
-				const disk = entries.find(([id]) => id === key)?.[1];
-				if (retained && (!disk || disk.at > now() || retained.at > disk.at)) capabilities.importProbes([[key, retained]]);
-				capabilities.importProbes(entries);
+				const latest = latestProbe(key, retained, entries, now());
+				if (latest) capabilities.importProbes([[key, latest]]);
+				options.signal?.throwIfAborted();
 				const [result] = await capabilities.enrich([model], refresh, route, force);
 				// Imported evidence belongs to other leases; only write our own result.
 				const value = new Map(capabilities.exportProbes()).get(key);
 				try {
-					await persistProbe(key, value, now);
+					await persistProbe(key, value, now, options.signal);
 					retainedProbes.delete(memoryKey);
 				} catch {
+					options.signal?.throwIfAborted();
 					if (value) {
 						if (retainedProbes.size >= 1000) retainedProbes.delete(retainedProbes.keys().next().value ?? "");
 						retainedProbes.set(memoryKey, value);
@@ -142,7 +160,7 @@ async function enrichPersistedApiCapabilitiesImpl(
 					logWarn("API capability results could not be persisted; retaining completed evidence in memory.");
 				}
 				return result ?? model;
-			}, { waitMs: 60_000 });
+			}, { waitMs: 60_000, signal: options.signal });
 		} catch (error) {
 			if (!unavailableLeaseCodes.has((error as NodeJS.ErrnoException).code ?? "")) throw error;
 			logWarn("API capability lease unavailable; skipping paid probes.");

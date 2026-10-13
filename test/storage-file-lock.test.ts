@@ -241,3 +241,27 @@ it("retries cleanup of an unpublished candidate after a failed acquisition",asyn
  await vi.waitFor(async()=>expect((await readdir(dir)).filter(p=>p.includes(".candidate-"))).toEqual([]),{timeout:5000});
  a.child.send("go");await a.wait("saved");
 });
+
+it("cancels a contended lease promptly without running late work or removing its owner", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lock-cancel-")); dirs.push(dir);
+    const path = join(dir, "state");
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const owner = withFileTransactionLock(path, async () => { entered(); await gate; });
+    await started;
+    const controller = new AbortController();
+    const action = vi.fn(async () => undefined);
+    const waiting = withFileTransactionLock(path, action, {waitMs: 60_000, signal: controller.signal});
+    const settled = waiting.then(() => "completed", () => "aborted");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        await vi.waitFor(async () => expect((await readdir(dir)).some(name => name.includes("candidate"))).toBe(true));
+        controller.abort();
+        expect(await Promise.race([settled, new Promise(resolve => { timer = setTimeout(() => resolve("blocked"), 1000); })])).toBe("aborted");
+        expect(action).not.toHaveBeenCalled();
+        expect((await readdir(dir)).filter(name => name.includes("candidate"))).toEqual([]);
+        expect((await readdir(dir)).some(name => name.endsWith("write-lock"))).toBe(true);
+    } finally { clearTimeout(timer); release(); await owner; await settled; }
+    expect(action).not.toHaveBeenCalled();
+});

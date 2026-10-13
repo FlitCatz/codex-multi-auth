@@ -69,6 +69,7 @@ export async function discoverModelInventory(
 	routes: ApiRouteCredential[],
 	options: {
 		fetchImpl?: typeof fetch;
+		signal?: AbortSignal;
 		now?: () => number;
 		clientVersion?: string;
 		updateApiDiscovery?: typeof updateApiModelDiscovery;
@@ -143,7 +144,7 @@ export async function discoverModelInventory(
 		options.updateApiDiscovery
 			? (models, refresh, route, forceProbes) =>
 					options.persistProbes
-                        ? enrichPersistedApiCapabilities(models,refresh,route,forceProbes,{fetchImpl:fetcher,now})
+                        ? enrichPersistedApiCapabilities(models,refresh,route,forceProbes,{fetchImpl:fetcher,now,signal:options.signal})
                         : capabilities.enrich(models, refresh, route, forceProbes)
 			: undefined,
 	);
@@ -216,14 +217,16 @@ async function saveModelInventorySerial(
 ): Promise<void> {
 	const previous = await loadModelInventory();
 	if (mergeEntries && previous) {
+		// Clock rollback must not make old observations permanently newer.
+		const now = Date.now();
 		const entries = [...previous.entries];
 		for (const entry of value.entries) {
 			const index = entries.findIndex(old => old.id === entry.id && old.kind === entry.kind);
 			if (index < 0) entries.push(entry);
-			else if ((entries[index]?.checkedAt ?? -Infinity) <= entry.checkedAt) entries[index] = entry;
+			else if ((entries[index]?.checkedAt ?? -Infinity) > now || (entries[index]?.checkedAt ?? -Infinity) <= entry.checkedAt) entries[index] = entry;
 		}
 		value = { ...previous, ...value, clientVersion: value.clientVersion ?? previous.clientVersion,
-			checkedAt: Math.max(previous.checkedAt, value.checkedAt), entries };
+			checkedAt: previous.checkedAt > now ? value.checkedAt : Math.max(previous.checkedAt, value.checkedAt), entries };
 	}
 	const data = schema.parse(withInventoryChanges(value, previous));
 	const serialized = JSON.stringify(data) + "\n";
