@@ -3268,6 +3268,56 @@ describe("runtime rotation proxy", () => {
 	});
 
 
+	it("retargets a late inference 429 onto the replacement manager after redirect", async () => {
+		const now = Date.now();
+		const storage = createStorage(now, 1);
+		const source = storage.accounts[0];
+		if (!source) throw new Error("expected account");
+		source.recordId = "row-a";
+		const previous = new AccountManager(undefined, storage);
+		const replacement = new AccountManager(undefined, structuredClone(storage));
+		openManagers.push(replacement);
+		vi.spyOn(previous, "saveToDiskDebounced").mockImplementation(() => undefined);
+		vi.spyOn(replacement, "saveToDiskDebounced").mockImplementation(() => undefined);
+		const previousRateLimit = vi.spyOn(previous, "recordRateLimit");
+		const replacementRateLimit = vi.spyOn(replacement, "recordRateLimit");
+		const replacementMarkRateLimited = vi.spyOn(replacement, "markRateLimitedWithReason");
+
+		let markUpstreamStarted!: () => void;
+		const upstreamStarted = new Promise<void>((resolve) => { markUpstreamStarted = resolve; });
+		let releaseUpstream!: () => void;
+		const upstreamGate = new Promise<void>((resolve) => { releaseUpstream = resolve; });
+		const { fetchImpl } = createRecordingFetch(async (call) => {
+			if (call.url.endsWith("/responses")) {
+				markUpstreamStarted();
+				await upstreamGate;
+				return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+					status: HTTP_STATUS.TOO_MANY_REQUESTS,
+					headers: { "content-type": "application/json", "retry-after": "60" },
+				});
+			}
+			return textEventStream();
+		});
+		const proxy = await startProxy({ accountManager: previous, fetchImpl });
+
+		const pending = postResponses(proxy, { model: "gpt-5-codex", input: "fixture" });
+		await upstreamStarted;
+		tokenRefreshRuntime.redirectRuntimeRefreshCommits(previous, replacement);
+		releaseUpstream();
+		const response = await pending;
+		await response.text();
+
+		expect(previousRateLimit).not.toHaveBeenCalled();
+		expect(replacementRateLimit).toHaveBeenCalledTimes(1);
+		expect(replacementMarkRateLimited).toHaveBeenCalledWith(
+			expect.objectContaining({ recordId: "row-a" }),
+			expect.any(Number),
+			expect.any(String),
+			"unknown",
+			"gpt-5-codex",
+		);
+	});
+
 	it("remaps approved workspace candidates when a refreshed account moves indexes", async () => {
 		const now = Date.now();
 		const storage = createStorage(now, 2);

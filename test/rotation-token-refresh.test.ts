@@ -355,6 +355,44 @@ describe("ensureFreshAccessToken", () => {
 		expect(replacement.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
 	});
 
+	it("does not re-enable a row disabled while refresh is pending", async () => {
+		const previous = managerWith(STALE_EXPIRES, { recordId: "row-a" });
+		const replacement = managerWith(STALE_EXPIRES, { recordId: "row-a" });
+		const replacementAccount = replacement.getAccountByIndex(0);
+		if (!replacementAccount) throw new Error("replacement account missing");
+		const replacementCommit = vi.spyOn(replacement, "commitRefreshedAuth");
+		let releaseRefresh!: (value: unknown) => void;
+		queuedRefreshMock.mockImplementation(
+			() => new Promise((resolve) => { releaseRefresh = resolve; }),
+		);
+
+		const pending = ensureFreshAccessToken(refreshParams(previous));
+		await vi.waitFor(() => expect(queuedRefreshMock).toHaveBeenCalledTimes(1));
+		replacementAccount.enabled = false;
+		redirectRuntimeRefreshCommits(previous, replacement);
+		releaseRefresh({
+			type: "success",
+			access: "must-not-commit",
+			refresh: "must-not-commit-refresh",
+			expires: NOW + 7_200_000,
+		});
+
+		const result = await pending;
+		expect(result).toMatchObject({
+			ok: false,
+			retryable: true,
+			selectionRestart: true,
+			accountManager: replacement,
+		});
+		expect(replacementCommit).not.toHaveBeenCalled();
+		expect(replacement.getAccountByIndex(0)).toMatchObject({
+			recordId: "row-a",
+			enabled: false,
+			access: "access-1",
+			refreshToken: "refresh-1",
+		});
+	});
+
 	it("ignores an old refresh invalidation after the same row is repaired by re-login", async () => {
 		const previous = managerWith(STALE_EXPIRES, { recordId: "row-a" });
 		const replacement = managerWith(FRESH_EXPIRES, {

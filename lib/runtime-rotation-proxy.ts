@@ -141,6 +141,7 @@ import {
 	DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
 	ensureFreshAccessToken,
 	redirectRuntimeRefreshCommits,
+	resolveRuntimeRefreshTarget,
 } from "./runtime/rotation-token-refresh.js";
 import { SessionAffinityStore } from "./session-affinity.js";
 import type { RequestBody } from "./types.js";
@@ -2926,6 +2927,16 @@ async function handleRequestInner(
 			}
 			const accountIdentity = accountIdentityFromAccount(refreshed.account, state.now());
 			recordLastRuntimeAccount(state.status, accountIdentity, accountId);
+			// A credential/inventory reload can publish while this request is waiting
+			// on upstream. Resolve response-derived health/auth mutations lazily onto
+			// the latest owner so late transport/429/401/5xx/success state cannot land
+			// only on a superseded manager. If the row vanished entirely, retain the
+			// captured object for this request; there is no replacement row to penalize.
+			const responseStateTarget = () =>
+				resolveRuntimeRefreshTarget(accountManager, refreshed.account) ?? {
+					accountManager,
+					account: refreshed.account,
+				};
 
 			const outboundHeaders = createOutboundHeaders(
 				context.headers,
@@ -3053,12 +3064,13 @@ async function handleRequestInner(
 				// exhaustion 503 a non-zero `retry_after_ms` to back the client off
 				// with (`getMinWaitTimeForFamily` returns 0 while any account is
 				// still selectable).
-				accountManager.markAccountCoolingDown(
-					refreshed.account,
+				const transportState = responseStateTarget();
+				transportState.accountManager.markAccountCoolingDown(
+					transportState.account,
 					state.networkErrorCooldownMs,
 					"network-error",
 				);
-				accountManager.saveToDiskDebounced();
+				transportState.accountManager.saveToDiskDebounced();
 				accountSkipReasons.set(refreshed.account.index, "network-error");
 				exhaustionReason = "network-error";
 				capabilityRejectionIsLatest = false;
@@ -3190,9 +3202,10 @@ async function handleRequestInner(
 				}
 				// Every 429 still drains this account for its retry window, but only an
 				// explicit subscription-usage signal is persisted as quota exhaustion.
-				accountManager.recordRateLimit(refreshed.account, context.family, context.model);
-				accountManager.markRateLimitedWithReason(
-					refreshed.account,
+				const rateLimitState = responseStateTarget();
+				rateLimitState.accountManager.recordRateLimit(rateLimitState.account, context.family, context.model);
+				rateLimitState.accountManager.markRateLimitedWithReason(
+					rateLimitState.account,
 					retryAfterMs,
 					context.family,
 					subscriptionQuotaExceeded ? "quota" : "unknown",
@@ -3206,12 +3219,12 @@ async function handleRequestInner(
 					const confirmedResetAt =
 						state.now() +
 						Math.min(Math.max(0, Math.floor(retryAfterMs)), MAX_RATE_LIMIT_DELAY_MS);
-					refreshed.account.rateLimitResetTimes[confirmedKey] = Math.max(
-						refreshed.account.rateLimitResetTimes[confirmedKey] ?? 0,
+					rateLimitState.account.rateLimitResetTimes[confirmedKey] = Math.max(
+						rateLimitState.account.rateLimitResetTimes[confirmedKey] ?? 0,
 						confirmedResetAt,
 					);
 				}
-				accountManager.saveToDiskDebounced();
+				rateLimitState.accountManager.saveToDiskDebounced();
 				if (!modelAtCapacity && subscriptionQuotaExceeded && switchRequestToLunaReserve(context)) {
 					usageRecorder = createUsageRecorderForModel(context.model);
 					if (runtimePolicyState) {
@@ -3255,25 +3268,25 @@ async function handleRequestInner(
 				const errorCode = extractErrorCodeFromBody(bodyText);
 				if (isWorkspaceDisabledError(upstream.status, errorCode, bodyText)) {
      if(requestScope && refreshed.account.workspaces?.length) {
-      if(accountManager.disableWorkspace(refreshed.account,requestScope.accountId)) accountManager.saveToDiskDebounced();
+      const workspaceState = responseStateTarget();
+      if(workspaceState.accountManager.disableWorkspace(workspaceState.account,requestScope.accountId)) workspaceState.accountManager.saveToDiskDebounced();
       pendingScopes?.shift();
       refundConsumedPoolToken(refreshed.account);
       if(pendingScopes?.length) attemptedIndexes.delete(refreshed.account.index);
       else policyDecision?.blockedAccountIndexes.add(refreshed.account.index);
       state.status.retries++;noteRotation();continue;
      }
-					const accountWasEnabled =
-						accountManager.getAccountByIndex(refreshed.account.index)?.enabled !==
-						false;
+					const disabledState = responseStateTarget();
+					const accountWasEnabled = disabledState.account.enabled !== false;
 					refundConsumedPoolToken(refreshed.account);
 					if (accountWasEnabled) {
-						accountManager.recordFailure(
-							refreshed.account,
+						disabledState.accountManager.recordFailure(
+							disabledState.account,
 							context.family,
 							context.model,
 						);
-						accountManager.setAccountEnabled(refreshed.account.index, false);
-						accountManager.saveToDiskDebounced();
+						disabledState.accountManager.setAccountEnabled(disabledState.account.index, false);
+						disabledState.accountManager.saveToDiskDebounced();
 					}
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
 					exhaustionReason = "deactivated";
@@ -3355,8 +3368,9 @@ async function handleRequestInner(
 			if (upstream.status === HTTP_STATUS.UNAUTHORIZED) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
 				refundConsumedPoolToken(refreshed.account);
+				const authState = responseStateTarget();
 				if (!isTranscribeRequest) {
-					accountManager.recordFailure(refreshed.account, context.family, context.model);
+					authState.accountManager.recordFailure(authState.account, context.family, context.model);
 				}
 				if (isTokenInvalidationError(bodyText)) {
 					// The upstream explicitly revoked this OAuth token. Applying a long
@@ -3364,20 +3378,20 @@ async function handleRequestInner(
 					// account's token from the same IP triggers OpenAI's anti-abuse
 					// detection and invalidates them in sequence. Return the 401 directly
 					// rather than rotating so the client can prompt for re-login.
-					accountManager.markAuthInvalidated(
-						refreshed.account,
+					authState.accountManager.markAuthInvalidated(
+						authState.account,
 						extractErrorCodeFromBody(bodyText) ?? "token_invalidated",
 					);
 					applyMonotonicAuthCooldown(
-						accountManager,
-						refreshed.account,
+						authState.accountManager,
+						authState.account,
 						state.tokenInvalidationCooldownMs,
 					);
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
 					// The invalidation marker must be durable before returning the 401.
 					// A delayed save would allow a proxy restart to reload and route the
 					// revoked account again.
-					await accountManager.saveToDisk();
+					await authState.accountManager.saveToDisk();
 					// Emit the same machine-readable shape as the refresh-failure path
 					// (code: "token_invalidated") instead of forwarding the raw upstream
 					// body, so the client contract is consistent across both vectors.
@@ -3405,11 +3419,11 @@ async function handleRequestInner(
 					return;
 				}
 				applyMonotonicAuthCooldown(
-					accountManager,
-					refreshed.account,
+					authState.accountManager,
+					authState.account,
 					DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
 				);
-				accountManager.saveToDiskDebounced();
+				authState.accountManager.saveToDiskDebounced();
 				exhaustionReason = "auth-failure";
 				capabilityRejectionIsLatest = false;
 				transientAttempts += 1;
@@ -3472,13 +3486,14 @@ async function handleRequestInner(
 					if (outcome === "retry") continue;
 				}
 				refundConsumedPoolToken(refreshed.account);
-				accountManager.recordFailure(refreshed.account, context.family, context.model);
-				accountManager.markAccountCoolingDown(
-					refreshed.account,
+				const serverState = responseStateTarget();
+				serverState.accountManager.recordFailure(serverState.account, context.family, context.model);
+				serverState.accountManager.markAccountCoolingDown(
+					serverState.account,
 					state.serverErrorCooldownMs,
 					"server-error",
 				);
-				accountManager.saveToDiskDebounced();
+				serverState.accountManager.saveToDiskDebounced();
 				exhaustionReason = "server-error";
 				capabilityRejectionIsLatest = false;
 				transientAttempts += 1;
@@ -3533,15 +3548,16 @@ async function handleRequestInner(
 							? quotaDeferral.waitMs
 							: 0;
 				if (nearExhaustionWaitMs > 0) {
-					accountManager.markRateLimitedWithReason(
-						refreshed.account,
+					const quotaState = responseStateTarget();
+					quotaState.accountManager.markRateLimitedWithReason(
+						quotaState.account,
 						nearExhaustionWaitMs,
 						context.family,
 						"quota",
 						context.model,
 					);
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
-					accountManager.saveToDiskDebounced();
+					quotaState.accountManager.saveToDiskDebounced();
 				} else {
 					state.sessionAffinityStore?.remember(
 						context.sessionKey,
@@ -3595,18 +3611,19 @@ async function handleRequestInner(
 					// broken stream is a signal about THIS account's session
 					// (upstream tearing it down) rather than about the shared
 					// network path, and it should still credit the breaker.
-					accountManager.recordFailure(
-						refreshed.account,
+					const streamState = responseStateTarget();
+					streamState.accountManager.recordFailure(
+						streamState.account,
 						context.family,
 						context.model,
 					);
-					accountManager.markAccountCoolingDown(
-						refreshed.account,
+					streamState.accountManager.markAccountCoolingDown(
+						streamState.account,
 						state.networkErrorCooldownMs,
 						"network-error",
 					);
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
-					accountManager.saveToDiskDebounced();
+					streamState.accountManager.saveToDiskDebounced();
 				},
 				state.streamStallTimeoutMs,
 				usageScanner.push,
@@ -3624,8 +3641,9 @@ async function handleRequestInner(
 					}
 				}
 				if (!isTranscribeRequest) {
-					accountManager.recordSuccess(refreshed.account, context.family, context.model);
-					recordRuntimeAccountRecovery(refreshed.account.index);
+					const successState = responseStateTarget();
+					successState.accountManager.recordSuccess(successState.account, context.family, context.model);
+					recordRuntimeAccountRecovery(successState.account.index);
 				}
 			} else if (!clientDisconnected) {
 				state.sessionAffinityStore?.forgetSession(context.sessionKey);

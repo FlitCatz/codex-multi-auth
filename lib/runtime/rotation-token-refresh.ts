@@ -99,7 +99,8 @@ function hasWorkspaceConflict(source: ManagedAccount, candidate: ManagedAccount)
 	);
 }
 
-function resolveRuntimeRefreshTarget(
+/** @internal Resolve an account onto the latest runtime manager replacement. */
+export function resolveRuntimeRefreshTarget(
 	accountManager: AccountManager,
 	account: ManagedAccount,
 ): RuntimeRefreshTarget | null {
@@ -237,6 +238,14 @@ export async function ensureFreshAccessToken(params: {
 		accountManager,
 		account,
 	};
+	if (initialTarget.account.enabled === false) {
+		return {
+			ok: false,
+			retryable: true,
+			selectionRestart: true,
+			accountManager: initialTarget.accountManager,
+		};
+	}
 	if (hasUsableAccessToken(initialTarget.account, now, tokenRefreshSkewMs)) {
 		return {
 			ok: true,
@@ -270,6 +279,16 @@ export async function ensureFreshAccessToken(params: {
 		};
 	}
 	const latestTarget = resolvedLatestTarget ?? initialTarget;
+	if (latestTarget.account.enabled === false) {
+		// An operator/runtime inventory change disabled this row while OAuth was in
+		// flight. Never let a successful refresh re-enable it in commitRefreshedAuth.
+		return {
+			ok: false,
+			retryable: true,
+			selectionRestart: true,
+			accountManager: latestTarget.accountManager,
+		};
+	}
 	const credentialChangedWhileRefreshing =
 		latestTarget.account.access !== refreshCredential.access ||
 		latestTarget.account.refreshToken !== refreshCredential.refreshToken ||
