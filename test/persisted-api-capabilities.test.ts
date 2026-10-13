@@ -737,3 +737,125 @@ it.each(["throttled", "transport", "revoked", "unsupported"])("retains disk-only
         await removeWithRetry(root, { recursive: true, force: true });
     }
 });
+
+it.each(["wipe", "rotate", "disable", "readd"])("does not persist completed production discovery after credential %s", async (change) => {
+ const {promises:fs}=await import("node:fs");
+ const {clearCredentialSidecars}=await import("../lib/storage/credential-sidecars.js");
+ const {updateApiModelDiscovery}=await import("../lib/api-route-store.js");
+ const root=await mkdtemp(join(tmpdir(),"probe-owner-change-"));
+ const previous=process.env.CODEX_MULTI_AUTH_DIR;process.env.CODEX_MULTI_AUTH_DIR=root;
+ const route={id:"fixture",label:"fixture",kind:"api" as const,apiKey:"fixture",enabled:true,priority:0,probeCapabilities:true,visibleModels:["fixture"],knownModels:["fixture"]};
+ let release!:()=>void,started!:()=>void;
+ const gate=new Promise<void>(r=>{release=r;}),first=new Promise<void>(r=>{started=r;});
+ const fetcher:typeof fetch=async(input,init)=>{
+  if(String(input).endsWith("/models"))return Response.json({data:[{id:"fixture"}]});
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  started();await gate;
+  const body=JSON.parse(String(init.body));return Response.json({reasoning:body.reasoning,service_tier:body.service_tier,output:[{type:"function_call",name:"capability_probe"}]});
+ };
+ let pending:Promise<unknown>|undefined;
+ try{
+  await saveApiRoutes([route]);
+  pending=discoverModelInventory(null,[route],{fetchImpl:fetcher,persistProbes:true,updateApiDiscovery:updateApiModelDiscovery});
+  await first;
+  if(change==="wipe"||change==="readd"){await clearCredentialSidecars();if(change==="readd")await saveApiRoutes([route]);}
+  else await saveApiRoutes([{...route,...(change==="rotate"?{apiKey:"replacement"}:{enabled:false})}]);
+  release();await pending;
+  await expect(fs.stat(join(root,"api-capability-probes.json"))).rejects.toMatchObject({code:"ENOENT"});
+ }finally{release();await pending;if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;await removeWithRetry(root,{recursive:true,force:true});}
+});
+
+it("invalidates retained production evidence after wipe and same-key readd", async () => {
+    const { promises: fs } = await import("node:fs");
+    const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
+    const root = await mkdtemp(join(tmpdir(), "probe-write-failure-")), previous = process.env.CODEX_MULTI_AUTH_DIR;
+    process.env.CODEX_MULTI_AUTH_DIR = root;
+    const rename = fs.rename.bind(fs);
+    const spy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => { if (String(to).endsWith("api-capability-probes.json"))
+        throw Object.assign(Error("full"), { code: "ENOSPC" }); return rename(from, to); });
+    let posts = 0;
+    const route = { id: "fixture", kind: "api" as const, label: "fixture", apiKey: "fixture", enabled: true, priority: 0, probeCapabilities: true, visibleModels: ["fixture"] };
+    const options = { requireStoredRoute: true, fetchImpl: async (_url: unknown, init?: RequestInit) => { if (init?.method !== "POST")
+            return new Response("missing", { status: 404 }); posts++; const body = JSON.parse(String(init.body)); return Response.json({ reasoning: body.reasoning, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] }); } };
+    try {
+        await saveApiRoutes([route]);
+        const [first] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+        expect(first.capability_probe_status).toMatchObject({ responses: "verified" });
+        const before = posts;
+        const [second] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+        expect(second.capability_probe_status).toMatchObject({ responses: "verified" });
+        expect(posts).toBe(before);
+        const { clearCredentialSidecars } = await import("../lib/storage/credential-sidecars.js");
+        await clearCredentialSidecars();
+        const [missing] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+        expect(posts).toBe(before);
+        expect(missing.capability_probe_status).toBeUndefined();
+        await saveApiRoutes([route]);
+        spy.mockRestore();
+        const [readded] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+        expect(posts).toBeGreaterThan(before);
+        expect(readded.capability_probe_status).toMatchObject({ responses: "verified" });
+    }
+    finally {
+        spy.mockRestore();
+        if (previous === undefined)
+            delete process.env.CODEX_MULTI_AUTH_DIR;
+        else
+            process.env.CODEX_MULTI_AUTH_DIR = previous;
+        await removeWithRetry(root, { recursive: true, force: true });
+    }
+});
+it("discards cache-only evidence when credentials are wiped while documentation is pending", async () => {
+	const locks = await import("../lib/storage/file-lock.js");
+	const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
+	const { clearCredentialSidecars } = await import("../lib/storage/credential-sidecars.js");
+	const { promises: fs } = await import("node:fs");
+	const root = await mkdtemp(join(tmpdir(), "probe-fallback-wipe-"));
+	const previous = process.env.CODEX_MULTI_AUTH_DIR;
+	process.env.CODEX_MULTI_AUTH_DIR = root;
+	const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture", enabled: true, priority: 0, probeCapabilities: true, visibleModels: ["fixture"] };
+	let release!: () => void, started!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const entered = new Promise<void>(resolve => { started = resolve; });
+	let blocked = false, posts = 0;
+	const fetcher: typeof fetch = async (_input, init) => {
+		if (init?.method !== "POST") {
+			if (blocked) { started(); await gate; }
+			return new Response("Model ID: `fixture`\nReasoning.effort supports: low.");
+		}
+		posts++;
+		const body = JSON.parse(String(init.body));
+		return Response.json({ reasoning: body.reasoning, service_tier: body.service_tier });
+	};
+	const options = { fetchImpl: fetcher, requireStoredRoute: true };
+	const original = locks.withFileTransactionLock;
+	let lock: ReturnType<typeof vi.spyOn> | undefined;
+	let pending: ReturnType<typeof enrichPersistedApiCapabilities> | undefined;
+	try {
+		await saveApiRoutes([route]);
+		await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+		const before = posts;
+		blocked = true;
+		lock = vi.spyOn(locks, "withFileTransactionLock").mockImplementation(async (...args) => {
+			if (String(args[0]).includes("api-probe-locks")) throw Object.assign(Error("unavailable"), { code: "EACCES" });
+			return original(...args);
+		});
+		pending = enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+		await entered;
+		await clearCredentialSidecars();
+		await saveApiRoutes([route]);
+		release();
+		const [result] = await pending;
+		expect(result.capability_probe_status).toBeUndefined();
+		expect(posts).toBe(before);
+		await expect(fs.stat(join(root, "api-capability-probes.json"))).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		release();
+		try { await pending; } finally {
+			lock?.mockRestore();
+			if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+			else process.env.CODEX_MULTI_AUTH_DIR = previous;
+			await removeWithRetry(root, { recursive: true, force: true });
+		}
+	}
+});

@@ -146,7 +146,7 @@ export async function discoverModelInventory(
 		options.updateApiDiscovery
 			? (models, refresh, route, forceProbes) =>
 					options.persistProbes
-                        ? enrichPersistedApiCapabilities(models,refresh,route,forceProbes,{fetchImpl:fetcher,now,signal:options.signal,programRefreshBefore:options.programRefreshBefore})
+                        ? enrichPersistedApiCapabilities(models,refresh,route,forceProbes,{fetchImpl:fetcher,now,requireStoredRoute:true,signal:options.signal,programRefreshBefore:options.programRefreshBefore})
                         : capabilities.enrich(models, refresh, route, forceProbes)
 			: undefined,
 	);

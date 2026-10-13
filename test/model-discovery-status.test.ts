@@ -1,3 +1,4 @@
+import { saveApiRoutes } from "../lib/api-route-store.js";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
 	discoverModelInventory,
@@ -404,6 +405,7 @@ it("honours the persisted 15-minute probe cache across fresh CLI processes unles
    return new Response("missing", { status: 404 });
   });
   const route = { id: "fixture", label: "API fixture", kind: "api" as const, apiKey: "fixture-secret", enabled: true, priority: 0, visibleModels: ["fixture-model"], probeCapabilities: true };
+  await saveApiRoutes([route]);
   let clock = 1_000_000;
   const run = async (forceProbes?: boolean) => {
    vi.resetModules();
@@ -591,6 +593,7 @@ it("merges concurrent checks' probe results instead of replacing the shared cach
    return new Response("missing", { status: 404 });
   });
   const route = (id: string) => ({ id, label: id, kind: "api" as const, apiKey: `key-${id}`, enabled: true, priority: 0, visibleModels: ["fixture-model"], probeCapabilities: true });
+  await saveApiRoutes([route("one"), route("two")]);
   vi.resetModules();
   const a = await import("../lib/runtime/model-discovery-status.js");
   vi.resetModules();
@@ -622,6 +625,7 @@ it("persists daily program evidence separately from the shorter capability cache
   if(body.access_programs)programRequests++;
   return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
  });
+ await saveApiRoutes([route]);
  const options={fetchImpl:fetcher,now:()=>now,persistProbes:true,updateApiDiscovery:async()=>route};
  await discoverModelInventory(null,[route],options);
  expect(programRequests).toBe(1);
@@ -657,6 +661,7 @@ it.each([429,403])("preserves the daily program cache through unrelated capabili
   if(failed && body.tools)return Response.json({error:{code:"temporary"}},{status});
   return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
  });
+ await saveApiRoutes([route]);
  const options={fetchImpl:fetcher,now:()=>now,persistProbes:true,updateApiDiscovery:async()=>route};
  await discoverModelInventory(null,[route],options);
  now+=900001;failed=true;
@@ -676,6 +681,7 @@ it("does not claim a program check when a model has no whitelisted candidates",a
   expect(body.access_programs).toBeUndefined();
   return Response.json({status:"completed",reasoning:body.reasoning});
  });
+ await saveApiRoutes([route]);
  const inventory=await discoverModelInventory(null,[route],{fetchImpl:fetcher,now:()=>1000,persistProbes:true,updateApiDiscovery:async()=>route});
  expect(inventory.entries[0].entitlements?.[0]).not.toHaveProperty("programCheckedAt");
  expect(formatModelInventory(inventory,1000).join("\n")).not.toContain("programs checked");
@@ -691,6 +697,7 @@ it("persists program-specific transient retries without renewing old evidence",a
   if(body.access_programs){programRequests++;if(failed)return Response.json({error:{code:"temporary"}},{status:429});}
   return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
  });
+ await saveApiRoutes([route]);
  const options={fetchImpl:fetcher,now:()=>now,persistProbes:true,updateApiDiscovery:async()=>route};
  await discoverModelInventory(null,[route],options);
  now+=1000;failed=true;

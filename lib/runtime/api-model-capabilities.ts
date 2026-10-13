@@ -22,11 +22,14 @@ export function parseApiReasoningDocumentation(
 	id: string,
 	text: string,
 ): string[] {
-	if (text.match(/^Model ID:\s*`([^`]+)`/m)?.[1] !== id) return [];
+	return parseReasoningStatement(id, text) ?? [];
+}
+function parseReasoningStatement(id: string, text: string): string[] | undefined {
+	if (text.match(/^Model ID:\s*`([^`]+)`/m)?.[1] !== id) return undefined;
 	const statement = text.match(
 		/`?reasoning\.effort`?\s+supports\s*:?\s*([^\n.]+)\./i,
 	)?.[1];
-	if (!statement) return [];
+	if (statement === undefined) return undefined;
 	const values = statement
 		.replace(/`|\(default\)/g, " ")
 		.split(/,|\band\b/)
@@ -42,7 +45,7 @@ export function parseApiReasoningDocumentation(
 				v === "persistent",
 		)
 	)
-		return [];
+		return undefined;
 	return [...new Set(values)];
 }
 export type ProbeResult = {
@@ -66,7 +69,7 @@ function programsFresh(result: ProbeResult, programs: string[], now: number): bo
   result.programCheckedAt <= now && result.programCheckedAt + 86400_000 > now &&
   programs.every(program => ["verified", "unsupported"].includes(result.status[`program:cyber:${program}`] ?? ""));
 }
-type DocumentedCapabilities = { levels: string[]; inputModalities?: string[] };
+type DocumentedCapabilities = { levels: string[]; reasoningAvailable?: boolean; inputModalities?: string[] };
 function probeKey(route: ApiRouteCredential, id: string): string {
 	return createHash("sha256").update(route.id).update("\0").update(route.apiKey).update("\0").update(id).digest("hex");
 }
@@ -181,13 +184,15 @@ export class ApiModelCapabilities {
 				await reader.cancel();
 			}
 			const text = Buffer.concat(chunks).toString("utf8");
+			const reasoning = parseReasoningStatement(id, text);
 			metadata = {
-				levels: parseApiReasoningDocumentation(id, text),
+				levels: reasoning ?? [],
+				reasoningAvailable: reasoning !== undefined,
 				inputModalities: parseInputModalities(id, text),
 			};
 		} catch {
 			// An outage is not a capability revocation. Keep last successful evidence.
-			metadata = cached ?? metadata;
+			metadata = { ...(cached ?? metadata), reasoningAvailable: false };
 		}
 		if (this.cache.size >= 1000)
 			this.cache.delete(this.cache.keys().next().value ?? "");
@@ -210,18 +215,27 @@ export class ApiModelCapabilities {
 		if (old && old.at <= this.now() && old.at + freshFor > this.now() && programCacheFresh) return old;
 		return undefined;
 	}
+	private reconcileReasoning(probe: ProbeResult, documented: string[], available: boolean): ProbeResult {
+		if (!available) return probe;
+		return { ...probe, levels: probe.levels.filter(effort => documented.includes(effort) || probe.status[`effort:${effort}`] === "verified") };
+	}
 	private async probe(
 		route: ApiRouteCredential,
 		id: string,
 		documented: string[],
 		force = false,
+		reasoningAvailable = false,
 	) {
 		const key = probeKey(route, id);
 		const fresh = this.freshProbe(route, id, this.probes.get(key));
-		if (!force && fresh) return fresh;
+		if (!force && fresh) {
+			const reconciled = this.reconcileReasoning(fresh, documented, reasoningAvailable);
+			this.probes.set(key, reconciled);
+			return reconciled;
+		}
 		const running = this.inFlight.get(key);
 		if (running) return running;
-		const pending = this.runProbe(route, id, documented, key, force).finally(() =>
+		const pending = this.runProbe(route, id, documented, key, force, reasoningAvailable).finally(() =>
 			this.inFlight.delete(key),
 		);
 		this.inFlight.set(key, pending);
@@ -233,6 +247,7 @@ export class ApiModelCapabilities {
 		documented: string[],
 		key: string,
 		force: boolean,
+		reasoningAvailable: boolean,
 	): Promise<ProbeResult> {
 		const result: ProbeResult = {
 			at: this.now(),
@@ -420,9 +435,9 @@ export class ApiModelCapabilities {
 				const effective = keep(`effort:${effort}`, status);
 				result.status[`effort:${effort}`] = effective;
 				// Persisted levels can originate in public documentation, without a
-				// verified effort probe. An inconclusive retry must not erase that
-				// scoped evidence after restart; explicit denial still removes it.
-				if (effective === "verified" || (status === "unverified" && !lostAccess && !modelDenied && previous?.levels.includes(effort))) result.levels.push(effort);
+				// verified effort probe. Keep that scoped evidence through an
+				// inconclusive retry only while current documentation is unavailable.
+				if (effective === "verified" || (status === "unverified" && !reasoningAvailable && !lostAccess && !modelDenied && previous?.levels.includes(effort))) result.levels.push(effort);
 			}
 		}
 		const effort = result.levels.includes("low") ? "low" : result.levels[0];
@@ -498,12 +513,14 @@ export class ApiModelCapabilities {
 						let levels = documented.levels;
 						let extra: Record<string, unknown> = {};
 						if (route?.enabled && route.probeCapabilities) {
-							const probed = cached ? this.freshProbe(route, model.slug, cached.get(probeKey(route, model.slug))) : await this.probe(
+							let probed = cached ? this.freshProbe(route, model.slug, cached.get(probeKey(route, model.slug))) : await this.probe(
 								route,
 								model.slug,
 								levels,
 								forceProbes,
+								documented.reasoningAvailable === true,
 							);
+							if (probed && cached) probed = this.reconcileReasoning(probed, levels, documented.reasoningAvailable === true);
 							if (probed) levels = probed.levels;
 							extra = probed ? {
 								service_tiers: probed.tiers.map((id) => ({

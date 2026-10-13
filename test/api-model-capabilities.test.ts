@@ -818,3 +818,73 @@ it.each(["effort", "program"])("caches conclusive model denial during %s probes 
 	expect(cached.capability_probe_status).toEqual(first.capability_probe_status);
 	expect(posts).toBe(count);
 });
+
+it.each(["low", "blank", "unavailable", "malformed", "verified"])("uses reasoning documentation provenance during an inconclusive refresh: %s", async (scenario) => {
+	let refreshed = false, now = 1000;
+	const fetcher: typeof fetch = async (_url, init) => {
+		if (init?.method !== "POST") {
+			if (refreshed && scenario === "unavailable") return new Response("offline", { status: 503 });
+			if (refreshed && scenario === "malformed") return new Response("Model ID: `fixture`\nReasoning.effort might support high.");
+			return new Response(`Model ID: \`fixture\`\nReasoning.effort supports: ${refreshed ? (scenario === "blank" ? "" : "low") : (scenario === "verified" ? "low" : "low, high")}.`);
+		}
+		if (refreshed) return Response.json({ error: { code: "rate_limit_exceeded" } }, { status: 429 });
+		const body = JSON.parse(String(init.body));
+		return Response.json({ reasoning: body.reasoning, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+	};
+	const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true };
+	const first = new ApiModelCapabilities(fetcher, () => now);
+	await first.enrich([{ slug: "fixture" }], false, route);
+	const restarted = new ApiModelCapabilities(fetcher, () => now);
+	restarted.importProbes(first.exportProbes());
+	now += 900_001;
+	refreshed = true;
+	const [model] = await restarted.enrich([{ slug: "fixture" }], true, route);
+	const levels = (model.supported_reasoning_levels as Array<{ effort: string }>).map(value => value.effort);
+	if (scenario === "low") expect(levels).not.toContain("high");
+	else expect(levels).toContain("high");
+});
+
+it.each([false, true])("reconciles cached doc-only levels without refreshing evidence (cache-only=%s)", async (cacheOnly) => {
+	let now = 1000, narrowed = false, outage = false, posts = 0;
+	const fetcher: typeof fetch = async (_url, init) => {
+		if (init?.method !== "POST") return outage ? new Response("offline", { status: 503 }) : new Response(`Model ID: \`fixture\`\nReasoning.effort supports: ${narrowed ? "low" : "low, high"}.`);
+		posts++;
+		if (outage) return new Response("throttled", { status: 429 });
+		const body = JSON.parse(String(init.body));
+		return Response.json({ reasoning: body.reasoning, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+	};
+	const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true };
+	const service = new ApiModelCapabilities(fetcher, () => now);
+	await service.enrich([{ slug: "fixture" }], false, route);
+	const prior = service.exportProbes();
+	const count = posts;
+	now++;
+	narrowed = true;
+	const [model] = await service.enrich([{ slug: "fixture" }], true, route, false, cacheOnly ? prior : undefined);
+	expect(model.supported_reasoning_levels).not.toContainEqual(expect.objectContaining({ effort: "high" }));
+	expect(model.supported_reasoning_levels).toContainEqual(expect.objectContaining({ effort: "max" }));
+	expect(model.capability_checked_at).toBe(1000);
+	expect(posts).toBe(count);
+	if (!cacheOnly) {
+		expect(service.exportProbes()[0][1].levels).not.toContain("high");
+		const restarted = new ApiModelCapabilities(fetcher, () => now);
+		restarted.importProbes(service.exportProbes());
+		outage = true;
+		now += 900_001;
+		const [afterRestart] = await restarted.enrich([{ slug: "fixture" }], true, route);
+		expect(afterRestart.supported_reasoning_levels).not.toContainEqual(expect.objectContaining({ effort: "high" }));
+	}
+});
+
+it("does not use an unavailable cached document to remove newer persisted doc-only efforts", async () => {
+	let outage = false;
+	const service = new ApiModelCapabilities(async () => outage ? new Response("offline", { status: 503 }) : new Response("Model ID: `fixture`\nReasoning.effort supports: low."), () => 2000);
+	await service.reasoning("fixture");
+	const { createHash } = await import("node:crypto");
+	const key = createHash("sha256").update("fixture\0fixture-key\0fixture").digest("hex");
+	service.importProbes([[key, { at: 2000, levels: ["low", "high"], tiers: [], status: { responses: "verified" } }]]);
+	outage = true;
+	const [model] = await service.enrich([{ slug: "fixture" }], true, { id: "fixture", label: "fixture", kind: "api", apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true });
+	expect(model.supported_reasoning_levels).toContainEqual(expect.objectContaining({ effort: "high" }));
+	expect(service.exportProbes()[0][1].levels).toEqual(["low", "high"]);
+});
