@@ -170,7 +170,18 @@ Run `check` for the full check, or select one portion:
 Plain `check` refreshes model discovery but reuses API capability probe results
 younger than 15 minutes, including results from an earlier `check` process
 (stored as hashes in `api-capability-probes.json`). Only `check capabilities`
-sends the billable probes regardless of age. No check sends the first-use
+sends the billable probes regardless of age. Access-program results have a separate
+24-hour cache and appear as `program:cyber:<program>` probe results with their
+check time; `configured programs` remains local policy, not an API advertisement.
+
+While a CLI/app router is running, enabled API/ZDR routes with
+`probeCapabilities: true` also receive a daily capability check of their visible
+models. These checks consume API usage, include small explicit access-program
+requests, and preserve request defaults and configured entitlements. A persisted
+claim prevents multiple routers or restarts from repeating the same daily pass.
+Disable capability probing or the route to stop future automatic probes.
+
+No check sends the first-use
 request without `--prime`; the dashboard's Quick and Deep Check do not prime.
 `account auto-prime <index> on` instead authorizes periodic priming by a running
 CLI/app router.

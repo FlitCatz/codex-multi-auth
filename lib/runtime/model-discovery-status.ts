@@ -33,7 +33,7 @@ const printable = z
 	.max(256)
 	.regex(/^[^\x00-\x1f\x7f]*$/);
 const entitlementSchema = z.object({
- model: printable, checkedAt: z.number().optional(),
+ model: printable, checkedAt: z.number().optional(), programCheckedAt: z.number().finite().nonnegative().max(8.64e15).optional(),
  probes: z.record(printable,z.enum(["verified","unsupported","unverified","downgraded"])).optional(),
  serviceTiers: z.array(z.object({id:printable,name:printable})).max(100),
  reasoningLevels:z.array(printable).max(100),accessPrograms:z.array(printable).max(100),
@@ -67,7 +67,7 @@ const probeCacheSchema = z.object({
 	version: z.literal(1),
 	entries: z.array(z.tuple([
 		z.string().regex(/^[0-9a-f]{64}$/),
-		z.object({ at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
+		z.object({ programCheckedAt: z.number().finite().nonnegative().max(8.64e15).optional(), at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
 	])).max(1000),
 });
 function probeCachePath(): string {
@@ -218,10 +218,10 @@ export async function loadModelInventory(): Promise<ModelInventory | null> {
 	}
 }
 let inventoryWrites: Promise<void> = Promise.resolve();
-export function saveModelInventory(value: ModelInventory): Promise<void> {
+export function saveModelInventory(value: ModelInventory, options: { mergeEntries?: boolean } = {}): Promise<void> {
 	const path = inventoryPath();
 	const pending = inventoryWrites.then(() =>
-		withFileTransactionLock(path, () => saveModelInventorySerial(value, path)),
+		withFileTransactionLock(path, () => saveModelInventorySerial(value, path, options.mergeEntries === true)),
 	);
 	inventoryWrites = pending.catch(() => undefined);
 	return pending;
@@ -229,8 +229,20 @@ export function saveModelInventory(value: ModelInventory): Promise<void> {
 async function saveModelInventorySerial(
 	value: ModelInventory,
 	path: string,
+	mergeEntries = false,
 ): Promise<void> {
-	const data = schema.parse(withInventoryChanges(value, await loadModelInventory()));
+	const previous = await loadModelInventory();
+	if (mergeEntries && previous) {
+		const entries = [...previous.entries];
+		for (const entry of value.entries) {
+			const index = entries.findIndex(old => old.id === entry.id && old.kind === entry.kind);
+			if (index < 0) entries.push(entry);
+			else if ((entries[index]?.checkedAt ?? -Infinity) <= entry.checkedAt) entries[index] = entry;
+		}
+		value = { ...previous, ...value, clientVersion: value.clientVersion ?? previous.clientVersion,
+			checkedAt: Math.max(previous.checkedAt, value.checkedAt), entries };
+	}
+	const data = schema.parse(withInventoryChanges(value, previous));
 	const serialized = JSON.stringify(data) + "\n";
 	if (Buffer.byteLength(serialized) > 4 * 1024 * 1024)
 		throw Error("Model discovery status exceeds size limit");
@@ -269,7 +281,7 @@ export function formatModelInventory(
 						m.probes
 							? `; probes: ${Object.entries(m.probes)
 									.map(([k, v]) => `${k}=${paint(v, v === "verified" ? "success" : v === "unsupported" || v === "downgraded" ? "warning" : "muted")}`)
-									.join(", ")} (${new Date(m.checkedAt ?? 0).toISOString()})`
+									.join(", ")} (${new Date(m.checkedAt ?? 0).toISOString()})${m.programCheckedAt !== undefined ? `; programs checked ${new Date(m.programCheckedAt).toISOString()}` : ""}`
 							: ""
 					}`,
 			),

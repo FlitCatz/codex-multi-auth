@@ -16,7 +16,7 @@ async function listen(server: Server) {
 	if (!address || typeof address === "string") throw Error("listen failed");
 	return `http://127.0.0.1:${address.port}`;
 }
-async function fixture(respond?: (ws: WebSocket, body: Record<string, unknown>, id: string) => boolean) {
+async function fixture(respond?: (ws: WebSocket, body: Record<string, unknown>, id: string) => boolean, options: {signal?: AbortSignal; sendFailure?: boolean} = {}) {
 	const upstream = createServer();
 	const wss = new WebSocketServer({ server: upstream });
 	const calls: Record<string, unknown>[] = [];
@@ -67,6 +67,21 @@ async function fixture(respond?: (ws: WebSocket, body: Record<string, unknown>, 
 		});
 	});
 	const upstreamUrl = await listen(upstream);
+	const peers = new Set<WebSocket>();
+	const originalSend = WebSocket.prototype.send;
+	const sendSpy = vi.spyOn(WebSocket.prototype, "send").mockImplementation(function(this: WebSocket, ...args: Parameters<WebSocket["send"]>) {
+		if (this.url === upstreamUrl.replace("http:", "ws:") + "/responses") {
+			peers.add(this);
+			if (options.sendFailure) {
+				const callback = typeof args[1] === "function" ? args[1] : args[2];
+				callback?.(Error("fixture send failure"));
+				return;
+			}
+		}
+		originalSend.apply(this, args);
+	});
+	cleanups.push(async () => { sendSpy.mockRestore(); });
+
 	cleanups.push(async () => {
 		for (const ws of wss.clients) ws.terminate();
 		wss.close();
@@ -96,6 +111,7 @@ async function fixture(respond?: (ws: WebSocket, body: Record<string, unknown>, 
 					"content-type": "application/json",
 				},
 				body: Buffer.concat(chunks),
+				signal: options.signal,
 			});
 			res.writeHead(response.status, Object.fromEntries(response.headers));
 			try {
@@ -122,7 +138,7 @@ async function fixture(respond?: (ws: WebSocket, body: Record<string, unknown>, 
 		cleanups.push(async () => ws.terminate());
 		return ws;
 	};
-	return { stats: gateway.stats, disconnectUpstream: async () => { await Promise.all([...wss.clients].map(async socket => { const closed=once(socket,"close");socket.terminate();await closed; })); await new Promise(resolve=>setImmediate(resolve)); }, connect, calls, connections: () => connections, baseUrl, useCredential: (credential: string) => { upstreamCredential = credential; } };
+	return { peers, stats: gateway.stats, disconnectUpstream: async () => { const closed = [...peers].filter(socket=>socket.readyState !== WebSocket.CLOSED).map(socket=>once(socket,"close")); for(const socket of wss.clients) socket.terminate(); await Promise.all(closed); }, connect, calls, connections: () => connections, baseUrl, useCredential: (credential: string) => { upstreamCredential = credential; } };
 }
 function turn(
 	ws: WebSocket,
@@ -632,4 +648,40 @@ it("keeps the real status of a per-turn error with an empty body", async () => {
 	const g = await customGateway({ upstream: rejectingUpstream(404, {}), auth: (req) => req.method === "POST" ? 401 : null });
 	const ws = await g.connect();
 	expect((await turn(ws, { model: "shared", input: [] })).at(-1)).toMatchObject({ type: "error", status: 401, error: { code: "websocket_request_failed" } });
+});
+
+
+it("does not diagnose a local request timeout as an upstream disconnect",async()=>{
+ const controller=new AbortController();
+ const f=await fixture(undefined,{signal:controller.signal});const ws=await f.connect();
+ const created=once(ws,"message");const pending=turn(ws,{model:"stall",input:[]});
+ await created;controller.abort(new DOMException("Timeout","TimeoutError"));
+ await pending;
+ expect(f.stats.lastDisconnect).toBeUndefined();
+ expect(f.stats.upstreamRequests).toBe(1);
+});
+
+it.each(["transport_error","buffer_limit"] as const)("records one %s diagnostic without replay even when close follows",async(cause)=>{
+ const f=await fixture();const ws=await f.connect();
+ const created=once(ws,"message");const pending=turn(ws,{model:"stall",input:[]});await created;
+ const peer=[...f.peers][0]!;
+ if(cause==="transport_error")peer.emit("error",Error("secret transport error"));
+ else for(let i=0;i<8;i++)peer.emit("message",Buffer.from(JSON.stringify({type:"response.output_text.delta",delta:"x".repeat(8192)})),false);
+ const diagnostic=f.stats.lastDisconnect;
+ peer.emit("close",1006,Buffer.from("secret close reason"));
+ await pending;
+ expect(f.stats.lastDisconnect).toBe(diagnostic);
+ expect(diagnostic).toMatchObject({cause,stage:"streaming"});
+ expect(JSON.stringify(diagnostic)).not.toContain("secret");
+ expect(f.stats.upstreamRequests).toBe(1);
+ expect(f.calls).toHaveLength(1);
+ peer.terminate();
+});
+
+it("records a send callback failure without replaying the create",async()=>{
+ const f=await fixture(undefined,{sendFailure:true});const ws=await f.connect();
+ await turn(ws,{model:"shared",input:[]});
+ expect(f.stats.lastDisconnect).toMatchObject({cause:"send_error",stage:"awaiting_first_event"});
+ expect(f.stats.upstreamRequests).toBe(1);
+ expect(f.calls).toHaveLength(0);
 });

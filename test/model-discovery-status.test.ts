@@ -574,3 +574,38 @@ it("merges concurrent checks' probe results instead of replacing the shared cach
   await fs.rm(dir, { recursive: true, force: true });
  }
 });
+
+it("persists daily program evidence separately from the shorter capability cache",async()=>{
+ let now=1000;
+ let programRequests=0;
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ const fetcher=vi.fn(async(url:unknown,init?:RequestInit)=>{
+  if(String(url).endsWith("/models"))return Response.json({data:[{id:"fixture"}]});
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)programRequests++;
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const options={fetchImpl:fetcher,now:()=>now,persistProbes:true,updateApiDiscovery:async()=>route};
+ await discoverModelInventory(null,[route],options);
+ expect(programRequests).toBe(1);
+ now+=900001;
+ const inventory=await discoverModelInventory(null,[route],options);
+ expect(programRequests).toBe(1);
+ expect(formatModelInventory(inventory,now).join("\n")).toContain("program:cyber:daybreak_blue=verified");
+});
+
+it("atomically merges partial inventories without losing OAuth or other API rows",async()=>{
+ const {saveModelInventory,loadModelInventory}=await import("../lib/runtime/model-discovery-status.js");
+ const entry=(id:string,kind:"api"|"oauth",checkedAt:number)=>({id,label:id,kind,checkedAt,enabled:true,error:false,models:[id],visibleModels:[id]});
+ await saveModelInventory({version:1,checkedAt:100,clientVersion:"1.2.3",entries:[entry("oauth","oauth",100),entry("a","api",100),entry("b","api",100)]});
+ await Promise.all([
+ saveModelInventory({version:1,checkedAt:200,entries:[entry("a","api",200)]},{mergeEntries:true}),
+ saveModelInventory({version:1,checkedAt:300,entries:[entry("b","api",300)]},{mergeEntries:true}),
+ ]);
+ const result=await loadModelInventory();
+ expect(result?.entries.map(e=>[e.id,e.checkedAt]).sort()).toEqual([["a",200],["b",300],["oauth",100]]);
+ expect(result?.clientVersion).toBe("1.2.3");
+ await saveModelInventory({version:1,checkedAt:150,entries:[entry("a","api",150)]},{mergeEntries:true});
+ expect((await loadModelInventory())?.entries.find(e=>e.id==="a")?.checkedAt).toBe(200);
+});

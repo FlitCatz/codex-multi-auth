@@ -1,3 +1,4 @@
+import { createAutomaticApiCheck, startAutomaticApiChecks } from "./runtime/automatic-api-checks.js";
 import { startAutomaticAccountChecks } from "./runtime/automatic-account-checks.js";
 import { createAutomaticSubscriptionCheck } from "./runtime/automatic-subscription-checks.js";
 import { ClientCancellationError } from "./request/client-cancellation.js";
@@ -1307,12 +1308,13 @@ export async function startRuntimeRotationProxy(
 	if (state.nativeOpenai) websocketGateway.attach(server, `http://${urlHost}:${resolvedPort}`);
 	// Embedded managers own their own lifecycle; ordinary CLI/app routers check opted-in accounts periodically.
 	const automaticChecks = options.accountManager ? undefined : startAutomaticAccountChecks(createAutomaticSubscriptionCheck());
+	const automaticApiChecks = options.accountManager || options.readApiRoutes ? undefined : startAutomaticApiChecks(createAutomaticApiCheck());
 	return {
 		host: bindHost,
 		port: resolvedPort,
 		baseUrl: `http://${urlHost}:${resolvedPort}`,
 		close: async () => {
-			await automaticChecks?.stop();
+			await Promise.all([automaticChecks?.stop(), automaticApiChecks?.stop()]);
 			websocketGateway.close();
 			await closeServer(server, sockets);
 			await flushRuntimeInferenceActivity();

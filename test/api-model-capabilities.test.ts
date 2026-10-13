@@ -559,3 +559,126 @@ describe("403 probe outcomes", () => {
 		expect(result.reprobedSoon).toBe(true);
 	});
 });
+
+it("periodically verifies configured programs without advertising or selecting them", async () => {
+ let now = 1000;
+ const programs: string[] = [];
+ const route = { id: "program-fixture", kind: "api" as const, label: "fixture", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["fixture"], probeCapabilities: true, modelAccessPrograms: {fixture:{cyber:["standard","daybreak_blue"]}} };
+ const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
+  if (init?.method !== "POST") return new Response("missing", {status:404});
+  const body = JSON.parse(String(init.body));
+  if (body.access_programs) {
+   programs.push(body.access_programs.cyber);
+   expect(body.store).toBe(false);
+   expect(body.max_output_tokens).toBe(16);
+   return Response.json({status:"completed",access_programs:body.access_programs});
+  }
+  return Response.json({reasoning:body.reasoning, service_tier:body.service_tier, output:[{type:"function_call",name:"capability_probe"}]});
+ });
+ const service = new ApiModelCapabilities(fetcher,()=>now);
+ const [model] = await service.enrich([{slug:"fixture"}],false,route);
+ expect(programs).toEqual(["standard","daybreak_blue"]);
+ expect(model.capability_probe_status).toMatchObject({"program:cyber:standard":"verified","program:cyber:daybreak_blue":"verified"});
+ expect(model.available_access_programs).toBeUndefined();
+ now += 900001;
+ const restored = new ApiModelCapabilities(fetcher,()=>now);
+ restored.importProbes(service.exportProbes());
+ await restored.enrich([{slug:"fixture"}],false,route);
+ expect(programs).toHaveLength(2);
+ now += 86400000;
+ await restored.enrich([{slug:"fixture"}],false,route);
+ expect(programs).toHaveLength(4);
+ await restored.enrich([{slug:"fixture"}],false,{...route,apiKey:"different-key"});
+ expect(programs).toHaveLength(6);
+ await restored.enrich([{slug:"fixture"}],false,{...route,enabled:false},true);
+ expect(programs).toHaveLength(6);
+});
+
+it.each([
+ [400,{error:{code:"invalid_access_program"}},"unsupported"],
+ [400,{error:{code:"unsupported_access_program"}},"unsupported"],
+ [403,{error:{code:"access_program_not_enabled",param:"access_programs.cyber"}},"unsupported"],
+ [403,{error:{code:"forbidden"}},"unverified"],
+ [429,{error:{code:"rate_limit_exceeded"}},"unverified"],
+ [503,{error:{code:"server_error"}},"unverified"],
+ [200,{status:"failed",access_programs:{cyber:"daybreak_blue"}},"unverified"],
+ [200,{status:"error",access_programs:{cyber:"daybreak_blue"}},"unverified"],
+ [200,{},"unverified"],
+ [200,{access_programs:{cyber:"standard"}},"unverified"],
+] as const)("classifies program evidence conservatively (%s)",async(status,data,expected)=>{
+ const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)return Response.json(data,{status});
+  return Response.json({reasoning:body.reasoning,service_tier:body.service_tier,output:[]});
+ });
+ const [model]=await new ApiModelCapabilities(fetcher).enrich([{slug:"fixture"}],false,{id:"fixture",kind:"api",label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,modelAccessPrograms:{fixture:{cyber:["daybreak_blue"]}}});
+ expect(model.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":expected});
+});
+
+it.each([
+ ["gpt-6.1-sol",["standard","daybreak_blue"]],
+ ["gpt-5.6-cyber",["daybreak_red"]],
+ ["unrelated",[]],
+] as const)("uses bounded program candidates for %s",async(id,expected)=>{
+ const programs:string[]=[];
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)programs.push(body.access_programs.cyber);
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const service=new ApiModelCapabilities(fetcher);
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:[id],probeCapabilities:false};
+ await service.enrich([{slug:id}],false,route);
+ expect(programs).toEqual([]);
+ await service.enrich([{slug:id}],false,{...route,probeCapabilities:true});
+ expect(programs).toEqual(expected);
+});
+
+it("does not present a previous program success as a new verification after transport failure",async()=>{
+ let fail=false;
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs && fail)throw Error("network");
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const service=new ApiModelCapabilities(fetcher);
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ await service.enrich([{slug:"fixture"}],false,route);
+ fail=true;
+ const [model]=await service.enrich([{slug:"fixture"}],false,route,true);
+ expect(model.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"unverified"});
+});
+
+
+it("discovers family program candidates beyond configured defaults",async()=>{
+ const programs:string[]=[];
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)programs.push(body.access_programs.cyber);
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ await new ApiModelCapabilities(fetcher).enrich([{slug:"gpt-6.1-sol"}],false,{id:"fixture",kind:"api",label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["gpt-6.1-sol"],probeCapabilities:true,modelAccessPrograms:{"gpt-6.1-sol":{cyber:["standard"]}}});
+ expect(programs).toEqual(["standard","daybreak_blue"]);
+});
+
+it.each([401,403])("clears earlier capability evidence when a program probe loses credential access (%s)",async(status)=>{
+ const programs:string[]=[];
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs){
+   programs.push(body.access_programs.cyber);
+   return Response.json({error:{code:"invalid_api_key"}},{status});
+  }
+  return Response.json({reasoning:body.reasoning,service_tier:body.service_tier,output:[{type:"function_call",name:"capability_probe"}]});
+ });
+ const [model]=await new ApiModelCapabilities(fetcher).enrich([{slug:"fixture"}],false,{id:"fixture",kind:"api",label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["standard","daybreak_blue"]}});
+ expect(programs).toEqual(["standard"]);
+ expect(model.supported_reasoning_levels).toEqual([]);
+ expect(model.additional_speed_tiers).toEqual([]);
+ expect(model.capability_probe_status).toMatchObject({responses:"unverified",fast:"unverified",retry:"transient","program:cyber:standard":"unverified","program:cyber:daybreak_blue":"unverified"});
+});

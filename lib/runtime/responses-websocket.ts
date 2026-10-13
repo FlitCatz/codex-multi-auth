@@ -270,7 +270,7 @@ class SocketSession {
 				finished = true;
 				cleanup();
 				this.channels.delete(key);
-                const cancelled = context.signal.aborted || this.closed;
+                const cancelled = init.signal?.aborted || context.signal.aborted || this.closed;
                 if (!cancelled) this.stats.lastDisconnect = {
                     at: Date.now(), cause, stage: accepted ? "streaming" : "awaiting_first_event",
                     ...(typeof closeCode === "number" ? {closeCode} : {}),

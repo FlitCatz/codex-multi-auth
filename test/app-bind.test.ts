@@ -2223,8 +2223,9 @@ it.each([
  {stored:{at:"123",cause:"close",stage:"streaming"},expected:null},
 ])("validates persisted WebSocket diagnostics without retaining arbitrary fields: $stored",async ({stored,expected})=>{
  const root=await createTempRoot("app-bind-ws-diagnostic-");
- const options={platform:"linux" as const,home:root,env:{CODEX_HOME:join(root,"codex")}};
+ const options={platform:"linux" as const,home:root,env:{CODEX_HOME:join(root,"codex"),CODEX_MULTI_AUTH_DIR:join(root,"multi-auth")}};
  const paths=resolveAppBindPaths(options);
+ expect(paths.bindDir.startsWith(root + "/")).toBe(true);
  await mkdir(paths.bindDir,{recursive:true});
  await writeFile(paths.statusPath,JSON.stringify({state:"stopped",lastWebsocketDisconnect:stored}));
  expect((await getAppBindStatus(options)).router?.lastWebsocketDisconnect).toEqual(expected);

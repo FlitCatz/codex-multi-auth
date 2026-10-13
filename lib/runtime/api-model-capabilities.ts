@@ -46,6 +46,7 @@ export function parseApiReasoningDocumentation(
 	return [...new Set(values)];
 }
 export type ProbeResult = {
+	programCheckedAt?: number;
 	at: number;
 	levels: string[];
 	tiers: string[];
@@ -106,15 +107,7 @@ export class ApiModelCapabilities {
 		}
 	}
 	private readonly inFlight = new Map<string, Promise<ProbeResult>>();
-	private readonly probes = new Map<
-		string,
-		{
-			at: number;
-			levels: string[];
-			tiers: string[];
-			status: Record<string, string>;
-		}
-	>();
+	private readonly probes = new Map<string, ProbeResult>();
 	private readonly cache = new Map<string, DocumentedCapabilities & { at: number }>();
 	constructor(
 		private readonly fetchImpl: typeof fetch = fetch,
@@ -196,7 +189,7 @@ export class ApiModelCapabilities {
 		if (!force && old && old.at + freshFor > this.now()) return old;
 		const running = this.inFlight.get(key);
 		if (running) return running;
-		const pending = this.runProbe(route, id, documented, key).finally(() =>
+		const pending = this.runProbe(route, id, documented, key, force).finally(() =>
 			this.inFlight.delete(key),
 		);
 		this.inFlight.set(key, pending);
@@ -207,8 +200,9 @@ export class ApiModelCapabilities {
 		id: string,
 		documented: string[],
 		key: string,
+		force: boolean,
 	): Promise<ProbeResult> {
-		const result = {
+		const result: ProbeResult = {
 			at: this.now(),
 			levels: [...documented],
 			tiers: [] as string[],
@@ -229,6 +223,7 @@ export class ApiModelCapabilities {
 			effort?: string;
 			tier?: string;
 			compatibility?: boolean;
+			program?: string;
 		}): Promise<string> => {
 			// Lost access drops everything this credential verified; a model-level
 			// denial hides the model; a 403 naming the probed setting removes only it.
@@ -284,6 +279,7 @@ export class ApiModelCapabilities {
 									? { reasoning: { effort: setting.effort } }
 									: {}),
 								...(setting.tier ? { service_tier: setting.tier } : {}),
+								...(setting.program ? { access_programs: {cyber: setting.program} } : {}),
 							}),
 						},
 					);
@@ -311,6 +307,16 @@ export class ApiModelCapabilities {
 						data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 					} catch {
 						return response.status === 403 ? denied403(null) : "unverified";
+					}
+					if (setting.program) {
+						const error = isRecord(data) && isRecord(data.error) ? data.error : null;
+						if ([400, 403].includes(response.status) && error &&
+							(["invalid_access_program", "unsupported_access_program", "access_program_not_enabled"].includes(String(error.code)) ||
+							["access_programs", "access_programs.cyber"].includes(String(error.param)))) return "unsupported";
+						if (response.status === 403) return denied403(data);
+						if (!response.ok) return "unverified";
+						return isRecord(data) && ["completed", "incomplete"].includes(String(data.status)) && isRecord(data.access_programs) && data.access_programs.cyber === setting.program
+							? "verified" : "unverified";
 					}
 					if (response.status === 403) return denied403(data);
 					if (!response.ok) {
@@ -395,11 +401,30 @@ export class ApiModelCapabilities {
 			result.status[tier] = effective;
 			if (effective === "verified") result.tiers.push(tier);
 		}
+		// These are probe candidates, never entitlements or request defaults.
+		const configured = route.modelAccessPrograms?.[id]?.cyber ?? route.accessPrograms?.cyber;
+		const candidates = [...(configured ?? []), ...(/(?:^|-)cyber(?:-|$)|daybreak-red/.test(id)
+			? ["daybreak_red"] : /^gpt-[56](?:[.-]|$)/.test(id) ? ["standard", "daybreak_blue"] : [])];
+		const programs = [...new Set(candidates)].filter(value => ["standard", "daybreak_blue", "daybreak_red"].includes(value));
+		const reusable = !force && previous?.programCheckedAt !== undefined && Number.isFinite(previous.programCheckedAt) && previous.programCheckedAt >= 0 && previous.programCheckedAt <= 8.64e15 && previous.programCheckedAt <= this.now() &&
+			previous.programCheckedAt + 86400_000 > this.now() && programs.every(program => previous.status[`program:cyber:${program}`] !== undefined);
+		if (reusable && !lostAccess && !modelDenied) {
+			for (const program of programs) result.status[`program:cyber:${program}`] = previous.status[`program:cyber:${program}`] ?? "unverified";
+			result.programCheckedAt = previous.programCheckedAt;
+		} else {
+			for (const program of programs) result.status[`program:cyber:${program}`] = await attempt({ program, effort });
+			result.programCheckedAt = this.now();
+		}
 		if (modelDenied) {
 			result.levels = [];
 			result.tiers = [];
 			for (const name of Object.keys(result.status)) result.status[name] = "unsupported";
 			result.status.responses = "unsupported";
+		}
+		if (lostAccess) {
+			result.levels = [];
+			result.tiers = [];
+			for (const name of Object.keys(result.status)) result.status[name] = "unverified";
 		}
 		if (credentialUnavailable && !modelDenied) result.status.retry = "transient";
 		result.at = this.now();
@@ -437,6 +462,7 @@ export class ApiModelCapabilities {
 								additional_speed_tiers: probed.tiers,
 								capability_probe_status: probed.status,
 								capability_checked_at: probed.at,
+								program_checked_at: probed.programCheckedAt,
 							};
 						}
 						// Ultra is a native orchestration mode. Codex resolves it to this
