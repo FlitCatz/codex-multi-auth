@@ -246,6 +246,7 @@ class SocketSession {
 		return new Promise<Response>((resolve, reject) => {
 			let accepted = false,
 				finished = false;
+			let bodyCancelled = false;
 			let streamController: ReadableStreamDefaultController<Uint8Array>;
 			const stream = new ReadableStream<Uint8Array>(
 				{
@@ -253,6 +254,7 @@ class SocketSession {
 						streamController = controller;
 					},
 					cancel() {
+						bodyCancelled = true;
 						active.terminate();
 					},
 				},
@@ -270,7 +272,7 @@ class SocketSession {
 				finished = true;
 				cleanup();
 				this.channels.delete(key);
-                const cancelled = init.signal?.aborted || context.signal.aborted || this.closed;
+                const cancelled = bodyCancelled || init.signal?.aborted || context.signal.aborted || this.closed;
                 if (!cancelled) this.stats.lastDisconnect = {
                     at: Date.now(), cause, stage: accepted ? "streaming" : "awaiting_first_event",
                     ...(typeof closeCode === "number" ? {closeCode} : {}),

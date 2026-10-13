@@ -47,6 +47,7 @@ export function parseApiReasoningDocumentation(
 }
 export type ProbeResult = {
 	programCheckedAt?: number;
+	programRetry?: boolean;
 	at: number;
 	levels: string[];
 	tiers: string[];
@@ -235,7 +236,7 @@ export class ApiModelCapabilities {
 				if (kind === "model") { modelDenied = true; return "unsupported"; }
 				if (kind === "setting") return "unsupported";
 				credentialUnavailable = true;
-				programAuthFailure = true;
+				programAuthFailure = Boolean(setting.program);
 				return "unverified";
 			};
 			return this.withProbeSlot(async () => {
@@ -408,12 +409,12 @@ export class ApiModelCapabilities {
 		const candidates = [...(configured ?? []), ...(/(?:^|-)cyber(?:-|$)|daybreak-red/.test(id)
 			? ["daybreak_red"] : /^gpt-[56](?:[.-]|$)/.test(id) ? ["standard", "daybreak_blue"] : [])];
 		const programs = [...new Set(candidates)].filter(value => ["standard", "daybreak_blue", "daybreak_red"].includes(value));
-		const reusable = !force && previous?.status.retry !== "transient" && previous?.programCheckedAt !== undefined && Number.isFinite(previous.programCheckedAt) && previous.programCheckedAt >= 0 && previous.programCheckedAt <= 8.64e15 && previous.programCheckedAt <= this.now() &&
-			previous.programCheckedAt + 86400_000 > this.now() && programs.every(program => previous.status[`program:cyber:${program}`] !== undefined);
-		if (reusable && !lostAccess && !modelDenied && !programAuthFailure) {
+		const reusable = !force && previous?.programRetry !== true && previous?.programCheckedAt !== undefined && Number.isFinite(previous.programCheckedAt) && previous.programCheckedAt >= 0 && previous.programCheckedAt <= 8.64e15 && previous.programCheckedAt <= this.now() &&
+			previous.programCheckedAt + 86400_000 > this.now() && programs.every(program => ["verified", "unsupported"].includes(previous.status[`program:cyber:${program}`] ?? ""));
+		if (programs.length && reusable && !lostAccess && !modelDenied && !programAuthFailure) {
 			for (const program of programs) result.status[`program:cyber:${program}`] = previous.status[`program:cyber:${program}`] ?? "unverified";
 			result.programCheckedAt = previous.programCheckedAt;
-		} else {
+		} else if (programs.length) {
 			let inconclusive = false;
 			for (const program of programs) {
 				const name = `program:cyber:${program}`;
@@ -423,7 +424,7 @@ export class ApiModelCapabilities {
 			}
 			// Never renew old evidence after throttling, transport failure or a missing echo.
 			result.programCheckedAt = inconclusive ? previous?.programCheckedAt : this.now();
-			if (inconclusive) result.status.retry = "transient";
+			if (inconclusive) { result.status.retry = "transient"; result.programRetry = true; }
 			if (programAuthFailure) {
 				for (const program of programs) result.status[`program:cyber:${program}`] = "unverified";
 			}

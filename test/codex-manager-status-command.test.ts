@@ -1,3 +1,10 @@
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { getAppBindStatus, resolveAppBindPaths } from "../lib/runtime/app-bind.js";
+import { getStoragePath, setStoragePath } from "../lib/storage.js";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
+import { withDeadPid } from "./helpers/owned-pids.js";
 import { quotaWorkspaceKey } from "../lib/quota-readiness.js";
 import { resetTargetForStoredAccount } from "../lib/runtime/account-reset-credits.js";
 import { describe, expect, it, vi } from "vitest";
@@ -692,4 +699,60 @@ it.each(["subscriptions","api-only","empty"] as const)("shows historical WebSock
  expect(output).toContain("1970-01-01T00:00:01.000Z");expect(output).toContain("streaming");expect(output).toContain("1011");expect(output).toContain("close");
  const json=vi.fn();await runStatusCommand(createStatusDeps({...overrides,json:true,logInfo:json}));
  expect(JSON.parse(json.mock.calls[0]![0]).lastWebsocketDisconnect).toEqual(diagnostic);
+});
+
+
+it.each([
+ { persistedState: "running", live: false },
+ { persistedState: "stopped", live: false },
+ { persistedState: "running", live: true },
+])("CLI reads persisted disconnects without treating a dead router as active: $persistedState / live=$live", async ({persistedState, live}) => {
+ const root = await mkdtemp(join(tmpdir(), "cma-status-disconnect-"));
+ vi.stubEnv("CODEX_MULTI_AUTH_DIR", join(root, "multi-auth"));
+ vi.stubEnv("CODEX_MULTI_AUTH_APP_BIND_CODEX_HOME", join(root, "codex"));
+ vi.spyOn(Date, "now").mockReturnValue(2_000);
+ const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+ try {
+  const paths = resolveAppBindPaths();
+  expect(paths.bindDir.startsWith(root)).toBe(true);
+  await mkdir(paths.bindDir, {recursive:true});
+  await writeFile(paths.statePath, JSON.stringify({
+   ...paths, version:1, platform:process.platform, host:"127.0.0.1", port:1234,
+   baseUrl:"http://127.0.0.1:1234", nodePath:process.execPath,
+   clientApiKey:"fixture-key", boundConfigHash:"fixture-hash", updatedAt:2_000, nativeOpenai:true,
+  }));
+  setStoragePath(null);
+  const storagePath = getStoragePath();
+  expect(storagePath.startsWith(root)).toBe(true);
+  await mkdir(dirname(storagePath), {recursive:true});
+  await writeFile(storagePath, JSON.stringify(createStorage()));
+  const diagnostic = {at:1_000,cause:"close",stage:"streaming",closeCode:1011};
+  const check = async (pid:number) => {
+   await writeFile(paths.statusPath, JSON.stringify({
+    state:persistedState, pid, updatedAt:2_000, lastAccountIndex:0,
+    lastAccountEmail:"one@example.com", lastWebsocketDisconnect:diagnostic,
+   }));
+   expect((await getAppBindStatus()).running).toBe(live);
+   expect(await runCodexMultiAuthCli(["status", "--json"])).toBe(0);
+   const payload = JSON.parse(String(log.mock.calls.at(-1)?.[0]));
+   expect(payload.accountCount).toBe(2);
+   expect(payload.lastWebsocketDisconnect).toEqual(diagnostic);
+   expect(payload.runtimeInUseIndex).toBe(live ? 0 : null);
+   expect(payload.selectionMode).toBe(live ? "model-priority" : "legacy-pin");
+   expect(payload.accounts[0].automaticOrder).toBe(live ? 1 : null);
+   log.mockClear();
+   expect(await runCodexMultiAuthCli(["status"])).toBe(0);
+   const output = log.mock.calls.flat().join("\n");
+   expect(output).toContain("1970-01-01T00:00:01.000Z");
+   expect(output).toContain("streaming");
+   expect(output).toContain("1011");
+  };
+  if (live) await check(process.pid);
+  else await withDeadPid(check);
+ } finally {
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+  setStoragePath(null);
+  await removeWithRetry(root, {recursive:true, force:true});
+ }
 });

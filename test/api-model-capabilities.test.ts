@@ -722,3 +722,27 @@ it("keeps old successful program evidence without renewing it after a nonforced 
  expect(model.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"verified",retry:"transient"});
  expect(model.program_checked_at).toBe(1000);
 });
+
+it("retries inconclusive legacy program cache entries without the separate retry flag",async()=>{
+ let now=1000,programRequests=0;
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)programRequests++;
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ const original=new ApiModelCapabilities(fetcher,()=>now);
+ await original.enrich([{slug:"fixture"}],false,route);
+ const entries=original.exportProbes();
+ entries[0]![1].status["program:cyber:daybreak_blue"]="unverified";
+ entries[0]![1].status.retry="transient";
+ delete entries[0]![1].programRetry;
+ now+=60001;
+ const restored=new ApiModelCapabilities(fetcher,()=>now);
+ restored.importProbes(entries);
+ const [model]=await restored.enrich([{slug:"fixture"}],false,route);
+ expect(programRequests).toBe(2);
+ expect(model.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"verified"});
+ expect(model.program_checked_at).toBe(now);
+});

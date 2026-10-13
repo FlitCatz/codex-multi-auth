@@ -409,7 +409,13 @@ const runListOrStatusCommand: CliCommandHandler = (rest) =>
 		loadRuntimeObservabilitySnapshot: loadPersistedRuntimeObservabilitySnapshot,
 		loadAppBindStatus: async () =>
 			getAppBindStatus()
-				.then((status) => (status.running && status.router ? { ...status.router, nativeOpenai: status.state?.nativeOpenai === true } : null))
+				.then((status) => status.router ? {
+					...status.router,
+					// Keep historical diagnostics, but never revive a crashed router's
+					// persisted "running" marker or its account-selection signal.
+					state: status.running ? status.router.state : "stopped",
+					nativeOpenai: status.running && status.state?.nativeOpenai === true,
+				} : null)
 				.catch(() => null),
 		loadAppHelperStatus: readAppRuntimeHelperAccountSignal,
 		loadQuotaCache,

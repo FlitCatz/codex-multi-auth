@@ -67,7 +67,7 @@ const probeCacheSchema = z.object({
 	version: z.literal(1),
 	entries: z.array(z.tuple([
 		z.string().regex(/^[0-9a-f]{64}$/),
-		z.object({ programCheckedAt: z.number().finite().nonnegative().max(8.64e15).optional(), at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
+		z.object({ programRetry: z.boolean().optional(), programCheckedAt: z.number().finite().nonnegative().max(8.64e15).optional(), at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
 	])).max(1000),
 });
 function probeCachePath(): string {

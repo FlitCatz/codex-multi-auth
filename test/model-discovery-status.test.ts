@@ -609,3 +609,58 @@ it("atomically merges partial inventories without losing OAuth or other API rows
  await saveModelInventory({version:1,checkedAt:150,entries:[entry("a","api",150)]},{mergeEntries:true});
  expect((await loadModelInventory())?.entries.find(e=>e.id==="a")?.checkedAt).toBe(200);
 });
+
+it.each([429,403])("preserves the daily program cache through unrelated capability failures (%s)",async(status)=>{
+ let now=1000,programRequests=0,failed=false;
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ const fetcher=vi.fn(async(url:unknown,init?:RequestInit)=>{
+  if(String(url).endsWith("/models"))return Response.json({data:[{id:"fixture"}]});
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)programRequests++;
+  if(failed && body.tools)return Response.json({error:{code:"temporary"}},{status});
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const options={fetchImpl:fetcher,now:()=>now,persistProbes:true,updateApiDiscovery:async()=>route};
+ await discoverModelInventory(null,[route],options);
+ now+=900001;failed=true;
+ await discoverModelInventory(null,[route],options);
+ now+=60001;failed=false;
+ const inventory=await discoverModelInventory(null,[route],options);
+ expect(programRequests).toBe(1);
+ expect(inventory.entries[0].entitlements?.[0]).toMatchObject({programCheckedAt:1000,probes:{"program:cyber:daybreak_blue":"verified"}});
+});
+
+it("does not claim a program check when a model has no whitelisted candidates",async()=>{
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["unknown_program"]}};
+ const fetcher=vi.fn(async(url:unknown,init?:RequestInit)=>{
+  if(String(url).endsWith("/models"))return Response.json({data:[{id:"fixture"}]});
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  expect(body.access_programs).toBeUndefined();
+  return Response.json({status:"completed",reasoning:body.reasoning});
+ });
+ const inventory=await discoverModelInventory(null,[route],{fetchImpl:fetcher,now:()=>1000,persistProbes:true,updateApiDiscovery:async()=>route});
+ expect(inventory.entries[0].entitlements?.[0]).not.toHaveProperty("programCheckedAt");
+ expect(formatModelInventory(inventory,1000).join("\n")).not.toContain("programs checked");
+});
+
+it("persists program-specific transient retries without renewing old evidence",async()=>{
+ let now=1000,programRequests=0,failed=false;
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ const fetcher=vi.fn(async(url:unknown,init?:RequestInit)=>{
+  if(String(url).endsWith("/models"))return Response.json({data:[{id:"fixture"}]});
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs){programRequests++;if(failed)return Response.json({error:{code:"temporary"}},{status:429});}
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const options={fetchImpl:fetcher,now:()=>now,persistProbes:true,updateApiDiscovery:async()=>route};
+ await discoverModelInventory(null,[route],options);
+ now+=1000;failed=true;
+ await discoverModelInventory(null,[route],{...options,forceProbes:true});
+ now+=60001;failed=false;
+ const inventory=await discoverModelInventory(null,[route],options);
+ expect(programRequests).toBe(3);
+ expect(inventory.entries[0].entitlements?.[0]).toMatchObject({programCheckedAt:now,probes:{"program:cyber:daybreak_blue":"verified"}});
+});

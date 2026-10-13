@@ -16,7 +16,7 @@ async function listen(server: Server) {
 	if (!address || typeof address === "string") throw Error("listen failed");
 	return `http://127.0.0.1:${address.port}`;
 }
-async function fixture(respond?: (ws: WebSocket, body: Record<string, unknown>, id: string) => boolean, options: {signal?: AbortSignal; sendFailure?: boolean} = {}) {
+async function fixture(respond?: (ws: WebSocket, body: Record<string, unknown>, id: string) => boolean, options: {signal?: AbortSignal; sendFailure?: boolean; cancelBody?: () => void} = {}) {
 	const upstream = createServer();
 	const wss = new WebSocketServer({ server: upstream });
 	const calls: Record<string, unknown>[] = [];
@@ -114,6 +114,14 @@ async function fixture(respond?: (ws: WebSocket, body: Record<string, unknown>, 
 				signal: options.signal,
 			});
 			res.writeHead(response.status, Object.fromEntries(response.headers));
+            if (options.cancelBody) {
+                const closed = [...peers].map(peer => once(peer, "close"));
+                await response.body?.cancel();
+                await Promise.all(closed);
+                options.cancelBody();
+                res.end();
+                return;
+            }
 			try {
 				if (response.body)
 					for await (const chunk of response.body) res.write(chunk);
@@ -688,4 +696,18 @@ it("records a send callback failure without replaying the create",async()=>{
  expect(peer.readyState).toBe(WebSocket.CLOSED);
  expect(f.stats.upstreamRequests).toBe(1);
  expect(f.calls).toHaveLength(0);
+});
+
+it("does not diagnose response body cancellation as an upstream disconnect",async()=>{
+ const controller=new AbortController();
+ let cancelled!:()=>void;const cancellation=new Promise<void>(resolve=>{cancelled=resolve;});
+ const f=await fixture(undefined,{signal:controller.signal,cancelBody:cancelled});
+ const ws=await f.connect();
+ ws.send(JSON.stringify({type:"response.create",model:"stall",input:[]}));
+ await cancellation;
+ expect(controller.signal.aborted).toBe(false);
+ expect(f.stats.lastDisconnect).toBeUndefined();
+ expect([...f.peers].every(peer=>peer.readyState===WebSocket.CLOSED)).toBe(true);
+ expect(f.stats.upstreamRequests).toBe(1);
+ expect(f.calls).toHaveLength(1);
 });
