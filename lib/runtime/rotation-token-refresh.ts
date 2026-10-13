@@ -234,7 +234,20 @@ export async function ensureFreshAccessToken(params: {
 		tokenRefreshSkewMs,
 		tokenInvalidationCooldownMs,
 	} = params;
-	const initialTarget = resolveRuntimeRefreshTarget(accountManager, account) ?? {
+	const redirectedInitialManager = resolveRuntimeRefreshCommitManager(accountManager);
+	const resolvedInitialTarget = resolveRuntimeRefreshTarget(accountManager, account);
+	if (redirectedInitialManager !== accountManager && !resolvedInitialTarget) {
+		// The request captured a manager that has since been replaced, and the
+		// selected row no longer exists there. Even a still-fresh old token must not
+		// bypass that removal; restart selection on the replacement pool.
+		return {
+			ok: false,
+			retryable: true,
+			selectionRestart: true,
+			accountManager: redirectedInitialManager,
+		};
+	}
+	const initialTarget = resolvedInitialTarget ?? {
 		accountManager,
 		account,
 	};

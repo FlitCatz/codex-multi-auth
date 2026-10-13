@@ -1966,11 +1966,16 @@ async function handleRequestInner(
 			: null;
 		let pinnedIdentityMissing = false;
 		const matchPinnedReplacementAccount = (
+			previousManager: AccountManager,
 			previous: ManagedAccount,
 			replacementManager: AccountManager,
 		): ManagedAccount | null => {
 			const replacements = replacementManager.getAccountsSnapshot();
-			if (previous.recordId) {
+			// A persisted record id is authoritative. Legacy rows receive a derived
+			// in-memory id whose hash includes the refresh token; an external re-login
+			// can therefore change that derived id for the same workspace. In that legacy
+			// case continue to the strict workspace/account fallback below.
+			if (previous.recordId && previousManager.hasPersistedRecordId(previous)) {
 				return uniqueAccount(replacements.filter((candidate) => candidate.recordId === previous.recordId));
 			}
 			const sourceIds = workspaceIds(previous);
@@ -2007,7 +2012,7 @@ async function handleRequestInner(
 			// the legacy numeric behavior because there is no identity to preserve.
 			const source = pinnedIdentityAccount ?? previousManager.getAccountByIndex(pinnedIndex) ?? null;
 			if (!source) return;
-			const replacement = matchPinnedReplacementAccount(source, replacementManager);
+			const replacement = matchPinnedReplacementAccount(previousManager, source, replacementManager);
 			const live = replacement ? replacementManager.getAccountByIndex(replacement.index) ?? null : null;
 			if (!live) {
 				pinnedIdentityMissing = true;
@@ -2932,11 +2937,22 @@ async function handleRequestInner(
 			// the latest owner so late transport/429/401/5xx/success state cannot land
 			// only on a superseded manager. If the row vanished entirely, retain the
 			// captured object for this request; there is no replacement row to penalize.
+			const responseCredential = {
+				access: refreshed.accessToken,
+				refreshToken: refreshed.account.refreshToken,
+			};
 			const responseStateTarget = () =>
 				resolveRuntimeRefreshTarget(accountManager, refreshed.account) ?? {
 					accountManager,
 					account: refreshed.account,
 				};
+			const responseAuthStateTarget = () => {
+				const target = responseStateTarget();
+				return target.account.access === responseCredential.access &&
+					target.account.refreshToken === responseCredential.refreshToken
+					? target
+					: null;
+			};
 
 			const outboundHeaders = createOutboundHeaders(
 				context.headers,
@@ -3368,8 +3384,8 @@ async function handleRequestInner(
 			if (upstream.status === HTTP_STATUS.UNAUTHORIZED) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
 				refundConsumedPoolToken(refreshed.account);
-				const authState = responseStateTarget();
-				if (!isTranscribeRequest) {
+				const authState = responseAuthStateTarget();
+				if (authState && !isTranscribeRequest) {
 					authState.accountManager.recordFailure(authState.account, context.family, context.model);
 				}
 				if (isTokenInvalidationError(bodyText)) {
@@ -3378,20 +3394,22 @@ async function handleRequestInner(
 					// account's token from the same IP triggers OpenAI's anti-abuse
 					// detection and invalidates them in sequence. Return the 401 directly
 					// rather than rotating so the client can prompt for re-login.
-					authState.accountManager.markAuthInvalidated(
-						authState.account,
-						extractErrorCodeFromBody(bodyText) ?? "token_invalidated",
-					);
-					applyMonotonicAuthCooldown(
-						authState.accountManager,
-						authState.account,
-						state.tokenInvalidationCooldownMs,
-					);
+					if (authState) {
+						authState.accountManager.markAuthInvalidated(
+							authState.account,
+							extractErrorCodeFromBody(bodyText) ?? "token_invalidated",
+						);
+						applyMonotonicAuthCooldown(
+							authState.accountManager,
+							authState.account,
+							state.tokenInvalidationCooldownMs,
+						);
+						// The invalidation marker must be durable before returning the 401.
+						// A delayed save would allow a proxy restart to reload and route the
+						// revoked account again.
+						await authState.accountManager.saveToDisk();
+					}
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
-					// The invalidation marker must be durable before returning the 401.
-					// A delayed save would allow a proxy restart to reload and route the
-					// revoked account again.
-					await authState.accountManager.saveToDisk();
 					// Emit the same machine-readable shape as the refresh-failure path
 					// (code: "token_invalidated") instead of forwarding the raw upstream
 					// body, so the client contract is consistent across both vectors.
@@ -3418,12 +3436,14 @@ async function handleRequestInner(
 					});
 					return;
 				}
-				applyMonotonicAuthCooldown(
-					authState.accountManager,
-					authState.account,
-					DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
-				);
-				authState.accountManager.saveToDiskDebounced();
+				if (authState) {
+					applyMonotonicAuthCooldown(
+						authState.accountManager,
+						authState.account,
+						DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
+					);
+					authState.accountManager.saveToDiskDebounced();
+				}
 				exhaustionReason = "auth-failure";
 				capabilityRejectionIsLatest = false;
 				transientAttempts += 1;
@@ -3884,14 +3904,14 @@ async function handleRequestInner(
 				? (() => {
 					const now = state.now();
 					let minWaitMs: number | null = null;
-					for (const [index, skipReason] of accountSkipReasons) {
-						if (
-							skipReason !== "transcription-rate-limited" &&
-							skipReason !== "cooling-down:auth-failure"
-						) continue;
-						if (policyDecision?.blockedAccountIndexes.has(index)) continue;
-						const account = accountManager.getAccountByIndex(index);
-						if (!account) continue;
+					// Read live account state, not only selection skip reasons. The final
+					// refresh attempt can install an auth cooldown after the last selection
+					// pass, so that blocker may never have been written to accountSkipReasons.
+					for (const account of accountManager.getAccountsSnapshot()) {
+						if (policyDecision?.blockedAccountIndexes.has(account.index)) continue;
+						if (account.enabled === false) continue;
+						if (!accountManager.hasEnabledWorkspaces(account)) continue;
+						if (accountManager.isAccountAuthInvalidated(account)) continue;
 						const transcriptionUntil = account.recordId
 							? state.transcriptionRateLimitUntilByRecordId.get(account.recordId)
 							: undefined;
@@ -3906,7 +3926,7 @@ async function handleRequestInner(
 								: 0,
 							typeof authUntil === "number" && authUntil > now ? authUntil : 0,
 						);
-						if (readyAt <= now) continue;
+						if (readyAt <= now) return 0;
 						const waitMs = readyAt - now;
 						minWaitMs = minWaitMs === null ? waitMs : Math.min(minWaitMs, waitMs);
 					}

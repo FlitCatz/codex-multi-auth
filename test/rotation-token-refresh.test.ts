@@ -303,6 +303,28 @@ describe("ensureFreshAccessToken", () => {
 	});
 
 
+	it("restarts selection when a redirected fresh-token row was removed", async () => {
+		const previous = managerWith(FRESH_EXPIRES, { recordId: "row-a" });
+		const replacement = managerWith(FRESH_EXPIRES, {
+			recordId: "row-b",
+			accountId: "acc_other",
+			email: "other@example.com",
+			refreshToken: "refresh-other",
+			accessToken: "access-other",
+		});
+		redirectRuntimeRefreshCommits(previous, replacement);
+
+		const result = await ensureFreshAccessToken(refreshParams(previous));
+
+		expect(result).toMatchObject({
+			ok: false,
+			retryable: true,
+			selectionRestart: true,
+			accountManager: replacement,
+		});
+		expect(queuedRefreshMock).not.toHaveBeenCalled();
+	});
+
 	it("does not redirect a removed same-email workspace refresh into its surviving sibling", async () => {
 		const previousStorage = storageWith(STALE_EXPIRES, {
 			recordId: "row-a",

@@ -66,6 +66,7 @@ function createRecordingFetch(
 async function startProxy(
 	accountManager: AccountManager,
 	fetchImpl: typeof fetch,
+	options: { forcedAccountIndex?: number } = {},
 ): Promise<RuntimeRotationProxyServer> {
 	openManagers.push(accountManager);
 	const proxy = await startRuntimeRotationProxy({
@@ -74,6 +75,7 @@ async function startProxy(
 		upstreamBaseUrl: "https://example.test/backend-api",
 		clientApiKey: CLIENT_KEY,
 		quotaRemainingPercentThreshold: 10,
+		...options,
 	});
 	openServers.push(proxy);
 	return proxy;
@@ -644,6 +646,32 @@ describe("runtime transcription proxy", () => {
 		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-1");
 	});
 
+	it("reports an auth cooldown created by the final refresh failure", async () => {
+		const now = Date.now();
+		vi.spyOn(Date, "now").mockReturnValue(now);
+		const storage = createStorage(now, 1);
+		const row = storage.accounts[0];
+		if (!row) throw new Error("missing refresh-failure row");
+		row.expiresAt = now - 60_000;
+		const manager = new AccountManager(undefined, storage);
+		const refresh = vi.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken").mockImplementation(async ({ accountManager, account }) => {
+			accountManager.markAccountCoolingDown(account, 30_000, "auth-failure");
+			return { ok: false, retryable: true, account, accountManager };
+		});
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "must not run" }), { status: HTTP_STATUS.OK }),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const response = await postTranscribe(proxy, Buffer.from("--refresh-failure--\r\n"));
+		const payload = (await response.json()) as { error?: { retry_after_ms?: number } };
+
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(refresh).toHaveBeenCalledTimes(1);
+		expect(calls).toHaveLength(0);
+		expect(payload.error?.retry_after_ms).toBe(30_000);
+	});
+
 	it("honors auth-failure cooldowns while selecting a transcription credential", async () => {
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 2));
 		const first = manager.getAccountByIndex(0);
@@ -697,6 +725,43 @@ describe("runtime transcription proxy", () => {
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.headers.get("authorization")).toBe("Bearer repaired-access");
 		expect(repaired.getAccountByIndex(0)?.rateLimitResetTimes.codex).toBe(expectedRateLimit);
+	});
+
+	it("keeps a hard pin on a repaired legacy login whose derived record id changes", async () => {
+		const now = Date.now();
+		const legacyStorage = createStorage(now, 1);
+		const legacyRow = legacyStorage.accounts[0];
+		if (!legacyRow) throw new Error("missing legacy row");
+		delete legacyRow.recordId;
+		const manager = new AccountManager(undefined, legacyStorage);
+		const stale = manager.getAccountByIndex(0);
+		if (!stale) throw new Error("missing stale legacy account");
+		manager.markAuthInvalidated(stale, "test_invalidated");
+
+		const repairedStorage = createStorage(now, 1);
+		const repairedRow = repairedStorage.accounts[0];
+		if (!repairedRow) throw new Error("missing repaired row");
+		delete repairedRow.recordId;
+		repairedRow.refreshToken = "refresh-relogin";
+		repairedRow.accessToken = "access-relogin";
+		repairedRow.expiresAt = now + 7_200_000;
+		const repaired = new AccountManager(undefined, repairedStorage);
+		expect(repaired.getAccountByIndex(0)?.recordId).not.toBe(stale.recordId);
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(repaired);
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "repaired pinned login" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl, { forcedAccountIndex: 0 });
+
+		const response = await postTranscribe(proxy, Buffer.from("--legacy-relogin--\r\n"));
+
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-relogin");
+		expect(calls[0]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("acc_1");
 	});
 
 	it("preserves inference updates that arrive while credential reload is pending", async () => {
@@ -971,6 +1036,58 @@ describe("runtime transcription proxy", () => {
 		expect(recordFailure).not.toHaveBeenCalled();
 		expect(markCooldown).not.toHaveBeenCalled();
 		expect(proxy.getStatus().rotations).toBe(0);
+	});
+
+	it("does not invalidate repaired credentials when an older transcription 401 arrives late", async () => {
+		const now = Date.now();
+		const originalStorage = createStorage(now, 1);
+		const originalRow = originalStorage.accounts[0];
+		if (!originalRow) throw new Error("missing original row");
+		originalRow.recordId = "row-1";
+		const manager = new AccountManager(undefined, originalStorage);
+
+		const repairedStorage = createStorage(now, 1);
+		const repairedRow = repairedStorage.accounts[0];
+		if (!repairedRow) throw new Error("missing repaired row");
+		repairedRow.recordId = "row-1";
+		repairedRow.refreshToken = "refresh-relogin";
+		repairedRow.accessToken = "access-relogin";
+		const repaired = new AccountManager(undefined, repairedStorage);
+
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => { markStarted = resolve; });
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const invalidationBody = JSON.stringify({
+			error: { message: "Encountered invalidated oauth token for user, failing request" },
+		});
+		const { calls, fetchImpl } = createRecordingFetch(async () => {
+			markStarted();
+			await gate;
+			return new Response(invalidationBody, {
+				status: HTTP_STATUS.UNAUTHORIZED,
+				headers: { "content-type": "application/json" },
+			});
+		});
+		const proxy = await startProxy(manager, fetchImpl);
+
+		const pending = postTranscribe(proxy, Buffer.from("--late-invalidation--\r\n"));
+		await started;
+		tokenRefreshRuntime.redirectRuntimeRefreshCommits(manager, repaired);
+		release();
+		const response = await pending;
+		const payload = (await response.json()) as { error: { code: string } };
+
+		expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+		expect(payload.error.code).toBe("token_invalidated");
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.headers.get("authorization")).toBe("Bearer access-1");
+		expect(repaired.getAccountByIndex(0)).toMatchObject({
+			access: "access-relogin",
+			refreshToken: "refresh-relogin",
+		});
+		expect(repaired.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
+		expect(repaired.getAccountByIndex(0)?.coolingDownUntil).toBeUndefined();
 	});
 
 	it("keeps explicit token invalidation semantics for 401", async () => {

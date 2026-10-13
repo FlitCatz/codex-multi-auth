@@ -387,6 +387,16 @@ export class AccountManager {
 		return this.loadedAccountStorageSnapshot;
 	}
 
+	/** @internal True only when this account identity was explicitly persisted, not legacy-derived in memory. */
+	hasPersistedRecordId(account: ManagedAccount): boolean {
+		const recordId = account.recordId?.trim();
+		if (!recordId || !this.persistenceBaseline) return false;
+		const baseline = this.persistenceBaseline.accounts.find(
+			(row) => resolveAccountRecordId(row) === recordId,
+		);
+		return typeof baseline?.recordId === "string" && baseline.recordId.trim().length > 0;
+	}
+
 	hasRefreshToken(refreshToken: string): boolean {
 		return this.accounts.some(
 			(account) => account.refreshToken === refreshToken,
