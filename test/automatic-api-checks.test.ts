@@ -128,3 +128,34 @@ it("does not adopt concurrent policy changes returned by discovery",async()=>{
  try{await api.saveApiRoutes([{...route("policy-race"),visibleModels:[],knownModels:[]}]);await createAutomaticApiCheck()(new AbortController().signal);expect(posts).toBe(0);expect(await discovery.loadModelInventory()).toBeNull();expect((await api.loadApiRoutes())[0]?.priority).toBe(9);}
  finally{update.mockRestore();network.mockRestore();if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;}
 });
+
+
+it("refreshes expired program evidence before consuming the daily pass despite fresh general probes",async()=>{
+ const api=await import("../lib/api-route-store.js"),discovery=await import("../lib/runtime/model-discovery-status.js");
+ const {createAutomaticApiCheck}=await import("../lib/runtime/automatic-api-checks.js");
+ const path=await fixture(),previous=process.env.CODEX_MULTI_AUTH_DIR;
+ process.env.CODEX_MULTI_AUTH_DIR=join(path,"..");
+ let now=1000,programPosts=0;
+ const clock=vi.spyOn(Date,"now").mockImplementation(()=>now);
+ const network=vi.spyOn(globalThis,"fetch").mockImplementation(async(input,init)=>{
+  if(String(input).endsWith("/models"))return Response.json({data:[{id:"fixture"}]});
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)programPosts++;
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ try{
+  const credential={...route("expiry"),visibleModels:["fixture"],accessPrograms:{cyber:["daybreak_blue"]}};
+  await api.saveApiRoutes([credential]);
+  const discover=()=>discovery.discoverModelInventory(null,[credential],{persistProbes:true,updateApiDiscovery:api.updateApiModelDiscovery});
+  await discover();
+  now=AUTOMATIC_API_CHECK_INTERVAL_MS;await discover();
+  expect(programPosts).toBe(1);
+  now=1001+AUTOMATIC_API_CHECK_INTERVAL_MS;
+  await createAutomaticApiCheck()(new AbortController().signal);
+  expect(programPosts).toBe(2);
+  expect((await discovery.loadModelInventory())?.entries[0]?.entitlements?.[0]?.programCheckedAt).toBe(now);
+  await createAutomaticApiCheck()(new AbortController().signal);
+  expect(programPosts).toBe(2);
+ }finally{clock.mockRestore();network.mockRestore();if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;}
+});

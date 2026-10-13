@@ -746,3 +746,46 @@ it("retries inconclusive legacy program cache entries without the separate retry
  expect(model.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"verified"});
  expect(model.program_checked_at).toBe(now);
 });
+
+describe("program cache invalidation",()=>{
+ function fixture(){
+  let now=1000;
+  const programs:string[]=[];
+  const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+   if(init?.method!=="POST")return new Response("missing",{status:404});
+   const body=JSON.parse(String(init.body));
+   if(body.access_programs)programs.push(body.access_programs.cyber);
+   return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+  });
+  const service=new ApiModelCapabilities(fetcher,()=>now);
+  const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["standard"]}};
+  return {service,route,programs,setNow:(value:number)=>{now=value;}};
+ }
+ it("checks expired program evidence despite a fresh general capability result",async()=>{
+  const f=fixture();await f.service.enrich([{slug:"fixture"}],false,f.route);
+  f.setNow(86400000);await f.service.enrich([{slug:"fixture"}],false,f.route);
+  expect(f.programs).toEqual(["standard"]);
+  f.setNow(86401001);const [model]=await f.service.enrich([{slug:"fixture"}],false,f.route);
+  expect(f.programs).toEqual(["standard","standard"]);
+  expect(model.program_checked_at).toBe(86401001);
+ });
+ it("invalidates added and removed candidates on the same credential",async()=>{
+  const f=fixture();await f.service.enrich([{slug:"fixture"}],false,f.route);
+  f.route.accessPrograms.cyber.push("daybreak_blue");
+  const [added]=await f.service.enrich([{slug:"fixture"}],false,f.route);
+  expect(f.programs).toContain("daybreak_blue");
+  expect(added.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"verified"});
+  f.route.accessPrograms.cyber=["daybreak_blue"];
+  const [removed]=await f.service.enrich([{slug:"fixture"}],false,f.route);
+  expect(removed.capability_probe_status).not.toHaveProperty("program:cyber:standard");
+  f.route.accessPrograms.cyber=[];
+  const [empty]=await f.service.enrich([{slug:"fixture"}],false,f.route);
+  expect(empty.program_checked_at).toBeUndefined();
+  expect(empty.capability_probe_status).not.toHaveProperty("program:cyber:daybreak_blue");
+ });
+ it("uses the whole model override instead of falling back to route cyber values",async()=>{
+  const f=fixture();
+  await f.service.enrich([{slug:"fixture"}],false,{...f.route,modelAccessPrograms:{fixture:{}}});
+  expect(f.programs).toEqual([]);
+ });
+});

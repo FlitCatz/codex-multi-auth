@@ -173,12 +173,18 @@ younger than 15 minutes, including results from an earlier `check` process
 sends the billable probes regardless of age. Access-program results have a separate
 24-hour cache and appear as `program:cyber:<program>` probe results with their
 check time; `configured programs` remains local policy, not an API advertisement.
+Program expiry and changes to configured candidates invalidate the relevant
+cached result even inside the 15-minute general cache. A per-model program map
+replaces the entire route default map; omitted families do not inherit defaults.
 
 While a CLI/app router is running, enabled API/ZDR routes with
 `probeCapabilities: true` also receive a daily capability check of their visible
 models. These checks consume API usage, include small explicit access-program
 requests, and preserve request defaults and configured entitlements. A persisted
 claim prevents multiple routers or restarts from repeating the same daily pass.
+Live catalog enrichment and daily checks share persisted probe results under
+credential/model locks, preventing concurrent refreshes from duplicating probes.
+Explicit `check capabilities` still forces a new pass.
 Disable capability probing or the route to stop future automatic probes.
 Malformed check history is repaired with a fresh daily delay, avoiding an
 immediate duplicate billable pass. Filesystem access errors stop the check

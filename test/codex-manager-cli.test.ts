@@ -155,11 +155,10 @@ vi.mock("../lib/runtime/runtime-observability.js", async () =>
 	).runtimeObservabilityModuleMock(runtimeObservabilityMocks),
 );
 
-vi.mock("../lib/runtime/app-bind.js", async () =>
-	(await import("./helpers/cli-test-fixtures.js")).appBindModuleMock(
-		appBindMocks,
-	),
-);
+vi.mock("../lib/runtime/app-bind.js", async (importOriginal) => ({
+	...(await import("./helpers/cli-test-fixtures.js")).appBindModuleMock(appBindMocks),
+	formatWebsocketDisconnect: (await importOriginal<typeof import("../lib/runtime/app-bind.js")>()).formatWebsocketDisconnect,
+}));
 
 vi.mock("../lib/cli.js", () => ({
 	promptAddAnotherAccount: promptAddAnotherAccountMock,

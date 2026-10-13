@@ -1,8 +1,9 @@
+import { enrichPersistedApiCapabilities } from "./persisted-api-capabilities.js";
 import { withFileTransactionLock } from "../storage/file-lock.js";
 import { styleReportText as paint } from "../ui/format.js";
 import { withCheckProgress } from "../ui/check-progress.js";
 import { mapWithConcurrency } from "../concurrency.js";
-import { ApiModelCapabilities, type ProbeResult } from "./api-model-capabilities.js";
+import { ApiModelCapabilities } from "./api-model-capabilities.js";
 import { getAppBindStatus } from "./app-bind.js";
 import { isRecord } from "../utils.js";
 import { promises as fs } from "node:fs";
@@ -63,23 +64,6 @@ const schema = z.object({
 	entries: z.array(entrySchema).max(3000),
 });
 export type ModelInventory = z.infer<typeof schema>;
-const probeCacheSchema = z.object({
-	version: z.literal(1),
-	entries: z.array(z.tuple([
-		z.string().regex(/^[0-9a-f]{64}$/),
-		z.object({ programRetry: z.boolean().optional(), programCheckedAt: z.number().finite().nonnegative().max(8.64e15).optional(), at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
-	])).max(1000),
-});
-function probeCachePath(): string {
-	return join(getCodexMultiAuthDir(), "api-capability-probes.json");
-}
-async function loadProbeCache(): Promise<Array<[string, ProbeResult]>> {
-	try {
-		return probeCacheSchema.parse(JSON.parse(await fs.readFile(probeCachePath(), "utf8"))).entries;
-	} catch {
-		return [];
-	}
-}
 export async function discoverModelInventory(
 	storage: AccountStorageV3 | null,
 	routes: ApiRouteCredential[],
@@ -152,31 +136,19 @@ export async function discoverModelInventory(
 		await manager.flushPendingSave();
 	}
 	const capabilities = new ApiModelCapabilities(fetcher, now);
-	if (options.persistProbes) capabilities.importProbes(await loadProbeCache());
 	const api = new ApiModelRuntime(
 		fetcher,
 		now,
 		options.updateApiDiscovery,
 		options.updateApiDiscovery
 			? (models, refresh, route, forceProbes) =>
-					capabilities.enrich(models, refresh, route, forceProbes)
+					options.persistProbes
+                        ? enrichPersistedApiCapabilities(models,refresh,route,forceProbes,{fetchImpl:fetcher,now})
+                        : capabilities.enrich(models, refresh, route, forceProbes)
 			: undefined,
 	);
 	await api.catalogs(routes, true, options.forceProbes === true);
-	if (options.persistProbes) {
-		const path = probeCachePath();
-		await withFileTransactionLock(path, async () => {
-			// Merge with the latest file: a concurrent check may have probed other
-			// credentials since this one loaded. The newer result wins per key.
-			const merged = new Map(await loadProbeCache());
-			for (const [key, value] of capabilities.exportProbes()) {
-				const disk = merged.get(key);
-				if (!disk || disk.at <= value.at) merged.set(key, value);
-			}
-			const entries = [...merged].sort((x, y) => x[1].at - y[1].at).slice(-1000);
-			await writeFileAtomic(path, JSON.stringify(probeCacheSchema.parse({ version: 1, entries })) + "\n");
-		}).catch(() => undefined);
-	}
+
 	entries.push(
 		...api.statuses(routes).map((s, i) => ({
 			id: modelScopeId(s.kind,s.id),

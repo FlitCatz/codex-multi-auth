@@ -67,6 +67,8 @@ All of this is file-backed under `~/.codex/multi-auth`. Nothing is a hosted or m
 | Budget limits per window | `codex-multi-auth budget limit <key> --window hour\|day\|week\|month` |
 | Pause/drain/tag/weight/note accounts — enforced at runtime | `codex-multi-auth account …` |
 | Reset-credit management | `codex-multi-auth resets list\|redeem\|auto` |
+| API/ZDR capability checks | Enabled routes with `probeCapabilities: true` receive daily billable probes; configured programs and verified evidence appear separately |
+| WebSocket interruption diagnostics | `status`, `status --json`, and `rotation status` show the last recorded cause and stage, including after router exit |
 | Model capability matrix | `codex-multi-auth models` |
 | Operator snapshot across runtime, usage, policy, and quota | `codex-multi-auth monitor` |
 

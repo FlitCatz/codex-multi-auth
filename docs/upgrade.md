@@ -59,6 +59,19 @@ The account pool under `~/.codex/multi-auth` carries over.
 
 ## Changes To Know About
 
+### Automatic API Checks And Disconnect Diagnostics
+
+Enabled API/ZDR routes already configured with `probeCapabilities: true` receive
+small billable checks daily while a CLI/app router runs. Disable capability
+probing or the route to stop automatic probes. Live model discovery and scheduled
+checks share persisted results; program evidence expires after 24 hours even
+when other capabilities were checked recently. No credential, workspace,
+subscription priming, or request-program setting is migrated.
+
+`status`, `status --json`, and `rotation status` expose sanitized historical
+WebSocket disconnect details. This helps investigate interruptions without
+replaying a generation that may already have started upstream.
+
 ### `codex` Is No Longer Ours (v2.1.2)
 
 The package stopped publishing a global `codex` binary — that name belongs to the official Codex install path (npm, Homebrew, or a release binary). Use `codex-multi-auth …` for account management, and `codex-multi-auth-codex`/`mcodex` when you intentionally want the forwarding wrapper. If a stale shim still answers to `codex`, reinstall the official CLI.

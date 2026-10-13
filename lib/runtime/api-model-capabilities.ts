@@ -53,6 +53,19 @@ export type ProbeResult = {
 	tiers: string[];
 	status: Record<string, string>;
 };
+/** Candidates describe checks, never request defaults or granted entitlements. */
+function programCandidates(route: ApiRouteCredential, id: string): string[] {
+ const configured = (route.modelAccessPrograms?.[id] ?? route.accessPrograms)?.cyber;
+ const candidates = [...(configured ?? []), ...(/(?:^|-)cyber(?:-|$)|daybreak-red/.test(id)
+  ? ["daybreak_red"] : /^gpt-[56](?:[.-]|$)/.test(id) ? ["standard", "daybreak_blue"] : [])];
+ return [...new Set(candidates)].filter(value => ["standard", "daybreak_blue", "daybreak_red"].includes(value));
+}
+function programsFresh(result: ProbeResult, programs: string[], now: number): boolean {
+ return result.programRetry !== true && result.programCheckedAt !== undefined &&
+  Number.isFinite(result.programCheckedAt) && result.programCheckedAt >= 0 && result.programCheckedAt <= 8.64e15 &&
+  result.programCheckedAt <= now && result.programCheckedAt + 86400_000 > now &&
+  programs.every(program => ["verified", "unsupported"].includes(result.status[`program:cyber:${program}`] ?? ""));
+}
 type DocumentedCapabilities = { levels: string[]; inputModalities?: string[] };
 
 /** Only the exact model's input declaration can enable native image attachments. */
@@ -96,6 +109,7 @@ export class ApiModelCapabilities {
 	private activeProbes = 0;
 	private readonly probeWaiters: Array<() => void> = [];
 	private async withProbeSlot<T>(operation: () => Promise<T>): Promise<T> {
+		if (this.probeSlot) return this.probeSlot(operation);
 		if (this.activeProbes >= 4)
 			await new Promise<void>((resolve) => this.probeWaiters.push(resolve));
 		else this.activeProbes++;
@@ -113,6 +127,7 @@ export class ApiModelCapabilities {
 	constructor(
 		private readonly fetchImpl: typeof fetch = fetch,
 		private readonly now: () => number = Date.now,
+		private readonly probeSlot?: <T>(operation: () => Promise<T>) => Promise<T>,
 	) {}
 	/** Probe results keyed by an opaque hash, for a fresh CLI process to honour the 15-minute cache. */
 	exportProbes(): Array<[string, ProbeResult]> {
@@ -187,7 +202,13 @@ export class ApiModelCapabilities {
 		const old = this.probes.get(key);
 		// A probe cut short by 401/403/429 is retried after a minute, not trusted for 15.
 		const freshFor = old?.status.retry === "transient" ? 60_000 : 900_000;
-		if (!force && old && old.at + freshFor > this.now()) return old;
+		const programs = programCandidates(route, id);
+		const oldPrograms = old ? Object.keys(old.status).filter(name => name.startsWith("program:cyber:")) : [];
+		const samePrograms = oldPrograms.length === programs.length && programs.every(program => oldPrograms.includes(`program:cyber:${program}`));
+		const programCacheFresh = old && samePrograms && (programs.length
+			? programsFresh(old, programs, this.now()) || ((old.programRetry === true || (old.status.retry === "transient" && programs.some(program => old.status[`program:cyber:${program}`] === "unverified"))) && old.at + 60_000 > this.now())
+			: old.programCheckedAt === undefined);
+		if (!force && old && old.at + freshFor > this.now() && programCacheFresh) return old;
 		const running = this.inFlight.get(key);
 		if (running) return running;
 		const pending = this.runProbe(route, id, documented, key, force).finally(() =>
@@ -404,13 +425,8 @@ export class ApiModelCapabilities {
 			result.status[tier] = effective;
 			if (effective === "verified") result.tiers.push(tier);
 		}
-		// These are probe candidates, never entitlements or request defaults.
-		const configured = route.modelAccessPrograms?.[id]?.cyber ?? route.accessPrograms?.cyber;
-		const candidates = [...(configured ?? []), ...(/(?:^|-)cyber(?:-|$)|daybreak-red/.test(id)
-			? ["daybreak_red"] : /^gpt-[56](?:[.-]|$)/.test(id) ? ["standard", "daybreak_blue"] : [])];
-		const programs = [...new Set(candidates)].filter(value => ["standard", "daybreak_blue", "daybreak_red"].includes(value));
-		const reusable = !force && previous?.programRetry !== true && previous?.programCheckedAt !== undefined && Number.isFinite(previous.programCheckedAt) && previous.programCheckedAt >= 0 && previous.programCheckedAt <= 8.64e15 && previous.programCheckedAt <= this.now() &&
-			previous.programCheckedAt + 86400_000 > this.now() && programs.every(program => ["verified", "unsupported"].includes(previous.status[`program:cyber:${program}`] ?? ""));
+		const programs = programCandidates(route, id);
+		const reusable = !force && previous && programsFresh(previous, programs, this.now());
 		if (programs.length && reusable && !lostAccess && !modelDenied && !programAuthFailure) {
 			for (const program of programs) result.status[`program:cyber:${program}`] = previous.status[`program:cyber:${program}`] ?? "unverified";
 			result.programCheckedAt = previous.programCheckedAt;

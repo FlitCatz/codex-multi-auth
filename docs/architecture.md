@@ -119,6 +119,8 @@ On an interactive terminal with a populated pool, bare `codex-multi-auth login` 
 
 Per request it applies policy before picking an account, refreshes tokens through a deduplicating queue (one in-flight refresh per token, cross-process leases so two CLIs do not double-refresh), classifies upstream responses into rotation marks (rate-limit, cooldown, circuit breaker, workspace disable, token invalidation), and streams successful bytes back with stall detection and backpressure. Runtime counters land in `runtime-observability.json` for `status`, `report`, `monitor`, `rotation status`, and `why-selected`.
 
+For API/ZDR routes, live catalog discovery and the daily opt-in checker share persisted capability evidence through `lib/runtime/persisted-api-capabilities.ts`. A credential/model lock covers reload, bounded probes, and atomic persistence, so competing consumers reuse the completed result. General capability evidence lasts 15 minutes; confirmed program evidence has its own 24-hour expiry. Request policy remains separate from probe evidence.
+
 ### 4. Local governance
 
 File-backed, local-only, and enforced on the rotation path by `evaluateRuntimePolicy` (`lib/policy/runtime-policy.ts`):
