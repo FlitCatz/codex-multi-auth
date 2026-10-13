@@ -1,3 +1,4 @@
+import {createHash} from "node:crypto";
 import {afterEach,expect,it,vi} from "vitest";
 import {promises as fs} from "node:fs";
 import {mkdtemp,readFile,writeFile} from "node:fs/promises";
@@ -89,4 +90,41 @@ it("includes newly enabled routes when repairing history under the lock",async()
  await runAutomaticApiChecks(options);await runAutomaticApiChecks(options);
  expect(check).not.toHaveBeenCalled();
  expect(Object.keys(JSON.parse(await readFile(path,"utf8")))).toHaveLength(2);
+});
+
+it("probes newly discovered visible models and saves their inventory without repeating after restart",async()=>{
+ const api=await import("../lib/api-route-store.js"),discovery=await import("../lib/runtime/model-discovery-status.js");
+ const {createAutomaticApiCheck}=await import("../lib/runtime/automatic-api-checks.js");
+ const root=await fixture();const previous=process.env.CODEX_MULTI_AUTH_DIR;process.env.CODEX_MULTI_AUTH_DIR=join(root,"..");
+ let posts=0;const models:string[]=[];
+ const network=vi.spyOn(globalThis,"fetch").mockImplementation(async(input,init)=>{
+  if(init?.method==="POST"){posts++;models.push(JSON.parse(String(init.body)).model);return Response.json({output:[],service_tier:"default"});}
+  if(String(input).endsWith("/models"))return Response.json({data:[{id:"gpt-test-old"},{id:"gpt-test-new"}]});
+  return new Response("",{status:404});
+ });
+ try{
+  await api.saveApiRoutes([{...route("discover"),visibleModels:["gpt-test-old"],knownModels:["gpt-test-old"]}]);
+  await createAutomaticApiCheck()(new AbortController().signal);
+  expect(posts).toBeGreaterThan(0);expect(models).toContain("gpt-test-new");
+  expect((await api.loadApiRoutes())[0]?.visibleModels).toContain("gpt-test-new");
+  expect((await discovery.loadModelInventory())?.entries[0]?.visibleModels).toContain("gpt-test-new");
+  const before=posts;await createAutomaticApiCheck()(new AbortController().signal);expect(posts).toBe(before);
+ }finally{network.mockRestore();if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;}
+});
+
+it("honors the legacy visibility-scoped daily claim",async()=>{
+ const path=await fixture(),credential=route("legacy"),check=vi.fn(async()=>{});
+ const oldKey=createHash("sha256").update(JSON.stringify([credential.id,credential.kind,credential.apiKey,credential.visibleModels])).digest("hex");
+ await writeFile(path,JSON.stringify({[oldKey]:1000}));
+ await runAutomaticApiChecks({path,loadRoutes:async()=>[credential],check,now:()=>2000});expect(check).not.toHaveBeenCalled();
+});
+it("does not adopt concurrent policy changes returned by discovery",async()=>{
+ const api=await import("../lib/api-route-store.js"),discovery=await import("../lib/runtime/model-discovery-status.js");
+ const {createAutomaticApiCheck}=await import("../lib/runtime/automatic-api-checks.js");
+ const root=await fixture(),previous=process.env.CODEX_MULTI_AUTH_DIR;process.env.CODEX_MULTI_AUTH_DIR=join(root,"..");
+ const original=api.updateApiModelDiscovery;let posts=0;
+ const network=vi.spyOn(globalThis,"fetch").mockImplementation(async(input,init)=>{if(init?.method==="POST"){posts++;return Response.json({output:[]});}if(String(input).endsWith("/models"))return Response.json({data:[{id:"gpt-test-new"}]});return new Response("",{status:404});});
+ const update=vi.spyOn(api,"updateApiModelDiscovery").mockImplementation(async(route,models)=>{await api.saveApiRoutes([{...route,priority:9}]);return original(route,models);});
+ try{await api.saveApiRoutes([{...route("policy-race"),visibleModels:[],knownModels:[]}]);await createAutomaticApiCheck()(new AbortController().signal);expect(posts).toBe(0);expect(await discovery.loadModelInventory()).toBeNull();expect((await api.loadApiRoutes())[0]?.priority).toBe(9);}
+ finally{update.mockRestore();network.mockRestore();if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;}
 });
