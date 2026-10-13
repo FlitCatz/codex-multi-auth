@@ -347,7 +347,7 @@ describe("ensureFreshAccessToken", () => {
 		});
 		const result = await pending;
 
-		expect(result).toMatchObject({ ok: false, retryable: true, accountManager: previous });
+		expect(result).toMatchObject({ ok: false, retryable: true, selectionRestart: true, accountManager: replacement });
 		expect(replacement.getAccountByIndex(0)).toMatchObject({
 			recordId: "row-b",
 			refreshToken: "refresh-b",

@@ -3335,6 +3335,123 @@ describe("runtime rotation proxy", () => {
 		expect(inference[0]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("enabled-workspace");
 	});
 
+
+	it("keeps an empty approved-workspace guard when every approved scope disappears during refresh", async () => {
+		const now = Date.now();
+		const storage = createStorage(now, 1);
+		const moving = storage.accounts[0];
+		if (!moving) throw new Error("expected account");
+		moving.recordId = "row-a";
+		moving.accountId = "fallback-workspace";
+		moving.workspaces = [
+			{ id: "fallback-workspace", enabled: true },
+			{ id: "approved-workspace", enabled: true },
+		];
+		moving.currentWorkspaceIndex = 0;
+		const previous = new AccountManager(undefined, storage);
+		const replacementStorage: AccountStorageV3 = {
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [structuredClone(moving)],
+		};
+		replacementStorage.accounts[0]!.workspaces = [
+			{ id: "fallback-workspace", enabled: true },
+			{ id: "approved-workspace", enabled: false },
+		];
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(replacement);
+		const { calls, fetchImpl } = createRecordingFetch((call) => {
+			if (call.url.includes("/models")) {
+				const workspace = call.headers.get(OPENAI_HEADERS.ACCOUNT_ID);
+				return Response.json({
+					models: workspace === "approved-workspace" ? [{ slug: "model-test" }] : [{ slug: "other" }],
+				});
+			}
+			return textEventStream();
+		});
+		const proxy = await startProxy({
+			accountManager: previous,
+			fetchImpl,
+			options: { nativeOpenai: true, readApiRoutes: async () => [] },
+		});
+		const catalog = await getModels(proxy, "/models?refresh_capabilities=1");
+		expect(catalog.status).toBe(HTTP_STATUS.OK);
+		await catalog.text();
+		const refresh = vi
+			.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken")
+			.mockImplementation(async () => {
+				const replacementAccount = replacement.getAccountByIndex(0);
+				if (!replacementAccount) throw new Error("replacement account missing");
+				return {
+					ok: true,
+					accessToken: replacementAccount.access!,
+					account: replacementAccount,
+					accountManager: replacement,
+				};
+			});
+		try {
+			const response = await postResponses(proxy, { model: "model-test", input: "fixture" });
+			expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+			await response.text();
+		} finally {
+			refresh.mockRestore();
+		}
+		expect(calls.filter((call) => call.url.endsWith("/responses"))).toHaveLength(0);
+	});
+
+	it("restarts selection on the replacement manager when the refreshed row was removed", async () => {
+		const now = Date.now();
+		const oldStorage = createStorage(now, 1);
+		const old = oldStorage.accounts[0];
+		if (!old) throw new Error("expected old account");
+		old.recordId = "row-old";
+		old.accessToken = "expired-old";
+		old.expiresAt = now - 60_000;
+		const previous = new AccountManager(undefined, oldStorage);
+
+		const replacementStorage = createStorage(now, 1);
+		const healthy = replacementStorage.accounts[0];
+		if (!healthy) throw new Error("expected replacement account");
+		healthy.recordId = "row-new";
+		healthy.accessToken = "healthy-access";
+		healthy.refreshToken = "healthy-refresh";
+		healthy.expiresAt = now + 3_600_000;
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(replacement);
+
+		const refresh = vi
+			.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken")
+			.mockImplementation(async ({ accountManager, account }) => {
+				if (accountManager === previous) {
+					return {
+						ok: false,
+						retryable: true,
+						selectionRestart: true,
+						accountManager: replacement,
+					};
+				}
+				return {
+					ok: true,
+					accessToken: account.access!,
+					account,
+					accountManager,
+				};
+			});
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager: previous, fetchImpl });
+		try {
+			const response = await postResponses(proxy, { model: "gpt-5-codex", input: "fixture" });
+			expect(response.status).toBe(HTTP_STATUS.OK);
+			await response.text();
+		} finally {
+			refresh.mockRestore();
+		}
+		const inference = calls.filter((call) => call.url.endsWith("/responses"));
+		expect(inference).toHaveLength(1);
+		expect(inference[0]?.headers.get("authorization")).toBe("Bearer healthy-access");
+	});
+
 	it("deduplicates pending refresh commits per account when OAuth tuples differ", async () => {
 		const now = Date.now();
 		const storage = createStorage(now, 1);

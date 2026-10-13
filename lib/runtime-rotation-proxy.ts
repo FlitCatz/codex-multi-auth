@@ -1935,7 +1935,10 @@ async function handleRequestInner(
 				const remapped = scopes
 					.map((scope) => currentScopes.get(scope.accountId))
 					.filter((scope): scope is ReturnType<typeof workspaceModelScopes>[number] => Boolean(scope?.routable));
-				if (remapped.length > 0) workspaceCandidates.set(live.index, remapped);
+				// Keep an explicit empty candidate list: it is a request-local guard that
+				// prevents fallback to a stored workspace binding when every catalog-approved
+				// scope disappeared or became unroutable during the manager swap.
+				workspaceCandidates.set(live.index, remapped);
 				if (oldQuota[previousIndex] !== undefined) {
 					subscriptionQuotaByAccount[live.index] = oldQuota[previousIndex];
 				}
@@ -2740,6 +2743,14 @@ async function handleRequestInner(
 			}
 			if (!refreshed.ok) {
 				refundConsumedPoolToken(selected);
+				if (refreshed.selectionRestart) {
+					// The credential row vanished while refresh was in flight. The manager
+					// swap above already cleared request-local attempt state; restart selection
+					// without charging a transient auth failure to the replacement pool.
+					exhaustionReason = "no-account";
+					capabilityRejectionIsLatest = false;
+					continue;
+				}
 				// No accountSkipReasons write here: ensureFreshAccessToken always
 				// applies an auth cooldown before returning !ok, so the next
 				// selection pass overwrites whatever this set with

@@ -213,7 +213,14 @@ export async function ensureFreshAccessToken(params: {
 		ok: false;
 		retryable: boolean;
 		invalidated?: boolean;
+		selectionRestart?: false;
 		account: ManagedAccount;
+		accountManager: AccountManager;
+	}
+	| {
+		ok: false;
+		retryable: true;
+		selectionRestart: true;
 		accountManager: AccountManager;
 	}
 > {
@@ -252,12 +259,14 @@ export async function ensureFreshAccessToken(params: {
 	);
 	if (redirectedManager !== initialTarget.accountManager && !resolvedLatestTarget) {
 		// The row that initiated this refresh disappeared while OAuth was in flight.
-		// Ignore the stale result rather than guessing another same-email workspace.
+		// Ignore the stale result rather than guessing another same-email workspace,
+		// but hand the caller the replacement manager so it can restart selection and
+		// discover a different healthy login from the current pool.
 		return {
 			ok: false,
 			retryable: true,
-			account: initialTarget.account,
-			accountManager: initialTarget.accountManager,
+			selectionRestart: true,
+			accountManager: redirectedManager,
 		};
 	}
 	const latestTarget = resolvedLatestTarget ?? initialTarget;
