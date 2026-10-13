@@ -1871,6 +1871,76 @@ async function handleRequestInner(
   const readSubscriptionQuota = state.readSubscriptionQuota;
   const subscriptionQuotaCache = state.nativeOpenai && isResponsesRequest && readSubscriptionQuota ? await cachedRead(state, "subscription-quota", readSubscriptionQuota).catch(()=>null) ?? null : null;
   const subscriptionQuotaByAccount: Record<number, SubscriptionQuotaPreference> = {};
+		const remapRequestWorkspaceState = (
+			previousManager: AccountManager,
+			replacementManager: AccountManager,
+		): void => {
+			const previousAccounts = previousManager.getAccountsSnapshot();
+			const replacementAccounts = replacementManager.getAccountsSnapshot();
+			const oldCandidates = [...workspaceCandidates.entries()];
+			const oldQuota = { ...subscriptionQuotaByAccount };
+			workspaceCandidates.clear();
+			for (const key of Object.keys(subscriptionQuotaByAccount)) {
+				delete subscriptionQuotaByAccount[Number(key)];
+			}
+
+			const workspaceIds = (account: ManagedAccount): Set<string> =>
+				new Set(
+					[
+						account.accountId?.trim(),
+						...(account.workspaces ?? []).map((workspace) => workspace.id.trim()),
+					].filter((value): value is string => Boolean(value)),
+				);
+			const unique = (candidates: ManagedAccount[]): ManagedAccount | null =>
+				candidates.length === 1 ? candidates[0] ?? null : null;
+			const matchReplacement = (previous: ManagedAccount): ManagedAccount | null => {
+				if (previous.recordId) {
+					return unique(replacementAccounts.filter((candidate) => candidate.recordId === previous.recordId));
+				}
+				const sourceIds = workspaceIds(previous);
+				const compatible = replacementAccounts.filter((candidate) => {
+					const candidateIds = workspaceIds(candidate);
+					return !(
+						sourceIds.size > 0 &&
+						candidateIds.size > 0 &&
+						![...sourceIds].some((id) => candidateIds.has(id))
+					);
+				});
+				const sourceEmail = sanitizeEmail(previous.email);
+				return (
+					unique(compatible.filter((candidate) => candidate.refreshToken === previous.refreshToken)) ??
+					(previous.accountId && sourceEmail
+						? unique(compatible.filter((candidate) =>
+							candidate.accountId === previous.accountId && sanitizeEmail(candidate.email) === sourceEmail))
+						: null) ??
+					(previous.accountId
+						? unique(compatible.filter((candidate) => candidate.accountId === previous.accountId))
+						: null) ??
+					(sourceEmail
+						? unique(compatible.filter((candidate) => sanitizeEmail(candidate.email) === sourceEmail))
+						: null)
+				);
+			};
+
+			for (const [previousIndex, scopes] of oldCandidates) {
+				const previous = previousAccounts.find((account) => account.index === previousIndex);
+				if (!previous) continue;
+				const replacement = matchReplacement(previous);
+				if (!replacement) continue;
+				const live = replacementManager.getAccountByIndex(replacement.index);
+				if (!live) continue;
+				const currentScopes = new Map(
+					workspaceModelScopes(live).map((scope) => [scope.accountId, scope] as const),
+				);
+				const remapped = scopes
+					.map((scope) => currentScopes.get(scope.accountId))
+					.filter((scope): scope is ReturnType<typeof workspaceModelScopes>[number] => Boolean(scope?.routable));
+				if (remapped.length > 0) workspaceCandidates.set(live.index, remapped);
+				if (oldQuota[previousIndex] !== undefined) {
+					subscriptionQuotaByAccount[live.index] = oldQuota[previousIndex];
+				}
+			}
+		};
   const resetCreditState=state.nativeOpenai&&isResponsesRequest ? await cachedRead(state, "reset-credits", loadResetCreditState).catch(()=>null):null;
   const quotaForScope = (account: ManagedAccount, scope: ReturnType<typeof workspaceModelScopes>[number]) => {
    // Scoped observations belong to this credential and workspace; legacy entries only describe the binding.
@@ -2611,12 +2681,60 @@ async function handleRequestInner(
 			// together for every later mutation/persist; account indexes are local to
 			// one manager and can shift when rows are removed or reordered.
 			if (refreshed.accountManager !== accountManager) {
+				const previousManager = accountManager;
+				remapRequestWorkspaceState(previousManager, refreshed.accountManager);
 				accountManager = refreshed.accountManager;
 				accountCount = accountManager.getAccountCount();
 				transientAttemptLimit = Math.max(
 					1,
 					Math.min(accountCount, state.maxRuntimeAccountAttempts),
 				);
+				if (runtimePolicyState) {
+					try {
+						const refreshedPolicyDecision = await evaluateRuntimePolicy({
+							state: runtimePolicyState,
+							accounts: accountManager.getAccountsSnapshot(),
+							model: context.model,
+							now: state.now(),
+						});
+						policyDecision = refreshedPolicyDecision;
+						mutateRuntimeObservabilitySnapshot((snapshot) => {
+							snapshot.policyBlockedIndexes = [...refreshedPolicyDecision.blockedAccountIndexes];
+							snapshot.policyBlockedReasons = Object.fromEntries(
+								[...refreshedPolicyDecision.blockedAccountIndexes].map((index) => [String(index), "policy-blocked"]),
+							);
+						});
+						if (!refreshedPolicyDecision.allowed) {
+							await usageRecorder.record({
+								outcome: "blocked",
+								statusCode: refreshedPolicyDecision.statusCode,
+								errorCode: refreshedPolicyDecision.errorCode,
+							});
+							writeJson(res, refreshedPolicyDecision.statusCode, {
+								error: {
+									message: "Runtime policy blocked this local request.",
+									code: refreshedPolicyDecision.errorCode ?? "policy_blocked",
+									reasons: refreshedPolicyDecision.reasons,
+								},
+							});
+							return;
+						}
+					} catch (error) {
+						state.status.lastError = error instanceof Error ? error.message : String(error);
+						await usageRecorder.record({
+							outcome: "failure",
+							statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
+							errorCode: "runtime_policy_unavailable",
+						});
+						writeJson(res, HTTP_STATUS.SERVICE_UNAVAILABLE, {
+							error: {
+								message: "Runtime policy could not be loaded for this local request.",
+								code: "runtime_policy_unavailable",
+							},
+						});
+						return;
+					}
+				}
 				accountSkipReasons.clear();
 				attemptedIndexes.clear();
 			}

@@ -80,6 +80,25 @@ function uniqueMatch(
 	return matches.length === 1 ? matches[0] ?? null : null;
 }
 
+function workspaceIds(account: Pick<ManagedAccount, "accountId" | "workspaces">): Set<string> {
+	return new Set(
+		[
+			account.accountId?.trim(),
+			...(account.workspaces ?? []).map((workspace) => workspace.id.trim()),
+		].filter((value): value is string => Boolean(value)),
+	);
+}
+
+function hasWorkspaceConflict(source: ManagedAccount, candidate: ManagedAccount): boolean {
+	const sourceIds = workspaceIds(source);
+	const candidateIds = workspaceIds(candidate);
+	return (
+		sourceIds.size > 0 &&
+		candidateIds.size > 0 &&
+		![...sourceIds].some((id) => candidateIds.has(id))
+	);
+}
+
 function resolveRuntimeRefreshTarget(
 	accountManager: AccountManager,
 	account: ManagedAccount,
@@ -88,24 +107,32 @@ function resolveRuntimeRefreshTarget(
 	if (targetManager === accountManager) return { accountManager, account };
 
 	const accounts = targetManager.getAccountsSnapshot();
+	// A persisted record id is the strongest row identity we have. If that row
+	// vanished in the replacement manager, never fall through to a same-email
+	// sibling workspace: the in-flight refresh belongs to the removed row.
+	if (account.recordId) {
+		const exact = uniqueMatch(accounts, (candidate) => candidate.recordId === account.recordId);
+		if (!exact) return null;
+		const live = targetManager.getAccountByIndex(exact.index);
+		return live ? { accountManager: targetManager, account: live } : null;
+	}
+
+	const compatibleAccounts = accounts.filter((candidate) => !hasWorkspaceConflict(account, candidate));
 	const sourceEmail = sanitizeEmail(account.email);
 	const snapshot =
-		(account.recordId
-			? uniqueMatch(accounts, (candidate) => candidate.recordId === account.recordId)
-			: null) ??
-		uniqueMatch(accounts, (candidate) => candidate.refreshToken === account.refreshToken) ??
+		uniqueMatch(compatibleAccounts, (candidate) => candidate.refreshToken === account.refreshToken) ??
 		(account.accountId && sourceEmail
 			? uniqueMatch(
-				accounts,
+				compatibleAccounts,
 				(candidate) =>
 					candidate.accountId === account.accountId && sanitizeEmail(candidate.email) === sourceEmail,
 			)
 			: null) ??
 		(account.accountId
-			? uniqueMatch(accounts, (candidate) => candidate.accountId === account.accountId)
+			? uniqueMatch(compatibleAccounts, (candidate) => candidate.accountId === account.accountId)
 			: null) ??
 		(sourceEmail
-			? uniqueMatch(accounts, (candidate) => sanitizeEmail(candidate.email) === sourceEmail)
+			? uniqueMatch(compatibleAccounts, (candidate) => sanitizeEmail(candidate.email) === sourceEmail)
 			: null);
 	if (!snapshot) return null;
 	const live = targetManager.getAccountByIndex(snapshot.index);
@@ -212,9 +239,50 @@ export async function ensureFreshAccessToken(params: {
 		};
 	}
 
-	const refreshResult = await queuedRefresh(initialTarget.account.refreshToken);
-	const latestTarget =
-		resolveRuntimeRefreshTarget(initialTarget.accountManager, initialTarget.account) ?? initialTarget;
+	const refreshCredential = {
+		access: initialTarget.account.access,
+		refreshToken: initialTarget.account.refreshToken,
+		expires: initialTarget.account.expires,
+	};
+	const refreshResult = await queuedRefresh(refreshCredential.refreshToken);
+	const redirectedManager = resolveRuntimeRefreshCommitManager(initialTarget.accountManager);
+	const resolvedLatestTarget = resolveRuntimeRefreshTarget(
+		initialTarget.accountManager,
+		initialTarget.account,
+	);
+	if (redirectedManager !== initialTarget.accountManager && !resolvedLatestTarget) {
+		// The row that initiated this refresh disappeared while OAuth was in flight.
+		// Ignore the stale result rather than guessing another same-email workspace.
+		return {
+			ok: false,
+			retryable: true,
+			account: initialTarget.account,
+			accountManager: initialTarget.accountManager,
+		};
+	}
+	const latestTarget = resolvedLatestTarget ?? initialTarget;
+	const credentialChangedWhileRefreshing =
+		latestTarget.account.access !== refreshCredential.access ||
+		latestTarget.account.refreshToken !== refreshCredential.refreshToken ||
+		latestTarget.account.expires !== refreshCredential.expires;
+	if (credentialChangedWhileRefreshing) {
+		// A concurrent refresh or external re-login repaired/replaced this credential.
+		// The result for the old OAuth tuple must never invalidate or overwrite it.
+		if (hasUsableAccessToken(latestTarget.account, now, tokenRefreshSkewMs)) {
+			return {
+				ok: true,
+				accessToken: latestTarget.account.access ?? "",
+				account: latestTarget.account,
+				accountManager: latestTarget.accountManager,
+			};
+		}
+		return {
+			ok: false,
+			retryable: true,
+			account: latestTarget.account,
+			accountManager: latestTarget.accountManager,
+		};
+	}
 	if (refreshResult.type === "failed") {
 		latestTarget.accountManager.recordFailure(latestTarget.account, family, model);
 		latestTarget.accountManager.incrementAuthFailures(latestTarget.account);

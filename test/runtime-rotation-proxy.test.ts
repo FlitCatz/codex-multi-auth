@@ -3267,6 +3267,74 @@ describe("runtime rotation proxy", () => {
 		);
 	});
 
+
+	it("remaps approved workspace candidates when a refreshed account moves indexes", async () => {
+		const now = Date.now();
+		const storage = createStorage(now, 2);
+		const removed = storage.accounts[0];
+		const moving = storage.accounts[1];
+		if (!removed || !moving) throw new Error("expected accounts");
+		removed.recordId = "row-a";
+		removed.accountId = "removed-workspace";
+		removed.workspaces = [{ id: "removed-workspace", enabled: true }];
+		moving.recordId = "row-b";
+		moving.accountId = "disabled-binding";
+		moving.workspaces = [
+			{ id: "disabled-binding", enabled: false },
+			{ id: "enabled-workspace", enabled: true },
+		];
+		moving.currentWorkspaceIndex = 1;
+		const previous = new AccountManager(undefined, storage);
+		const replacementStorage: AccountStorageV3 = {
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [structuredClone(moving)],
+		};
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(replacement);
+		const { calls, fetchImpl } = createRecordingFetch((call) => {
+			if (call.url.includes("/models")) {
+				const workspace = call.headers.get(OPENAI_HEADERS.ACCOUNT_ID);
+				return Response.json({ models: workspace === "enabled-workspace" ? [{ slug: "model-test" }] : [{ slug: "other" }] });
+			}
+			return textEventStream();
+		});
+		const proxy = await startProxy({
+			accountManager: previous,
+			fetchImpl,
+			options: { nativeOpenai: true, readApiRoutes: async () => [] },
+		});
+		const catalog = await getModels(proxy, "/models?refresh_capabilities=1");
+		expect(catalog.status).toBe(HTTP_STATUS.OK);
+		await catalog.text();
+		const refresh = vi
+			.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken")
+			.mockImplementation(async ({ account, accountManager }) => {
+				if (account.recordId !== "row-b") {
+					return { ok: true, accessToken: account.access!, account, accountManager };
+				}
+				const replacementAccount = replacement.getAccountByIndex(0);
+				if (!replacementAccount) throw new Error("replacement account missing");
+				return {
+					ok: true,
+					accessToken: replacementAccount.access!,
+					account: replacementAccount,
+					accountManager: replacement,
+				};
+			});
+		try {
+			const response = await postResponses(proxy, { model: "model-test", input: "fixture" });
+			expect(response.status).toBe(HTTP_STATUS.OK);
+			await response.text();
+		} finally {
+			refresh.mockRestore();
+		}
+		const inference = calls.filter((call) => call.url.endsWith("/responses"));
+		expect(inference).toHaveLength(1);
+		expect(inference[0]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("enabled-workspace");
+	});
+
 	it("deduplicates pending refresh commits per account when OAuth tuples differ", async () => {
 		const now = Date.now();
 		const storage = createStorage(now, 1);

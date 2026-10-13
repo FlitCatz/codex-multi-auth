@@ -302,6 +302,130 @@ describe("ensureFreshAccessToken", () => {
 		expect(previous.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
 	});
 
+
+	it("does not redirect a removed same-email workspace refresh into its surviving sibling", async () => {
+		const previousStorage = storageWith(STALE_EXPIRES, {
+			recordId: "row-a",
+			email: "shared@example.com",
+			accountId: "workspace-a",
+			workspaces: [{ id: "workspace-a", enabled: true }],
+		});
+		previousStorage.accounts.push({
+			recordId: "row-b",
+			email: "shared@example.com",
+			accountId: "workspace-b",
+			workspaces: [{ id: "workspace-b", enabled: true }],
+			refreshToken: "refresh-b",
+			accessToken: "access-b",
+			expiresAt: FRESH_EXPIRES,
+			addedAt: NOW - 60_000,
+			lastUsed: NOW - 30_000,
+			enabled: true,
+		});
+		const previous = new AccountManager(undefined, previousStorage);
+		const replacementStorage: AccountStorageV3 = {
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { [FAMILY]: 0 },
+			accounts: [structuredClone(previousStorage.accounts[1]!)],
+		};
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(previous, replacement);
+		let releaseRefresh!: (value: unknown) => void;
+		queuedRefreshMock.mockImplementation(
+			() => new Promise((resolve) => { releaseRefresh = resolve; }),
+		);
+
+		const pending = ensureFreshAccessToken(refreshParams(previous));
+		await vi.waitFor(() => expect(queuedRefreshMock).toHaveBeenCalledTimes(1));
+		redirectRuntimeRefreshCommits(previous, replacement);
+		releaseRefresh({
+			type: "failed",
+			reason: "http_error",
+			statusCode: 401,
+			message: "OAuth token has been invalidated",
+		});
+		const result = await pending;
+
+		expect(result).toMatchObject({ ok: false, retryable: true, accountManager: previous });
+		expect(replacement.getAccountByIndex(0)).toMatchObject({
+			recordId: "row-b",
+			refreshToken: "refresh-b",
+		});
+		expect(replacement.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
+	});
+
+	it("ignores an old refresh invalidation after the same row is repaired by re-login", async () => {
+		const previous = managerWith(STALE_EXPIRES, { recordId: "row-a" });
+		const replacement = managerWith(FRESH_EXPIRES, {
+			recordId: "row-a",
+			accessToken: "access-repaired",
+			refreshToken: "refresh-repaired",
+		});
+		let releaseRefresh!: (value: unknown) => void;
+		queuedRefreshMock.mockImplementation(
+			() => new Promise((resolve) => { releaseRefresh = resolve; }),
+		);
+
+		const pending = ensureFreshAccessToken(refreshParams(previous));
+		await vi.waitFor(() => expect(queuedRefreshMock).toHaveBeenCalledTimes(1));
+		redirectRuntimeRefreshCommits(previous, replacement);
+		releaseRefresh({
+			type: "failed",
+			reason: "http_error",
+			statusCode: 401,
+			message: "OAuth token has been invalidated",
+		});
+		const result = await pending;
+
+		expect(result).toMatchObject({
+			ok: true,
+			accessToken: "access-repaired",
+			accountManager: replacement,
+		});
+		expect(replacement.getAccountByIndex(0)).toMatchObject({
+			access: "access-repaired",
+			refreshToken: "refresh-repaired",
+		});
+		expect(replacement.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
+	});
+
+	it("ignores an old successful refresh after the same row is repaired by re-login", async () => {
+		const previous = managerWith(STALE_EXPIRES, { recordId: "row-a" });
+		const replacement = managerWith(FRESH_EXPIRES, {
+			recordId: "row-a",
+			accessToken: "access-repaired",
+			refreshToken: "refresh-repaired",
+		});
+		const replacementCommit = vi.spyOn(replacement, "commitRefreshedAuth");
+		let releaseRefresh!: (value: unknown) => void;
+		queuedRefreshMock.mockImplementation(
+			() => new Promise((resolve) => { releaseRefresh = resolve; }),
+		);
+
+		const pending = ensureFreshAccessToken(refreshParams(previous));
+		await vi.waitFor(() => expect(queuedRefreshMock).toHaveBeenCalledTimes(1));
+		redirectRuntimeRefreshCommits(previous, replacement);
+		releaseRefresh({
+			type: "success",
+			access: "access-from-old-refresh",
+			refresh: "refresh-from-old-refresh",
+			expires: NOW + 7_200_000,
+		});
+		const result = await pending;
+
+		expect(result).toMatchObject({
+			ok: true,
+			accessToken: "access-repaired",
+			accountManager: replacement,
+		});
+		expect(replacementCommit).not.toHaveBeenCalled();
+		expect(replacement.getAccountByIndex(0)).toMatchObject({
+			access: "access-repaired",
+			refreshToken: "refresh-repaired",
+		});
+	});
+
 	it("clears refresh-manager redirects between tests", async () => {
 		const previous = managerWith(STALE_EXPIRES);
 		const replacement = managerWith(STALE_EXPIRES);
