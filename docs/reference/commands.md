@@ -180,6 +180,11 @@ models. These checks consume API usage, include small explicit access-program
 requests, and preserve request defaults and configured entitlements. A persisted
 claim prevents multiple routers or restarts from repeating the same daily pass.
 Disable capability probing or the route to stop future automatic probes.
+Malformed check history is repaired with a fresh daily delay, avoiding an
+immediate duplicate billable pass. Filesystem access errors stop the check
+until access is restored. Inconclusive program probes keep the last evidence
+time and can be retried by a subsequent capability refresh after 60 seconds;
+they do not renew the 24-hour evidence cache or accelerate the daily scheduler.
 
 No check sends the first-use
 request without `--prime`; the dashboard's Quick and Deep Check do not prime.

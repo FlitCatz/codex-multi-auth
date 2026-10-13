@@ -7,6 +7,7 @@ import {getCodexMultiAuthDir} from "../runtime-paths.js";
 import {withFileTransactionLock} from "../storage/file-lock.js";
 import {tempPathFor} from "../temp-path.js";
 import {withRetry} from "../fs-retry.js";
+import {combineSignals} from "../utils.js";
 import {logWarn} from "../logger.js";
 import {discoverModelInventory,saveModelInventory} from "./model-discovery-status.js";
 export const AUTOMATIC_API_CHECK_INTERVAL_MS=24*60*60_000;
@@ -26,15 +27,22 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
   // Commit the claim before network I/O. Concurrent routers and restarts share it.
   const claimed=await withFileTransactionLock(options.path,async()=>{
    let attempts:Record<string,number>={};
-   try{const raw=await withRetry(()=>fs.readFile(options.path,"utf8"),retry);if(Buffer.byteLength(raw)>1024*1024)throw Error("API-check history too large");attempts=schema.parse(JSON.parse(raw));}catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;}
-   const now=options.now?.()??Date.now(),id=key(current),last=attempts[id];
-   if(signal.aborted||(last!==undefined&&last<=now+300_000&&now-last<AUTOMATIC_API_CHECK_INTERVAL_MS))return false;
+   let raw:string|undefined,repairHistory=false;
+   try{raw=await withRetry(()=>fs.readFile(options.path,"utf8"),retry);}catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;}
+   if(raw!==undefined)try{if(Buffer.byteLength(raw)>1024*1024)throw Error("API-check history too large");attempts=schema.parse(JSON.parse(raw));}catch{repairHistory=true;}
+   const now=options.now?.()??Date.now(),id=key(current);
+   // Unknown prior attempts must not trigger another billable pass on repair.
+   // Seed every eligible route so a restart can resume normally the next day.
+   if(repairHistory)attempts=Object.fromEntries((await options.loadRoutes()).filter(eligible).map(route=>[key(route),now]));
+   const last=attempts[id];
+   if(signal.aborted||(!repairHistory&&last!==undefined&&last<=now+300_000&&now-last<AUTOMATIC_API_CHECK_INTERVAL_MS))return false;
    // Keep other processes' claims; prune only the oldest history at a fixed bound.
    for(const [old] of Object.entries(attempts).sort((a,b)=>b[1]-a[1]).slice(999))delete attempts[old];
    attempts[id]=now;const temp=tempPathFor(options.path);
    await fs.mkdir(dirname(options.path),{recursive:true,mode:0o700});
    try{await fs.writeFile(temp,JSON.stringify(attempts)+"\n",{mode:0o600,flag:"wx"});await withRetry(()=>fs.rename(temp,options.path),retry);}finally{await withRetry(()=>fs.rm(temp,{force:true}),retry);}
-   return true;
+   if(repairHistory)logWarn("Automatic API check history repaired; billable checks deferred for one daily interval.");
+   return !repairHistory;
   });
   if(!claimed||signal.aborted)continue;
   try{await options.check(current,signal);}catch{if(!signal.aborted)logWarn("Automatic API capability check failed; retry deferred until the next daily interval.");}
@@ -45,8 +53,7 @@ export function createAutomaticApiCheck(){return async(signal:AbortSignal)=>runA
  check:async(route,stop)=>{
   // Link shutdown to each existing bounded request without weakening its timeout.
   const fetcher:typeof fetch=async(input,init)=>{
-   const signals=[stop,init?.signal].filter((s):s is AbortSignal=>!!s);
-   const signal=AbortSignal.any(signals);
+   const signal=combineSignals(stop,init?.signal);
    signal.throwIfAborted();
    if(init?.method?.toUpperCase()==="POST" && !(await loadApiRoutes()).some(r=>eligible(r)&&key(r)===key(route)))throw Error("API check route changed");
    signal.throwIfAborted();

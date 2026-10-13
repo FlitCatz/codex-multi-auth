@@ -1,4 +1,5 @@
 import {afterEach,expect,it,vi} from "vitest";
+import {promises as fs} from "node:fs";
 import {mkdtemp,readFile,writeFile} from "node:fs/promises";
 import {join} from "node:path";
 import {tmpdir} from "node:os";
@@ -17,10 +18,9 @@ it("checks only opted-in enabled routes once per day, including competing runner
  expect(await readFile(path,"utf8")).not.toContain("secret");
  await runAutomaticApiChecks({...options,now:()=>1000+AUTOMATIC_API_CHECK_INTERVAL_MS});expect(check).toHaveBeenCalledTimes(2);
 });
-it("records failed attempts before requests and rejects malformed history",async()=>{
+it("records failed attempts before requests",async()=>{
  const path=await fixture(),check=vi.fn(async()=>{throw Error("fixture");}),options={path,loadRoutes:async()=>[route("on")],check,now:()=>1000};
  await runAutomaticApiChecks(options);await runAutomaticApiChecks(options);expect(check).toHaveBeenCalledTimes(1);
- await writeFile(path,"not-json");await expect(runAutomaticApiChecks(options)).rejects.toThrow();expect(check).toHaveBeenCalledTimes(1);
 });
 it("defers startup, prevents overlap, and aborts/drains on stop",async()=>{
  vi.useFakeTimers();let release!:()=>void;const gate=new Promise<void>(r=>{release=r;});let signal:AbortSignal|undefined;
@@ -60,4 +60,33 @@ it("revalidates opt-in immediately before each POST and keeps shutdown linked to
   return {version:1,checkedAt:1000,entries:[]};
  });
  try{await createAutomaticApiCheck()(controller.signal);expect(network).toHaveBeenCalledTimes(1);expect(save).not.toHaveBeenCalled();}finally{load.mockRestore();network.mockRestore();save.mockRestore();discover.mockRestore();}
+});
+
+
+it.each(["not-json", JSON.stringify({oldFormat:true})])("repairs corrupt history without an immediate duplicate billable pass: %s",async(raw)=>{
+ const path=await fixture(),routes=[route("one"),route("two")],check=vi.fn(async()=>{});
+ await writeFile(path,raw);
+ const options={path,loadRoutes:async()=>routes,check,now:()=>1000};
+ await Promise.all([runAutomaticApiChecks(options),runAutomaticApiChecks(options)]);
+ expect(check).not.toHaveBeenCalled();
+ const repaired=JSON.parse(await readFile(path,"utf8"));expect(Object.keys(repaired)).toHaveLength(2);expect(Object.values(repaired)).toEqual([1000,1000]);
+ expect(JSON.stringify(repaired)).not.toContain("secret");
+ await Promise.all([runAutomaticApiChecks({...options,now:()=>1000+AUTOMATIC_API_CHECK_INTERVAL_MS}),runAutomaticApiChecks({...options,now:()=>1000+AUTOMATIC_API_CHECK_INTERVAL_MS})]);
+ expect(check).toHaveBeenCalledTimes(2);
+});
+it("does not replace an unreadable history or send probes",async()=>{
+ const path=await fixture(),original=fs.readFile,check=vi.fn(async()=>{});
+ await writeFile(path,"preserve unreadable history");
+ const read=vi.spyOn(fs,"readFile").mockImplementation(((file,...args)=>String(file)===path?Promise.reject(Object.assign(Error("denied"),{code:"EACCES"})):original(file,...args)) as typeof fs.readFile);
+ try{await expect(runAutomaticApiChecks({path,loadRoutes:async()=>[route("one")],check})).rejects.toMatchObject({code:"EACCES"});expect(check).not.toHaveBeenCalled();}finally{read.mockRestore();}
+ expect(await readFile(path,"utf8")).toBe("preserve unreadable history");
+});
+
+it("includes newly enabled routes when repairing history under the lock",async()=>{
+ const path=await fixture(),one=route("one"),two=route("two"),check=vi.fn(async()=>{});
+ await writeFile(path,"corrupt");let loads=0;
+ const options={path,loadRoutes:async()=>++loads===1?[one]:[one,two],check,now:()=>1000};
+ await runAutomaticApiChecks(options);await runAutomaticApiChecks(options);
+ expect(check).not.toHaveBeenCalled();
+ expect(Object.keys(JSON.parse(await readFile(path,"utf8")))).toHaveLength(2);
 });

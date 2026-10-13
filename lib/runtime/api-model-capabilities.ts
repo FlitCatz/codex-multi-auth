@@ -214,6 +214,7 @@ export class ApiModelCapabilities {
 		// inconclusive and keeps what an earlier probe verified. Only
 		// "unsupported" or "downgraded" removes a setting otherwise.
 		let lostAccess = false;
+		let programAuthFailure = false;
 		// A model-level denial hides the model on this credential: no efforts, no tiers.
 		let modelDenied = false;
 		const previous = this.probes.get(key);
@@ -234,6 +235,7 @@ export class ApiModelCapabilities {
 				if (kind === "model") { modelDenied = true; return "unsupported"; }
 				if (kind === "setting") return "unsupported";
 				credentialUnavailable = true;
+				programAuthFailure = true;
 				return "unverified";
 			};
 			return this.withProbeSlot(async () => {
@@ -313,7 +315,7 @@ export class ApiModelCapabilities {
 						if ([400, 403].includes(response.status) && error &&
 							(["invalid_access_program", "unsupported_access_program", "access_program_not_enabled"].includes(String(error.code)) ||
 							["access_programs", "access_programs.cyber"].includes(String(error.param)))) return "unsupported";
-						if (response.status === 403) return denied403(data);
+						if (response.status === 403) { programAuthFailure = true; return denied403(data); }
 						if (!response.ok) return "unverified";
 						return isRecord(data) && ["completed", "incomplete"].includes(String(data.status)) && isRecord(data.access_programs) && data.access_programs.cyber === setting.program
 							? "verified" : "unverified";
@@ -406,14 +408,25 @@ export class ApiModelCapabilities {
 		const candidates = [...(configured ?? []), ...(/(?:^|-)cyber(?:-|$)|daybreak-red/.test(id)
 			? ["daybreak_red"] : /^gpt-[56](?:[.-]|$)/.test(id) ? ["standard", "daybreak_blue"] : [])];
 		const programs = [...new Set(candidates)].filter(value => ["standard", "daybreak_blue", "daybreak_red"].includes(value));
-		const reusable = !force && previous?.programCheckedAt !== undefined && Number.isFinite(previous.programCheckedAt) && previous.programCheckedAt >= 0 && previous.programCheckedAt <= 8.64e15 && previous.programCheckedAt <= this.now() &&
+		const reusable = !force && previous?.status.retry !== "transient" && previous?.programCheckedAt !== undefined && Number.isFinite(previous.programCheckedAt) && previous.programCheckedAt >= 0 && previous.programCheckedAt <= 8.64e15 && previous.programCheckedAt <= this.now() &&
 			previous.programCheckedAt + 86400_000 > this.now() && programs.every(program => previous.status[`program:cyber:${program}`] !== undefined);
-		if (reusable && !lostAccess && !modelDenied) {
+		if (reusable && !lostAccess && !modelDenied && !programAuthFailure) {
 			for (const program of programs) result.status[`program:cyber:${program}`] = previous.status[`program:cyber:${program}`] ?? "unverified";
 			result.programCheckedAt = previous.programCheckedAt;
 		} else {
-			for (const program of programs) result.status[`program:cyber:${program}`] = await attempt({ program, effort });
-			result.programCheckedAt = this.now();
+			let inconclusive = false;
+			for (const program of programs) {
+				const name = `program:cyber:${program}`;
+				const status = await attempt({ program, effort });
+				if (status === "unverified") inconclusive = true;
+				result.status[name] = !force && !programAuthFailure ? keep(name, status) : status;
+			}
+			// Never renew old evidence after throttling, transport failure or a missing echo.
+			result.programCheckedAt = inconclusive ? previous?.programCheckedAt : this.now();
+			if (inconclusive) result.status.retry = "transient";
+			if (programAuthFailure) {
+				for (const program of programs) result.status[`program:cyber:${program}`] = "unverified";
+			}
 		}
 		if (modelDenied) {
 			result.levels = [];

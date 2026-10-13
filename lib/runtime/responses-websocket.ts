@@ -359,7 +359,10 @@ class SocketSession {
 			}
 			this.stats.upstreamRequests++;
 			active.send(JSON.stringify(body), (error) => {
-				if (error) onClose(undefined, "send_error");
+				if (error) {
+					onClose(undefined, "send_error");
+					active.terminate();
+				}
 			});
 		});
 	}

@@ -682,3 +682,43 @@ it.each([401,403])("clears earlier capability evidence when a program probe lose
  expect(model.additional_speed_tiers).toEqual([]);
  expect(model.capability_probe_status).toMatchObject({responses:"unverified",fast:"unverified",retry:"transient","program:cyber:standard":"unverified","program:cyber:daybreak_blue":"unverified"});
 });
+
+it.each([429,503,"network"] as const)("retries inconclusive program probes after 60 seconds (%s)",async(failure)=>{
+ let now=1000, failing=true, attempts=0;
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs){
+   attempts++;
+   if(failing){if(failure==="network")throw Error("network");return Response.json({error:{code:"temporary"}},{status:failure});}
+  }
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const service=new ApiModelCapabilities(fetcher,()=>now);
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ const [first]=await service.enrich([{slug:"fixture"}],false,route);
+ expect(first.program_checked_at).toBeUndefined();
+ expect(first.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"unverified",retry:"transient"});
+ failing=false;now+=60001;
+ const [second]=await service.enrich([{slug:"fixture"}],false,route);
+ expect(attempts).toBe(2);
+ expect(second.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"verified"});
+ expect(second.program_checked_at).toBe(now);
+});
+
+it("keeps old successful program evidence without renewing it after a nonforced transient failure",async()=>{
+ let now=1000,failing=false;
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs&&failing)return Response.json({error:{code:"rate_limit_exceeded"}},{status:429});
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const service=new ApiModelCapabilities(fetcher,()=>now);
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ await service.enrich([{slug:"fixture"}],false,route);
+ now+=86400001;failing=true;
+ const [model]=await service.enrich([{slug:"fixture"}],false,route);
+ expect(model.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"verified",retry:"transient"});
+ expect(model.program_checked_at).toBe(1000);
+});

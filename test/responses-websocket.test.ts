@@ -682,6 +682,10 @@ it("records a send callback failure without replaying the create",async()=>{
  const f=await fixture(undefined,{sendFailure:true});const ws=await f.connect();
  await turn(ws,{model:"shared",input:[]});
  expect(f.stats.lastDisconnect).toMatchObject({cause:"send_error",stage:"awaiting_first_event"});
+ const peer=[...f.peers][0]!;
+ expect(peer.readyState).not.toBe(WebSocket.OPEN);
+ if(peer.readyState!==WebSocket.CLOSED)await once(peer,"close");
+ expect(peer.readyState).toBe(WebSocket.CLOSED);
  expect(f.stats.upstreamRequests).toBe(1);
  expect(f.calls).toHaveLength(0);
 });
