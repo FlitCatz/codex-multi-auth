@@ -185,6 +185,10 @@ claim prevents multiple routers or restarts from repeating the same daily pass.
 Live catalog enrichment and daily checks share persisted probe results under
 credential/model locks, preventing concurrent refreshes from duplicating probes.
 Explicit `check capabilities` still forces a new pass.
+If the probe cache contains malformed JSON or an invalid schema, that explicit
+check repairs it atomically before probing. Ordinary and automatic checks leave
+corrupt caches untouched. Filesystem access errors never trigger cache repair or
+paid probes.
 Disable capability probing or the route to stop future automatic probes.
 Malformed check history is repaired with a fresh daily delay, avoiding an
 immediate duplicate billable pass. Filesystem access errors stop the check

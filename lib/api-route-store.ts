@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -15,6 +16,9 @@ const programId = z.string().min(1).max(80).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/
 const accessPrograms = z.record(programId, z.array(programId).max(32))
 	.refine(value => Object.keys(value).length <= 16);
 const routeSchema = z.object({
+	/** Internal lifetime token. Store-owned; never trust an incoming token. */
+	capabilityEpoch: z.string().uuid().optional(),
+	legacyCapabilityCache: z.boolean().optional(),
 	id: z
 		.string()
 		.min(1)
@@ -82,33 +86,58 @@ export async function loadApiRoutes(
 		throw new Error("Invalid API route configuration");
 	}
 }
-export async function saveApiRoutes(
+export function saveApiRoutes(routes: ApiRouteCredential[], path = getApiRoutesPath(), expected?: ApiRouteCredential[]): Promise<void> {
+	return saveApiRoutesInternal(routes, path, expected);
+}
+async function saveApiRoutesInternal(
 	routes: ApiRouteCredential[],
 	path = getApiRoutesPath(),
 	expected?: ApiRouteCredential[],
+	discoveryExpansion = false,
+	signal?: AbortSignal,
+	onSaved?: (routes: ApiRouteCredential[]) => void,
 ): Promise<void> {
 	const validated = validate({ version: 1, routes });
-	const serialized = JSON.stringify({ version: 1, routes: validated }) + "\n";
+	let serialized = JSON.stringify({ version: 1, routes: validated }) + "\n";
 	if (Buffer.byteLength(serialized) > 1024 * 1024)
 		throw new Error("API route configuration is too large");
 	await withStorageLock(() => withFileTransactionLock(path, async () => {
+		signal?.throwIfAborted();
+		const current = await loadApiRoutes(path);
 		await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
 		const temp = tempPathFor(path);
 		try {
 			if (
 				expected &&
-				JSON.stringify(await loadApiRoutes(path)) !==
+				JSON.stringify(current) !==
 					JSON.stringify(validate({ version: 1, routes: expected }))
 			) {
 				throw new Error(
 					"API route configuration changed; reopen the menu before saving.",
 				);
 			}
+			const owned = validated.map(route => {
+				const old = current.find(value => value.id === route.id);
+				const policy = (value: ApiRouteCredential) => JSON.stringify([
+					value.kind, value.apiKey, value.enabled, value.probeCapabilities,
+					value.accessPrograms, value.modelAccessPrograms,
+					...(discoveryExpansion ? [] : [value.visibleModels]),
+				]);
+				const sameLifetime = old && policy(old) === policy(route);
+				const withoutLegacy = { ...route };
+				delete withoutLegacy.legacyCapabilityCache;
+				return { ...withoutLegacy, capabilityEpoch: sameLifetime ? old.capabilityEpoch ?? randomUUID() : randomUUID(),
+					...(sameLifetime && (!old.capabilityEpoch || old.legacyCapabilityCache === true) ? { legacyCapabilityCache: true } : {}) };
+			});
+			serialized = JSON.stringify({ version: 1, routes: owned }) + "\n";
+			if (Buffer.byteLength(serialized) > 1024 * 1024) throw Error("API route configuration is too large");
 			await fs.writeFile(temp, serialized, { mode: 0o600, flag: "wx" });
+			signal?.throwIfAborted();
 			await withRetry(() => fs.rename(temp, path), {
 				maxAttempts: 6,
 				backoffMs: 25,
 			});
+			onSaved?.(owned);
 		} finally {
 			await withRetry(() => fs.unlink(temp), {
 					maxAttempts: 6,
@@ -117,7 +146,7 @@ export async function saveApiRoutes(
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 				});
 		}
-	}));
+	}, { signal }));
 }
 
 /** Persist a discovery baseline and new GPT text IDs without undoing menu edits.
@@ -145,7 +174,8 @@ async function updateApiModelDiscoverySerial(
 	const routes = await loadApiRoutes(path);
 	const current = routes.find(
 		(r) =>
-			r.id === route.id && r.apiKey === route.apiKey && r.kind === route.kind,
+			r.id === route.id && r.apiKey === route.apiKey && r.kind === route.kind &&
+			(!route.capabilityEpoch || route.capabilityEpoch === r.capabilityEpoch),
 	);
 	if (!current) return { ...route, enabled: false, visibleModels: [] };
 	if (!current.enabled) return current;
@@ -160,11 +190,28 @@ async function updateApiModelDiscoverySerial(
 		knownModels: [...known],
 		visibleModels: [...visible],
 	};
+	let persisted = updated;
 	if (JSON.stringify(updated) !== JSON.stringify(current))
-		await saveApiRoutes(
+		await saveApiRoutesInternal(
 			routes.map((r) => (r.id === current.id ? updated : r)),
 			path,
 			routes,
+			true,
+			undefined,
+			values => { const saved = values.find(value => value.id === updated.id); if (saved) persisted = saved as typeof updated; },
 		);
-	return updated;
+	return persisted;
+}
+
+/** Migrate legacy ownership before taking any capability lease or cache lock. */
+export async function ensureApiRouteCapabilityEpoch(route: ApiRouteCredential, signal?: AbortSignal): Promise<ApiRouteCredential | undefined> {
+	const current = await loadApiRoutes();
+	const match = current.find(value => value.id === route.id && value.kind === route.kind && value.apiKey === route.apiKey);
+	if (!match || (route.capabilityEpoch && route.capabilityEpoch !== match.capabilityEpoch)) return undefined;
+	if (match.capabilityEpoch) return match;
+	let migrated: ApiRouteCredential | undefined;
+	await saveApiRoutesInternal(current, getApiRoutesPath(), current, false, signal, values => {
+		migrated = values.find(value => value.id === route.id);
+	});
+	return migrated;
 }

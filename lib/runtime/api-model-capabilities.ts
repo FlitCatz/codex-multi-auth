@@ -49,6 +49,7 @@ function parseReasoningStatement(id: string, text: string): string[] | undefined
 	return [...new Set(values)];
 }
 export type ProbeResult = {
+	ownerEpoch?: string;
 	programCheckedAt?: number;
 	programRetry?: boolean;
 	at: number;
