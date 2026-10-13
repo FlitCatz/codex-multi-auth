@@ -67,6 +67,9 @@ function programsFresh(result: ProbeResult, programs: string[], now: number): bo
   programs.every(program => ["verified", "unsupported"].includes(result.status[`program:cyber:${program}`] ?? ""));
 }
 type DocumentedCapabilities = { levels: string[]; inputModalities?: string[] };
+function probeKey(route: ApiRouteCredential, id: string): string {
+	return createHash("sha256").update(route.id).update("\0").update(route.apiKey).update("\0").update(id).digest("hex");
+}
 
 /** Only the exact model's input declaration can enable native image attachments. */
 function parseInputModalities(id: string, text: string): string[] | undefined {
@@ -186,20 +189,7 @@ export class ApiModelCapabilities {
 		this.cache.set(id, { ...metadata, at: this.now() });
 		return metadata;
 	}
-	private async probe(
-		route: ApiRouteCredential,
-		id: string,
-		documented: string[],
-		force = false,
-	) {
-		const key = createHash("sha256")
-			.update(route.id)
-			.update("\0")
-			.update(route.apiKey)
-			.update("\0")
-			.update(id)
-			.digest("hex");
-		const old = this.probes.get(key);
+	private freshProbe(route: ApiRouteCredential, id: string, old: ProbeResult | undefined): ProbeResult | undefined {
 		// A probe cut short by 401/403/429 is retried after a minute, not trusted for 15.
 		const freshFor = old?.status.retry === "transient" ? 60_000 : 900_000;
 		const programs = programCandidates(route, id);
@@ -208,7 +198,18 @@ export class ApiModelCapabilities {
 		const programCacheFresh = old && samePrograms && (programs.length
 			? programsFresh(old, programs, this.now()) || ((old.programRetry === true || (old.status.retry === "transient" && programs.some(program => old.status[`program:cyber:${program}`] === "unverified"))) && old.at + 60_000 > this.now())
 			: old.programCheckedAt === undefined);
-		if (!force && old && old.at + freshFor > this.now() && programCacheFresh) return old;
+		if (old && old.at <= this.now() && old.at + freshFor > this.now() && programCacheFresh) return old;
+		return undefined;
+	}
+	private async probe(
+		route: ApiRouteCredential,
+		id: string,
+		documented: string[],
+		force = false,
+	) {
+		const key = probeKey(route, id);
+		const fresh = this.freshProbe(route, id, this.probes.get(key));
+		if (!force && fresh) return fresh;
 		const running = this.inFlight.get(key);
 		if (running) return running;
 		const pending = this.runProbe(route, id, documented, key, force).finally(() =>
@@ -476,20 +477,23 @@ export class ApiModelCapabilities {
 		refresh = false,
 		route?: ApiRouteCredential,
 		forceProbes = false,
+		// Supplying evidence limits this call to cache reads, even when forced.
+		cachedProbesOnly?: Array<[string, ProbeResult]>,
 	): Promise<RouteModel[]> {
+		const cached = cachedProbesOnly === undefined ? undefined : new Map(cachedProbesOnly);
 		return mapWithConcurrency(models, 3, async (model) => {
 						const documented = await this.documentation(model.slug, refresh);
 						let levels = documented.levels;
 						let extra: Record<string, unknown> = {};
 						if (route?.enabled && route.probeCapabilities) {
-							const probed = await this.probe(
+							const probed = cached ? this.freshProbe(route, model.slug, cached.get(probeKey(route, model.slug))) : await this.probe(
 								route,
 								model.slug,
 								levels,
 								forceProbes,
 							);
-							levels = probed.levels;
-							extra = {
+							if (probed) levels = probed.levels;
+							extra = probed ? {
 								service_tiers: probed.tiers.map((id) => ({
 									id: id === "fast" ? "priority" : id,
 									name: id === "fast" ? "Fast" : "Ultrafast",
@@ -501,6 +505,15 @@ export class ApiModelCapabilities {
 								capability_probe_status: probed.status,
 								capability_checked_at: probed.at,
 								program_checked_at: probed.programCheckedAt,
+							} : {
+								// A previously enriched model must not smuggle expired or
+								// differently scoped evidence through a cache-only miss.
+								service_tiers: [],
+								default_service_tier: "default",
+								additional_speed_tiers: [],
+								capability_probe_status: undefined,
+								capability_checked_at: undefined,
+								program_checked_at: undefined,
 							};
 						}
 						// Ultra is a native orchestration mode. Codex resolves it to this

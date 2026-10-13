@@ -294,6 +294,59 @@ it("returns completed evidence after ENOSPC and avoids immediate duplicate probe
         await removeWithRetry(root, { recursive: true, force: true });
     }
 });
+it.each(["fresh", "expired", "future", "changed-programs", "changed-credential"])("keeps only fresh matching retained evidence after write then read failure: %s", async (scenario) => {
+    const { promises: fs } = await import("node:fs");
+    const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
+    const root = await mkdtemp(join(tmpdir(), "probe-write-read-failure-"));
+    const previous = process.env.CODEX_MULTI_AUTH_DIR;
+    process.env.CODEX_MULTI_AUTH_DIR = root;
+    const path = join(root, "api-capability-probes.json");
+    const rename = fs.rename.bind(fs), read = fs.readFile.bind(fs);
+    let readFailed = false, now = 1000, posts = 0;
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+        if (String(to) === path) throw Object.assign(Error("full"), { code: "ENOSPC" });
+        return rename(from, to);
+    });
+    vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+        if (readFailed && String(args[0]) === path) throw Object.assign(Error("unavailable"), { code: "EIO" });
+        return read(...args);
+    });
+    const route = { id: "fixture", kind: "api" as const, label: "fixture", apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, accessPrograms: { cyber: ["standard"] } };
+    const options = { now: () => now, fetchImpl: async (_url: unknown, init?: RequestInit) => {
+        if (init?.method !== "POST") return new Response("missing", { status: 404 });
+        posts++;
+        const body = JSON.parse(String(init.body));
+        return Response.json({ status: "completed", reasoning: body.reasoning, service_tier: body.service_tier, access_programs: body.access_programs, output: [{ type: "function_call", name: "capability_probe" }] });
+    } };
+    try {
+        const [first] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+        expect(first.capability_probe_status).toMatchObject({ responses: "verified", "program:cyber:standard": "verified" });
+        const count = posts;
+        readFailed = true;
+        if (scenario === "expired") now += 900_001;
+        else if (scenario === "future") now--;
+        const current = scenario === "changed-programs" ? { ...route, accessPrograms: { cyber: ["daybreak_blue"] } }
+            : scenario === "changed-credential" ? { ...route, apiKey: "new-fixture-key" } : route;
+        const [second] = await enrichPersistedApiCapabilities([scenario === "fresh" ? { slug: "fixture" } : first], true, current, true, options);
+        if (scenario === "fresh") {
+            expect(second.capability_probe_status).toEqual(first.capability_probe_status);
+            expect(second.service_tiers).toEqual(first.service_tiers);
+            expect(second.capability_checked_at).toBe(1000);
+            expect(second.program_checked_at).toBe(1000);
+        } else {
+            expect(second.capability_probe_status).toBeUndefined();
+            expect(second.capability_checked_at).toBeUndefined();
+            expect(second.program_checked_at).toBeUndefined();
+            expect(second.service_tiers).toEqual([]);
+        }
+        expect(posts).toBe(count);
+    } finally {
+        vi.restoreAllMocks();
+        if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+        else process.env.CODEX_MULTI_AUTH_DIR = previous;
+        await removeWithRetry(root, { recursive: true, force: true });
+    }
+});
 it("retries a transient locked cache read without losing existing entries", async () => {
     const { promises: fs } = await import("node:fs");
     const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
@@ -326,4 +379,83 @@ it("retries a transient locked cache read without losing existing entries", asyn
             process.env.CODEX_MULTI_AUTH_DIR = previous;
         await removeWithRetry(root, { recursive: true, force: true });
     }
+});
+
+it.each(["EACCES", "EROFS", "ENOSPC"])("keeps API and ZDR metadata available when lease storage fails with %s", async (code) => {
+    const locks = await import("../lib/storage/file-lock.js");
+    const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
+    const root = await mkdtemp(join(tmpdir(), "probe-lease-unavailable-"));
+    const previous = process.env.CODEX_MULTI_AUTH_DIR;
+    process.env.CODEX_MULTI_AUTH_DIR = root;
+    const originalLock = locks.withFileTransactionLock;
+    const lock = vi.spyOn(locks, "withFileTransactionLock").mockImplementation(async (...args) => {
+        if (String(args[0]).includes("api-probe-locks")) throw Object.assign(new Error("fixture lease unavailable"), { code });
+        return originalLock(...args);
+    });
+    let posts = 0;
+    const fetcher: typeof fetch = async (_input, init) => {
+        if (init?.method === "POST") {
+            posts++;
+            throw Error("Paid probe must not run without its lease");
+        }
+        expect(new Headers(init?.headers).has("authorization")).toBe(false);
+        return new Response("Model ID: `fixture`\nReasoning.effort supports: low, medium, high.");
+    };
+    try {
+        for (const kind of ["api", "zdr"] as const) {
+            const [model] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, {
+                id: kind, label: "fixture", kind, apiKey: "fixture-key", enabled: true,
+                priority: 0, probeCapabilities: true,
+            }, false, { fetchImpl: fetcher });
+            expect(model.supported_reasoning_levels).toEqual(expect.arrayContaining([expect.objectContaining({ effort: "high" })]));
+        }
+        expect(posts).toBe(0);
+    } finally {
+        lock.mockRestore();
+        if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+        else process.env.CODEX_MULTI_AUTH_DIR = previous;
+        await removeWithRetry(root, { recursive: true, force: true });
+    }
+});
+
+it.each([false, true])("replaces future-dated own evidence without repeating paid probes (save failure=%s)", async (saveFails) => {
+	const { promises: fs } = await import("node:fs");
+	const { createHash } = await import("node:crypto");
+	const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
+	const root = await mkdtemp(join(tmpdir(), "future-probes-"));
+	const previous = process.env.CODEX_MULTI_AUTH_DIR;
+	process.env.CODEX_MULTI_AUTH_DIR = root;
+	const path = join(root, "api-capability-probes.json");
+	const key = createHash("sha256").update("fixture\0fixture-key\0fixture").digest("hex");
+	const future = { at: 2000, levels: [], tiers: [], status: { responses: "unsupported" } };
+	await fs.writeFile(path, JSON.stringify({ version: 1, entries: [[key, future]] }));
+	const rename = fs.rename.bind(fs);
+	const spy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+		if (saveFails && String(to) === path) throw Object.assign(Error("full"), { code: "ENOSPC" });
+		return rename(from, to);
+	});
+	let posts = 0;
+	const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true };
+	const options = { now: () => 1000, fetchImpl: async (_url: unknown, init?: RequestInit) => {
+		if (init?.method !== "POST") return new Response("missing", { status: 404 });
+		posts++;
+		const body = JSON.parse(String(init.body));
+		return Response.json({ reasoning: body.reasoning, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+	} };
+	try {
+		await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+		const firstPosts = posts;
+		expect(firstPosts).toBeGreaterThan(0);
+		await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+		expect(posts).toBe(firstPosts);
+		spy.mockRestore();
+		await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, options);
+		expect(posts).toBe(firstPosts);
+		expect(new Map(JSON.parse(await fs.readFile(path, "utf8")).entries).get(key)).toMatchObject({ at: 1000, status: { responses: "verified" } });
+	} finally {
+		spy.mockRestore();
+		if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+		else process.env.CODEX_MULTI_AUTH_DIR = previous;
+		await removeWithRetry(root, { recursive: true, force: true });
+	}
 });
