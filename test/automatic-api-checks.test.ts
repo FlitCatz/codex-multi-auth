@@ -8,7 +8,7 @@ import {removeWithRetry} from "./helpers/remove-with-retry.js";
 import {runAutomaticApiChecks,startAutomaticApiChecks,AUTOMATIC_API_CHECK_INTERVAL_MS} from "../lib/runtime/automatic-api-checks.js";
 import type {ApiRouteCredential} from "../lib/api-route-store.js";
 const roots:string[]=[];
-afterEach(async()=>{vi.useRealTimers();for(const root of roots.splice(0))await removeWithRetry(root,{recursive:true,force:true});});
+afterEach(async()=>{vi.useRealTimers();vi.restoreAllMocks();for(const root of roots.splice(0))await removeWithRetry(root,{recursive:true,force:true});});
 const route=(id:string, enabled=true,probeCapabilities=true):ApiRouteCredential=>({id,label:id,kind:"api",apiKey:`secret-${id}`,enabled,probeCapabilities,priority:0,visibleModels:["chat-test"]});
 async function fixture(){const root=await mkdtemp(join(tmpdir(),"api-checks-"));roots.push(root);return join(root,"attempts.json");}
 it("checks only opted-in enabled routes once per day, including competing runners",async()=>{
@@ -160,7 +160,7 @@ it("refreshes expired program evidence before consuming the daily pass despite f
  }finally{clock.mockRestore();network.mockRestore();if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;}
 });
 
-it("stops daily discovery waiting on a real probe lease without paid or late work", async () => {
+it.each([undefined, "EBUSY", "EPERM"])("stops daily discovery and drains owner cleanup with %s", async (cleanupCode) => {
  const {withFileTransactionLock}=await import("../lib/storage/file-lock.js");
  const {saveApiRoutes}=await import("../lib/api-route-store.js");
  const {createAutomaticApiCheck}=await import("../lib/runtime/automatic-api-checks.js");
@@ -177,6 +177,14 @@ it("stops daily discovery waiting on a real probe lease without paid or late wor
   return new Response("missing",{status:404});
  });
  const owner=withFileTransactionLock(lease,async()=>{entered();await gate;});await started;
+ let cleanupFailures=0;
+ const unlink=fs.unlink.bind(fs);
+ const unlinkSpy=vi.spyOn(fs,"unlink").mockImplementation(async target=>{
+  if(cleanupCode&&!cleanupFailures&&String(target).replace(/\\/g,"/").includes(`${key}.write-lock/`)){
+   cleanupFailures++;throw Object.assign(Error("busy cleanup"),{code:cleanupCode});
+  }
+  return unlink(target);
+ });
  let contended=false;
  const rename=fs.rename.bind(fs);
  const renameSpy=vi.spyOn(fs,"rename").mockImplementation(async(from,to)=>{
@@ -193,13 +201,18 @@ it("stops daily discovery waiting on a real probe lease without paid or late wor
   await vi.waitFor(()=>expect(stopped).toBe(true),{timeout:1000,interval:50});
   expect(posts).toBe(0);
  }finally{
-  release();await owner;
+  release();let ownerDrained=false;
+  const drainOwner=owner.finally(()=>{ownerDrained=true;});
   try{
+   await vi.waitFor(()=>expect(ownerDrained).toBe(true),{timeout:1000,interval:50});await drainOwner;
    stop??=scheduler?.stop().then(()=>{stopped=true;});
    if(stop){await vi.waitFor(()=>expect(stopped).toBe(true),{timeout:1000,interval:50});await stop;}
-  }finally{vi.useRealTimers();renameSpy.mockRestore();mock.mockRestore();}
-  if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;
+  }finally{
+   vi.useRealTimers();unlinkSpy.mockRestore();renameSpy.mockRestore();mock.mockRestore();
+   if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;
+  }
  }
  expect(posts).toBe(0);
+ expect(cleanupFailures).toBe(cleanupCode?1:0);
  expect((await fs.readdir(join(root,"api-probe-locks"))).filter(name=>name.includes("candidate")||name.endsWith("write-lock"))).toEqual([]);
 });

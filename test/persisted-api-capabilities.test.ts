@@ -676,3 +676,57 @@ it.each([1000, 1001])("prefers readable disk denial over retained positive evide
         await removeWithRetry(root, { recursive: true, force: true });
     }
 });
+
+it.each(["throttled", "transport", "revoked", "unsupported"])("retains disk-only documented efforts after restarted daily checks unless denied: %s", async (failure) => {
+    const { loadModelInventory } = await import("../lib/runtime/model-discovery-status.js");
+    const { resolveModelRoute } = await import("../lib/model-route-policy.js");
+    const root = await mkdtemp(join(tmpdir(), "restart-program-docs-"));
+    const previous = process.env.CODEX_MULTI_AUTH_DIR;
+    process.env.CODEX_MULTI_AUTH_DIR = root;
+    let now = 1000, outage = false;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fetcher: typeof fetch = async (input, init) => {
+        if (String(input).endsWith("/models")) return Response.json({ data: [{ id: "fixture" }] });
+        if (init?.method !== "POST") return outage ? new Response("offline", { status: 503 }) : new Response("Model ID: `fixture`\nReasoning.effort supports: low, medium, high.");
+        const body = JSON.parse(String(init.body));
+        if (outage) {
+            if (failure === "transport") throw Error("offline");
+            if (failure === "unsupported" && body.reasoning?.effort === "high") return Response.json({ error: { code: "unsupported_value", param: "reasoning.effort" } }, { status: 400 });
+            if (failure !== "unsupported") return Response.json({ error: { code: failure === "revoked" ? "invalid_api_key" : "rate_limit_exceeded" } }, { status: failure === "revoked" ? 401 : 429 });
+        }
+        return Response.json({ status: "completed", reasoning: body.reasoning, access_programs: body.access_programs, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+    };
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetcher);
+    const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, visibleModels: ["fixture"], knownModels: ["fixture"], accessPrograms: { cyber: ["standard"] } };
+    try {
+        await saveApiRoutes([route]);
+        const initial = await discoverModelInventory(null, [route], { fetchImpl: fetcher, persistProbes: true, updateApiDiscovery: async () => route });
+        expect(initial.entries[0].entitlements![0].reasoningLevels).toContain("high");
+        // No process-local capability/documentation object survives into this first scheduler pass.
+        resetPersistedApiCapabilitiesForTests();
+        now += 86400_000;
+        outage = true;
+        await createAutomaticApiCheck()(new AbortController().signal);
+        const saved = (await loadModelInventory())!;
+        const entitlement = saved.entries[0].entitlements![0];
+        if (failure === "throttled" || failure === "transport") expect(entitlement.reasoningLevels).toContain("high");
+        else expect(entitlement.reasoningLevels).not.toContain("high");
+        const inventory = await discoverModelInventory(null, [route], { fetchImpl: fetcher, persistProbes: true, updateApiDiscovery: async () => route });
+        expect(inventory.entries[0].entitlements![0].reasoningLevels).toEqual(entitlement.reasoningLevels);
+        const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
+        const [model] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, { fetchImpl: fetcher });
+        const resolved = resolveModelRoute("api/fixture", [{ ...route, models: [model] }], { reasoningEffort: "high" });
+        if (failure === "revoked" || failure === "unsupported") {
+            expect(resolved.candidates).toEqual([]);
+        } else {
+            expect(model.supported_reasoning_levels).toContainEqual(expect.objectContaining({ effort: "high" }));
+            expect(resolved.candidates).toHaveLength(1);
+            expect(model.capability_probe_status).toMatchObject({ "effort:high": "unverified" });
+        }
+    } finally {
+        vi.restoreAllMocks();
+        if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+        else process.env.CODEX_MULTI_AUTH_DIR = previous;
+        await removeWithRetry(root, { recursive: true, force: true });
+    }
+});

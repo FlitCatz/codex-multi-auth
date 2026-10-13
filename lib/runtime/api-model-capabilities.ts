@@ -419,7 +419,10 @@ export class ApiModelCapabilities {
 			for (const { effort, status } of checked) {
 				const effective = keep(`effort:${effort}`, status);
 				result.status[`effort:${effort}`] = effective;
-				if (effective === "verified") result.levels.push(effort);
+				// Persisted levels can originate in public documentation, without a
+				// verified effort probe. An inconclusive retry must not erase that
+				// scoped evidence after restart; explicit denial still removes it.
+				if (effective === "verified" || (status === "unverified" && !lostAccess && !modelDenied && previous?.levels.includes(effort))) result.levels.push(effort);
 			}
 		}
 		const effort = result.levels.includes("low") ? "low" : result.levels[0];
