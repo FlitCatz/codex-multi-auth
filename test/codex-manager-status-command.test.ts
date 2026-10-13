@@ -681,3 +681,15 @@ it.each(["{broken", JSON.stringify({version:1,accounts:{"sha256:fixture":{autoPr
   expect(JSON.parse(vi.mocked(deps.logInfo!).mock.calls.at(-1)![0]).accounts[0].subscription.autoPrime).toBeNull();
  } finally {spy.mockRestore();}
 });
+
+it.each(["subscriptions","api-only","empty"] as const)("shows historical WebSocket diagnostics in text and JSON for %s status",async(kind)=>{
+ const diagnostic={at:1000,cause:"close" as const,stage:"streaming" as const,closeCode:1011};
+ const bind={state:"running",pid:123,baseUrl:null,totalRequests:0,lastAccountIndex:null,lastAccountLabel:null,lastAccountEmail:null,lastAccountId:null,updatedAt:2000,lastError:null,lastWebsocketDisconnect:diagnostic};
+ const overrides:Partial<StatusCommandDeps>={loadAccounts:async()=>kind==="subscriptions"?createStorage():null,loadAppBindStatus:async()=>bind,
+ loadApiRoutes:async()=>kind==="api-only"?[{id:"fixture",label:"fixture",kind:"api",apiKey:"fixture-secret",enabled:true,priority:0,visibleModels:[]}]:[]};
+ const text=vi.fn();await runStatusCommand(createStatusDeps({...overrides,logInfo:text}));
+ const output=text.mock.calls.map(call=>call[0]).join("\n");
+ expect(output).toContain("1970-01-01T00:00:01.000Z");expect(output).toContain("streaming");expect(output).toContain("1011");expect(output).toContain("close");
+ const json=vi.fn();await runStatusCommand(createStatusDeps({...overrides,json:true,logInfo:json}));
+ expect(JSON.parse(json.mock.calls[0]![0]).lastWebsocketDisconnect).toEqual(diagnostic);
+});

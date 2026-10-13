@@ -960,6 +960,11 @@ completed), and health/model checks do not update it. `status --json` preserves
 `apiAccounts`, `totalAccountCount`, `selectionMode`, `modelInventory`, and
 per-account priority/forecast/reset-credit fields.
 
+`status` and `rotation status` show the last recorded WebSocket interruption,
+when present: timestamp, cause, response stage, and optional close code.
+`status --json` exposes it as `lastWebsocketDisconnect`. Local cancellation and
+request timeouts are excluded; raw upstream messages and payloads are not stored.
+
 API model entries require explicit selection and never serve as automatic paid
 fallbacks; see [model route pools](../design/model-route-pools.md) for setup
 and refresh behavior. Credential-scoped access programs can be configured per

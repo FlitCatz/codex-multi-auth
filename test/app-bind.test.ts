@@ -2230,3 +2230,48 @@ it.each([
  await writeFile(paths.statusPath,JSON.stringify({state:"stopped",lastWebsocketDisconnect:stored}));
  expect((await getAppBindStatus(options)).router?.lastWebsocketDisconnect).toEqual(expected);
 });
+
+
+it.each([true,false])("shows safe WebSocket disconnect details for native=%s", (nativeOpenai) => {
+ const configPath="fixture/config.toml";
+ const status: Parameters<typeof formatAppBindStatus>[0] = {
+		bound: true,
+		running: true,
+		state: {
+			version: 1,
+			platform: "win32",
+			host: "127.0.0.1",
+			port: 4567,
+			baseUrl: "http://127.0.0.1:4567",
+			configPath,
+			statePath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\state.json",
+			backupPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\backup.json",
+			statusPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\status.json",
+			logPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\router.log",
+			nodePath: process.execPath,
+			routerScriptPath: "C:\\repo\\scripts\\codex-app-router.js",
+			clientApiKey: "redacted",
+			startupPath: null,
+			launchAgentPath: null,
+			boundConfigHash: "hash",
+			updatedAt: 1,
+		},
+		router: null,
+		paths: {
+			codexHome: "C:\\Users\\neil\\DevTools\\config\\codex",
+			configPath,
+			bindDir: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind",
+			statePath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\state.json",
+			backupPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\backup.json",
+			statusPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\status.json",
+			logPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\router.log",
+			routerScriptPath: "C:\\repo\\scripts\\codex-app-router.js",
+			startupPath: null,
+			launchAgentPath: null,
+		},
+	};
+ status.state!.nativeOpenai=nativeOpenai;
+ const withDiagnostic = {...status,router:{lastWebsocketDisconnect:{at:1000,cause:"transport_error" as const,stage:"streaming" as const,closeCode:1006}}};
+ expect(formatAppBindStatus(withDiagnostic)).toContain("Last WebSocket disconnect: 1970-01-01T00:00:01.000Z; cause=transport_error; stage=streaming; closeCode=1006");
+ expect(formatAppBindStatus(status)).not.toContain("Last WebSocket disconnect:");
+});

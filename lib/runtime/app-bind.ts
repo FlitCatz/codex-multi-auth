@@ -1885,6 +1885,12 @@ async function unbindCodexAppRuntimeRotationLocked(
 	};
 }
 
+export function formatWebsocketDisconnect(value: unknown): string | null {
+ const diagnostic = readWebsocketDisconnect(value);
+ if (!diagnostic || diagnostic.at > 8.64e15) return null;
+ return `Last WebSocket disconnect: ${new Date(diagnostic.at).toISOString()}; cause=${diagnostic.cause}; stage=${diagnostic.stage}${diagnostic.closeCode !== undefined ? `; closeCode=${diagnostic.closeCode}` : ""}`;
+}
+
 export function formatAppBindStatus(status: AppBindStatus): string {
 	if (status.unmanagedBind && !status.state) {
 		return [
@@ -1907,9 +1913,11 @@ export function formatAppBindStatus(status: AppBindStatus): string {
 	} else if (status.router?.lastAccountIndex !== null && status.router?.lastAccountIndex !== undefined) {
 		parts.push(`lastAccount=Account ${status.router.lastAccountIndex + 1}`);
 	}
-	if (status.state.nativeOpenai) return `Codex app bind: ${parts.join(", ")}, native OpenAI, live account catalogs`;
+	const diagnostic = formatWebsocketDisconnect(status.router?.lastWebsocketDisconnect);
+	if (status.state.nativeOpenai) return [`Codex app bind: ${parts.join(", ")}, native OpenAI, live account catalogs`, ...(diagnostic ? [diagnostic] : [])].join("\n");
 	return [
 		`Codex app bind: ${parts.join(", ")}`,
+		...(diagnostic ? [diagnostic] : []),
 		[
 			"Note: Codex Desktop may hide history while the app bind selects the",
 			"codex-multi-auth-runtime-proxy provider; use `codex-multi-auth rotation",
