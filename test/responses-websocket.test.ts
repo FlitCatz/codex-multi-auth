@@ -122,7 +122,7 @@ async function fixture(respond?: (ws: WebSocket, body: Record<string, unknown>, 
 		cleanups.push(async () => ws.terminate());
 		return ws;
 	};
-	return { disconnectUpstream: async () => { await Promise.all([...wss.clients].map(async socket => { const closed=once(socket,"close");socket.terminate();await closed; })); await new Promise(resolve=>setImmediate(resolve)); }, connect, calls, connections: () => connections, baseUrl, useCredential: (credential: string) => { upstreamCredential = credential; } };
+	return { stats: gateway.stats, disconnectUpstream: async () => { await Promise.all([...wss.clients].map(async socket => { const closed=once(socket,"close");socket.terminate();await closed; })); await new Promise(resolve=>setImmediate(resolve)); }, connect, calls, connections: () => connections, baseUrl, useCredential: (credential: string) => { upstreamCredential = credential; } };
 }
 function turn(
 	ws: WebSocket,
@@ -235,6 +235,31 @@ it("does not replay after generation starts and the upstream disconnects", async
 	expect(events.at(-1)?.type).toBe("error");
 	expect(f.calls).toHaveLength(1);
 });
+it("records a sanitized upstream close without replaying generation", async () => {
+ const f = await fixture(ws => { ws.close(1011, "secret fixture reason"); return true; });
+ const ws = await f.connect();
+ const before = Date.now();
+ await turn(ws, {model:"shared",input:[]});
+ expect(f.stats.lastDisconnect).toEqual({at:expect.any(Number),cause:"close",stage:"streaming",closeCode:1011});
+ expect(f.stats.lastDisconnect?.at).toBeGreaterThanOrEqual(before);
+ expect(JSON.stringify(f.stats)).not.toContain("secret fixture reason");
+ expect(f.calls).toHaveLength(1);
+});
+it("distinguishes invalid upstream events from transport disconnects", async () => {
+ const f = await fixture(ws => { ws.send("not JSON: secret"); return true; });
+ const ws = await f.connect();
+ await turn(ws,{model:"shared",input:[]});
+ expect(f.stats.lastDisconnect).toEqual({at:expect.any(Number),cause:"invalid_event",stage:"streaming"});
+ expect(JSON.stringify(f.stats)).not.toContain("secret");
+});
+it("does not report an idle close after completion as an interrupted response", async () => {
+ const f=await fixture(); const ws=await f.connect();
+ await turn(ws,{model:"shared",input:[]});
+ await f.disconnectUpstream();
+ expect(f.stats.lastDisconnect).toBeUndefined();
+ expect((await turn(ws,{model:"shared",input:[]})).at(-1)?.type).toBe("response.completed");
+ expect(f.connections()).toBe(2);
+});
 it("cancels active generation and can start another request", async () => {
 	const f = await fixture();
 	const ws = await f.connect();
@@ -247,6 +272,7 @@ it("cancels active generation and can start another request", async () => {
 		"response.completed",
 	);
 	expect(f.calls).toHaveLength(2);
+	expect(f.stats.lastDisconnect).toBeUndefined();
 });
 it("rejects oversized frames before any upstream request", async () => {
 	const f = await fixture();
@@ -442,7 +468,7 @@ async function customGateway(options: {
 		ws.once("open", () => resolve(101));
 		ws.once("error", reject);
 	});
-	return { connect, handshakeStatus, responses };
+	return { stats: gateway.stats, connect, handshakeStatus, responses };
 }
 
 function rejectingUpstream(status: number, headers: Record<string, string>, onPost?: (body: string) => void): Server {
@@ -571,6 +597,7 @@ it("does not replay a sent create when a reused socket closes before its first e
 	expect((await turn(ws, { model: "shared", input: [] })).at(-1)).toMatchObject({ type: "error" });
 	expect(connections).toBe(1);
 	expect(messages).toBe(2);
+	expect(g.stats.lastDisconnect).toMatchObject({cause:"close",stage:"awaiting_first_event",closeCode:1006});
 });
 
 it("keeps loopback hops off an environment HTTP proxy", async () => {

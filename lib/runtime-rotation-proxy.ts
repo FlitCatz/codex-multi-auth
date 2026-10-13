@@ -1326,6 +1326,7 @@ export async function startRuntimeRotationProxy(
 			...state.status,
  websocketConnections: websocketGateway.stats.connections,
  websocketUpstreamRequests: websocketGateway.stats.upstreamRequests,
+ lastWebsocketDisconnect: websocketGateway.stats.lastDisconnect,
 			// Redact any email/token material that leaked into a raw upstream or
 			// refresh error string before exposing it to status/report consumers
 			// (errors-logging-08). maskString is a no-op for clean diagnostic text.

@@ -2216,3 +2216,16 @@ describe("reviewed provider transitions",()=>{
   });
  });
 });
+
+it.each([
+ {stored:{at:123,cause:"close",stage:"streaming",closeCode:1011,reason:"secret"},expected:{at:123,cause:"close",stage:"streaming",closeCode:1011}},
+ {stored:{at:123,cause:"secret",stage:"streaming"},expected:null},
+ {stored:{at:"123",cause:"close",stage:"streaming"},expected:null},
+])("validates persisted WebSocket diagnostics without retaining arbitrary fields: $stored",async ({stored,expected})=>{
+ const root=await createTempRoot("app-bind-ws-diagnostic-");
+ const options={platform:"linux" as const,home:root,env:{CODEX_HOME:join(root,"codex")}};
+ const paths=resolveAppBindPaths(options);
+ await mkdir(paths.bindDir,{recursive:true});
+ await writeFile(paths.statusPath,JSON.stringify({state:"stopped",lastWebsocketDisconnect:stored}));
+ expect((await getAppBindStatus(options)).router?.lastWebsocketDisconnect).toEqual(expected);
+});

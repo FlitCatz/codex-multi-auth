@@ -21,6 +21,28 @@ afterEach(async () => {
 	await isolationFs.rm(multiAuthDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 describe("model discovery reporting", () => {
+	it.each(["api", "zdr"] as const)("labels %s programs as local configuration", async (kind) => {
+		const inventory = await discoverModelInventory(null, [{
+			id: "fixture", label: "API fixture", kind, apiKey: "fixture-secret",
+			enabled: true, priority: 0, visibleModels: ["configured", "unconfigured"],
+			modelAccessPrograms: { configured: { cyber: ["standard", "daybreak_blue"] } },
+		}], { fetchImpl: vi.fn(async () => Response.json({ data: [
+			{ id: "configured" }, { id: "unconfigured" },
+		] })), now: () => 1234 });
+		const output = formatModelInventory(inventory, 1234).join("\n");
+		expect(output).toContain("configured programs=cyber:standard, cyber:daybreak_blue");
+		expect(output).toContain("configured programs=none");
+		expect(output).not.toContain("programs=not advertised");
+	});
+	it("preserves upstream program wording for OAuth catalogs", () => {
+		const output = formatModelInventory({ version: 1, checkedAt: 1234, entries: [{
+			id: "fixture", label: "OAuth fixture", kind: "oauth", enabled: true,
+			error: false, checkedAt: 1234, models: ["fixture"], visibleModels: ["fixture"],
+			entitlements: [{ model: "fixture", serviceTiers: [], reasoningLevels: [], accessPrograms: [] }],
+		}] }, 1234).join("\n");
+		expect(output).toContain("programs=not advertised");
+		expect(output).not.toContain("configured programs=");
+	});
 	it("reports each credential independently including API-only and hidden IDs", async () => {
 		const fetcher = vi.fn(async () =>
 			Response.json({ data: [{ id: "exclusive" }, { id: "hidden" }] }),

@@ -179,6 +179,7 @@ function createStatusPayload({
 		upstreamRequests: proxyStatus.upstreamRequests ?? 0,
 		websocketConnections: proxyStatus.websocketConnections ?? 0,
 		websocketUpstreamRequests: proxyStatus.websocketUpstreamRequests ?? 0,
+		lastWebsocketDisconnect: proxyStatus.lastWebsocketDisconnect ?? null,
 		streamQuotaUpdates: proxyStatus.streamQuotaUpdates ?? 0,
 		lastStreamQuotaUpdateAt: proxyStatus.lastStreamQuotaUpdateAt ?? null,
 		retries: proxyStatus.retries ?? 0,

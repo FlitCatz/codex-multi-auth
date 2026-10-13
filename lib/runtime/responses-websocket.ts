@@ -9,6 +9,19 @@ import { parseModelRoute } from "../model-route-policy.js";
 import { isRecord } from "../utils.js";
 import { ResponseOutputHistory, hasOrphanToolResult } from "./response-output-history.js";
 
+/** Safe operational evidence only: never persist upstream reason text or payloads. */
+export interface WebSocketDisconnectDiagnostic {
+ at: number;
+ cause: "close" | "transport_error" | "invalid_event" | "buffer_limit" | "send_error";
+ stage: "awaiting_first_event" | "streaming";
+ closeCode?: number;
+}
+interface WebSocketStats {
+ connections: number;
+ upstreamConnections: number;
+ upstreamRequests: number;
+ lastDisconnect?: WebSocketDisconnectDiagnostic;
+}
 const CONTEXT_HEADER = "x-local-responses-transport";
 const terminal = new Set([
 	"response.completed",
@@ -75,11 +88,7 @@ class SocketSession {
 	closed = false;
 	constructor(
 		readonly maxBytes: number,
-		readonly stats: {
-			connections: number;
-			upstreamConnections: number;
-			upstreamRequests: number;
-		},
+		readonly stats: WebSocketStats,
 		private readonly httpFetch: typeof fetch = fetch,
 	) {}
 	close() {
@@ -251,17 +260,21 @@ class SocketSession {
 			);
 			const cleanup = () => {
 				active.off("message", onMessage);
-				active.off("close", onClose);
-				active.off("error", onClose);
+				active.off("close", onSocketClose);
+				active.off("error", onError);
 				init.signal?.removeEventListener("abort", abort);
                 context.signal.removeEventListener("abort", abort);
 			};
-			const onClose = () => {
+			const onClose = (closeCode?: number, cause: WebSocketDisconnectDiagnostic["cause"] = "close") => {
 				if (finished) return;
 				finished = true;
 				cleanup();
 				this.channels.delete(key);
                 const cancelled = context.signal.aborted || this.closed;
+                if (!cancelled) this.stats.lastDisconnect = {
+                    at: Date.now(), cause, stage: accepted ? "streaming" : "awaiting_first_event",
+                    ...(typeof closeCode === "number" ? {closeCode} : {}),
+                };
                 // Once create has been sent, a disconnect cannot prove generation
                 // did not start. Never replay it, even before the first event.
                 const error = cancelled
@@ -277,8 +290,11 @@ class SocketSession {
                     }));
                 }
 			};
+			const onSocketClose = (code: number) => onClose(code);
+			const onError = () => onClose(undefined, "transport_error");
 			const abort = () => active.terminate();
 			const onMessage = (raw: WebSocket.RawData, isBinary: boolean) => {
+				let failureCause: WebSocketDisconnectDiagnostic["cause"] = "invalid_event";
 				try {
 					if (isBinary) throw Error("Unexpected binary response");
 					const text = raw.toString();
@@ -307,8 +323,10 @@ class SocketSession {
 							}),
 						);
 					}
-					if ((streamController.desiredSize ?? 0) < -this.maxBytes)
+					if ((streamController.desiredSize ?? 0) < -this.maxBytes) {
+						failureCause = "buffer_limit";
 						throw Error("Upstream buffer exceeded");
+					}
 					streamController.enqueue(Buffer.from(`data: ${text}\n\n`));
 					if (
 						isRecord(event.response) &&
@@ -326,13 +344,13 @@ class SocketSession {
 						streamController.close();
 					}
 				} catch {
+					onClose(undefined, failureCause);
 					active.terminate();
-					onClose();
 				}
 			};
 			active.on("message", onMessage);
-			active.once("close", onClose);
-			active.once("error", onClose);
+			active.once("close", onSocketClose);
+			active.once("error", onError);
 			init.signal?.addEventListener("abort", abort, { once: true });
 			context.signal.addEventListener("abort", abort, {once:true});
             if (init.signal?.aborted || context.signal.aborted) {
@@ -341,7 +359,7 @@ class SocketSession {
 			}
 			this.stats.upstreamRequests++;
 			active.send(JSON.stringify(body), (error) => {
-				if (error) onClose();
+				if (error) onClose(undefined, "send_error");
 			});
 		});
 	}
@@ -349,7 +367,7 @@ class SocketSession {
 
 /** Adapts only the transport; authenticated HTTP routing remains the policy authority. */
 export class ResponsesWebSocketGateway {
-	readonly stats = {
+	readonly stats: WebSocketStats = {
 		connections: 0,
 		upstreamConnections: 0,
 		upstreamRequests: 0,

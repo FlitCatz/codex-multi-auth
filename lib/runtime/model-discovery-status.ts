@@ -265,7 +265,7 @@ export function formatModelInventory(
 			`    ${paint("Available:", "muted")} ${e.models.join(", ") || "none"}`,
 			...(e.entitlements ?? []).map(
 				(m) =>
-					`    ${paint(m.model, "accent")}: speeds=${m.serviceTiers.map((t) => `${t.name} (${t.id})`).join(", ") || "not advertised"}; reasoning=${m.reasoningLevels.join(", ") || "not advertised"}; programs=${m.accessPrograms.join(", ") || "not advertised"}${
+					`    ${paint(m.model, "accent")}: speeds=${m.serviceTiers.map((t) => `${t.name} (${t.id})`).join(", ") || "not advertised"}; reasoning=${m.reasoningLevels.join(", ") || "not advertised"}; ${e.kind === "oauth" ? "programs" : "configured programs"}=${m.accessPrograms.join(", ") || (e.kind === "oauth" ? "not advertised" : "none")}${
 						m.probes
 							? `; probes: ${Object.entries(m.probes)
 									.map(([k, v]) => `${k}=${paint(v, v === "verified" ? "success" : v === "unsupported" || v === "downgraded" ? "warning" : "muted")}`)

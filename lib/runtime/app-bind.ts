@@ -1,3 +1,4 @@
+import type { WebSocketDisconnectDiagnostic } from "./responses-websocket.js";
 import { withNativeBindingLock } from "./native-binding-lock.js";
 import { isRecord } from "../utils.js";
 import { hasNativeProviderConfig, rewriteNativeProviderConfig, restoreNativeProviderConfig } from "./native-provider-config.js";
@@ -87,6 +88,7 @@ export interface AppBindState {
 }
 
 export interface AppBindRouterStatus {
+	lastWebsocketDisconnect?: WebSocketDisconnectDiagnostic | null;
 	state: string | null;
 	pid: number | null;
 	startedAt?: number | null;
@@ -408,10 +410,20 @@ async function readAppBindBackup(path: string): Promise<AppBindBackup | null> {
 	};
 }
 
+function readWebsocketDisconnect(value: unknown): WebSocketDisconnectDiagnostic | null {
+ if (!isRecord(value) || typeof value.at !== "number" || !Number.isFinite(value.at) || value.at < 0) return null;
+ const { cause, stage, closeCode } = value;
+ if (cause !== "close" && cause !== "transport_error" && cause !== "invalid_event" && cause !== "buffer_limit" && cause !== "send_error") return null;
+ if (stage !== "awaiting_first_event" && stage !== "streaming") return null;
+ if (closeCode !== undefined && (typeof closeCode !== "number" || !Number.isInteger(closeCode) || closeCode < 1000 || closeCode > 4999)) return null;
+ return {at:value.at,cause,stage,...(typeof closeCode === "number" ? {closeCode} : {})};
+}
+
 async function readRouterStatus(path: string): Promise<AppBindRouterStatus | null> {
 	const record = await readJsonFile(path);
 	if (!record) return null;
 	return {
+		lastWebsocketDisconnect: readWebsocketDisconnect(record.lastWebsocketDisconnect),
 		state: readString(record, "state"),
 		pid: readNumber(record, "pid"),
 		startedAt: readNumber(record, "startedAt"),
