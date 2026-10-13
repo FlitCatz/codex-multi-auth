@@ -52,7 +52,9 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
   try{await options.check(current,signal);}catch{if(!signal.aborted)logWarn("Automatic API capability check failed; retry deferred until the next daily interval.");}
  }
 }
-export function createAutomaticApiCheck(){return async(signal:AbortSignal)=>runAutomaticApiChecks({
+export function createAutomaticApiCheck(){return async(signal:AbortSignal)=>{
+ const programRefreshBefore=Date.now()+AUTOMATIC_API_CHECK_INTERVAL_MS;
+ return runAutomaticApiChecks({
  path:join(getCodexMultiAuthDir(),"automatic-api-checks.json"),loadRoutes:loadApiRoutes,signal,
  check:async(route,stop)=>{
   let acceptedRoute=route, discoveryAccepted=true;
@@ -74,12 +76,12 @@ export function createAutomaticApiCheck(){return async(signal:AbortSignal)=>runA
    signal.throwIfAborted();
    return fetch(input,{...init,signal});
   };
-  const inventory=await discoverModelInventory(null,[route],{fetchImpl:fetcher,signal:stop,persistProbes:true,updateApiDiscovery:updateDiscovery});
+  const inventory=await discoverModelInventory(null,[route],{fetchImpl:fetcher,signal:stop,persistProbes:true,programRefreshBefore,updateApiDiscovery:updateDiscovery});
   if(stop.aborted||!discoveryAccepted)return;
   const current=(await loadApiRoutes()).find(r=>eligible(r)&&sameRoute(r,acceptedRoute));
   if(current)await saveModelInventory(inventory,{mergeEntries:true});
  },
-});}
+});};}
 /** Daily checks run off startup, never overlap, and drain on shutdown. */
 export function startAutomaticApiChecks(run:(signal:AbortSignal)=>Promise<void>){
  const controller=new AbortController();let pending:Promise<void>|undefined;let timer:ReturnType<typeof setTimeout>|undefined;

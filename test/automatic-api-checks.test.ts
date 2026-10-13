@@ -177,17 +177,27 @@ it("stops daily discovery waiting on a real probe lease without paid or late wor
   return new Response("missing",{status:404});
  });
  const owner=withFileTransactionLock(lease,async()=>{entered();await gate;});await started;
- let scheduler:ReturnType<typeof startAutomaticApiChecks>|undefined,timer:ReturnType<typeof setTimeout>|undefined;
+ let contended=false;
+ const rename=fs.rename.bind(fs);
+ const renameSpy=vi.spyOn(fs,"rename").mockImplementation(async(from,to)=>{
+  try{return await rename(from,to);}catch(error){if(String(to).endsWith(`${key}.write-lock`))contended=true;throw error;}
+ });
+ let scheduler:ReturnType<typeof startAutomaticApiChecks>|undefined;
+ let stopped=false;
  let stop:Promise<void>|undefined;
  try{
   await saveApiRoutes([credential]);
-  vi.useFakeTimers();scheduler=startAutomaticApiChecks(createAutomaticApiCheck());await vi.advanceTimersByTimeAsync(5000);vi.useRealTimers();
-  await vi.waitFor(async()=>expect((await fs.readdir(join(root,"api-probe-locks"))).some(name=>name.includes("candidate"))).toBe(true));
-  stop=scheduler.stop();
-  expect(await Promise.race([stop.then(()=>"stopped"),new Promise(resolve=>{timer=setTimeout(()=>resolve("blocked"),1000);})])).toBe("stopped");
+  vi.useFakeTimers();scheduler=startAutomaticApiChecks(createAutomaticApiCheck());await vi.advanceTimersByTimeAsync(5000);
+  await vi.waitFor(()=>expect(contended).toBe(true),{timeout:1000,interval:50});
+  stop=scheduler.stop().then(()=>{stopped=true;});
+  await vi.waitFor(()=>expect(stopped).toBe(true),{timeout:1000,interval:50});
   expect(posts).toBe(0);
  }finally{
-  clearTimeout(timer);vi.useRealTimers();release();await owner;await(stop??scheduler?.stop());mock.mockRestore();
+  release();await owner;
+  try{
+   stop??=scheduler?.stop().then(()=>{stopped=true;});
+   if(stop){await vi.waitFor(()=>expect(stopped).toBe(true),{timeout:1000,interval:50});await stop;}
+  }finally{vi.useRealTimers();renameSpy.mockRestore();mock.mockRestore();}
   if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;
  }
  expect(posts).toBe(0);

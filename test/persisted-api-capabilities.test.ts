@@ -10,6 +10,87 @@ import { createAutomaticApiCheck } from "../lib/runtime/automatic-api-checks.js"
 import { discoverModelInventory } from "../lib/runtime/model-discovery-status.js";
 import {resetPersistedApiCapabilitiesForTests} from "../lib/runtime/persisted-api-capabilities.js";
 afterEach(()=>{vi.restoreAllMocks();resetPersistedApiCapabilitiesForTests();});
+it("preserves transient backoff when scheduled program evidence is due", async () => {
+    const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
+    const root = await mkdtemp(join(tmpdir(), "automatic-program-backoff-"));
+    const previous = process.env.CODEX_MULTI_AUTH_DIR;
+    process.env.CODEX_MULTI_AUTH_DIR = root;
+    let now = 1000, posts = 0, failing = false;
+    const fetcher: typeof fetch = async (_input, init) => {
+        if (init?.method !== "POST") return new Response("missing", { status: 404 });
+        posts++;
+        if (failing) return Response.json({ error: { code: "rate_limit_exceeded" } }, { status: 429 });
+        const body = JSON.parse(String(init.body));
+        return Response.json({ status: "completed", reasoning: body.reasoning, access_programs: body.access_programs, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+    };
+    const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, visibleModels: ["fixture"], accessPrograms: { cyber: ["standard"] } };
+    const check = () => enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, { fetchImpl: fetcher, now: () => now, programRefreshBefore: now + 86400_000 });
+    try {
+        await check();
+        now++;
+        failing = true;
+        const [failed] = await check();
+        expect(failed.program_checked_at).toBe(1000);
+        expect(failed.capability_probe_status).toMatchObject({ retry: "transient" });
+        const count = posts;
+        now++;
+        await check();
+        expect(posts).toBe(count);
+        now += 60_000;
+        failing = false;
+        const [retried] = await check();
+        expect(posts).toBeGreaterThan(count);
+        expect(retried.program_checked_at).toBe(now);
+    } finally {
+        if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+        else process.env.CODEX_MULTI_AUTH_DIR = previous;
+        await removeWithRetry(root, { recursive: true, force: true });
+    }
+});
+it.each([1, 86400_000 - 300_000])("renews programs before claiming another daily interval after %s ms of live evidence", async (age) => {
+    const { loadModelInventory } = await import("../lib/runtime/model-discovery-status.js");
+    const root = await mkdtemp(join(tmpdir(), "automatic-program-horizon-"));
+    const previous = process.env.CODEX_MULTI_AUTH_DIR;
+    process.env.CODEX_MULTI_AUTH_DIR = root;
+    let now = 1000, programs = 0, posts = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fetcher: typeof fetch = async (input, init) => {
+        if (String(input).includes("/models")) return Response.json({ data: [{ id: "fixture" }] });
+        if (init?.method !== "POST") return new Response("missing", { status: 404 });
+        const body = JSON.parse(String(init.body));
+        posts++;
+        if (body.access_programs) programs++;
+        return Response.json({ status: "completed", reasoning: body.reasoning, access_programs: body.access_programs, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+    };
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetcher);
+    const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, visibleModels: ["fixture"], knownModels: ["fixture"], accessPrograms: { cyber: ["standard"] } };
+    const live = () => discoverModelInventory(null, [route], { fetchImpl: fetcher, persistProbes: true, updateApiDiscovery: async () => route });
+    try {
+        await saveApiRoutes([route]);
+        await live();
+        expect(programs).toBe(1);
+        now += age;
+        await live(); // Plain refresh keeps the independent 24-hour program cache.
+        expect(programs).toBe(1);
+        const daily = createAutomaticApiCheck();
+        const signal = new AbortController().signal;
+        await daily(signal);
+        expect(programs).toBe(2);
+        expect((await loadModelInventory())?.entries[0].entitlements?.[0].programCheckedAt).toBe(now);
+        const count = posts;
+        await daily(signal);
+        await live();
+        expect(posts).toBe(count);
+        now += 86400_000;
+        await daily(signal);
+        expect(programs).toBe(3);
+    } finally {
+        vi.restoreAllMocks();
+        if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+        else process.env.CODEX_MULTI_AUTH_DIR = previous;
+        await removeWithRetry(root, { recursive: true, force: true });
+    }
+});
 it("preserves non-probing live catalog reasoning through a documentation outage", async () => {
     const root = await mkdtemp(join(tmpdir(), "shared-api-documentation-"));
     const previous = process.env.CODEX_MULTI_AUTH_DIR;
@@ -528,9 +609,9 @@ it.each(["EACCES", "ELOCKED"])("reuses only valid readable disk evidence when le
     const route = { id: "fixture", label: "fixture", kind: "zdr" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, visibleModels: ["fixture"], accessPrograms: { cyber: ["standard"] } };
     try {
         for (const scenario of ["fresh", "expired", "future", "changed-credential", "changed-programs"]) {
-            const now = scenario === "expired" ? 901_001 : scenario === "future" ? 999 : 1000;
+            const now = scenario === "expired" ? 901_001 : scenario === "future" ? 999 : 1001;
             const current = scenario === "changed-credential" ? { ...route, apiKey: "other-key" } : scenario === "changed-programs" ? { ...route, accessPrograms: { cyber: ["daybreak_blue"] } } : route;
-            const [model] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], true, current, true, { fetchImpl: fetcher, now: () => now });
+            const [model] = await enrichPersistedApiCapabilities([{ slug: "fixture" }], true, current, true, { fetchImpl: fetcher, now: () => now, programRefreshBefore: now + 86400_000 });
             const resolved = resolveModelRoute("zdr/fixture", [{ ...current, models: [model] }], { reasoningEffort: "high", serviceTier: "priority" });
             if (scenario === "fresh") {
                 expect(model.capability_probe_status).toEqual(entry.status);

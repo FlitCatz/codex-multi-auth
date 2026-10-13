@@ -65,7 +65,10 @@ Enabled API/ZDR routes already configured with `probeCapabilities: true` receive
 small billable checks daily while a CLI/app router runs. Disable capability
 probing or the route to stop automatic probes. Live model discovery and scheduled
 checks share persisted results; program evidence expires after 24 hours even
-when other capabilities were checked recently. No credential, workspace,
+when other capabilities were checked recently. Each claimed daily pass refreshes
+program evidence that would expire before its next run, so it can repeat a full
+capability pass even after a recently completed live check. An overlapping probe completed after the daily pass
+started is reused. No credential, workspace,
 subscription priming, or request-program setting is migrated.
 
 `status`, `status --json`, and `rotation status` expose sanitized historical

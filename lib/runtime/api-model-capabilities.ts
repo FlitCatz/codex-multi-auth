@@ -133,6 +133,8 @@ export class ApiModelCapabilities {
 		private readonly probeSlot?: <T>(operation: () => Promise<T>) => Promise<T>,
 		// Keep public documentation across short-lived credential/model leases.
 		private readonly documentationSource?: ApiModelCapabilities,
+		// Scheduled checks need program evidence to last until their next run.
+		private readonly programRefreshBefore?: number,
 	) {}
 	/** Probe results keyed by an opaque hash, for a fresh CLI process to honour the 15-minute cache. */
 	exportProbes(): Array<[string, ProbeResult]> {
@@ -192,6 +194,10 @@ export class ApiModelCapabilities {
 		this.cache.set(id, { ...metadata, at: this.now() });
 		return metadata;
 	}
+	private programsCoverCheck(result: ProbeResult, programs: string[]): boolean {
+		return programsFresh(result, programs, this.now()) &&
+			(this.programRefreshBefore === undefined || (result.programCheckedAt ?? -Infinity) + 86400_000 >= this.programRefreshBefore);
+	}
 	private freshProbe(route: ApiRouteCredential, id: string, old: ProbeResult | undefined): ProbeResult | undefined {
 		// A probe cut short by 401/403/429 is retried after a minute, not trusted for 15.
 		const freshFor = old?.status.retry === "transient" ? 60_000 : 900_000;
@@ -199,7 +205,7 @@ export class ApiModelCapabilities {
 		const oldPrograms = old ? Object.keys(old.status).filter(name => name.startsWith("program:cyber:")) : [];
 		const samePrograms = oldPrograms.length === programs.length && programs.every(program => oldPrograms.includes(`program:cyber:${program}`));
 		const programCacheFresh = old && samePrograms && (programs.length
-			? programsFresh(old, programs, this.now()) || ((old.programRetry === true || (old.status.retry === "transient" && programs.some(program => old.status[`program:cyber:${program}`] === "unverified"))) && old.at + 60_000 > this.now())
+			? this.programsCoverCheck(old, programs) || ((old.programRetry === true || old.status.retry === "transient") && old.at + 60_000 > this.now())
 			: old.programCheckedAt === undefined);
 		if (old && old.at <= this.now() && old.at + freshFor > this.now() && programCacheFresh) return old;
 		return undefined;
@@ -430,7 +436,7 @@ export class ApiModelCapabilities {
 			if (effective === "verified") result.tiers.push(tier);
 		}
 		const programs = programCandidates(route, id);
-		const reusable = !force && previous && programsFresh(previous, programs, this.now());
+		const reusable = !force && previous && this.programsCoverCheck(previous, programs);
 		if (programs.length && reusable && !lostAccess && !modelDenied && !programAuthFailure) {
 			for (const program of programs) result.status[`program:cyber:${program}`] = previous.status[`program:cyber:${program}`] ?? "unverified";
 			result.programCheckedAt = previous.programCheckedAt;

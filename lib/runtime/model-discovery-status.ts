@@ -77,6 +77,8 @@ export async function discoverModelInventory(
 		forceProbes?: boolean;
 		/** Share probe results with later CLI processes through the multi-auth directory. */
 		persistProbes?: boolean;
+		/** Refresh program evidence that expires before the next scheduled check. */
+		programRefreshBefore?: number;
 	} = {},
 ): Promise<ModelInventory> {
 	const fetcher = options.fetchImpl ?? fetch,
@@ -136,7 +138,7 @@ export async function discoverModelInventory(
 	} finally {
 		await manager.flushPendingSave();
 	}
-	const capabilities = new ApiModelCapabilities(fetcher, now);
+	const capabilities = new ApiModelCapabilities(fetcher, now, undefined, undefined, options.programRefreshBefore);
 	const api = new ApiModelRuntime(
 		fetcher,
 		now,
@@ -144,7 +146,7 @@ export async function discoverModelInventory(
 		options.updateApiDiscovery
 			? (models, refresh, route, forceProbes) =>
 					options.persistProbes
-                        ? enrichPersistedApiCapabilities(models,refresh,route,forceProbes,{fetchImpl:fetcher,now,signal:options.signal})
+                        ? enrichPersistedApiCapabilities(models,refresh,route,forceProbes,{fetchImpl:fetcher,now,signal:options.signal,programRefreshBefore:options.programRefreshBefore})
                         : capabilities.enrich(models, refresh, route, forceProbes)
 			: undefined,
 	);

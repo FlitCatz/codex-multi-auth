@@ -103,7 +103,7 @@ async function enrichPersistedApiCapabilitiesImpl(
 	refresh: boolean,
 	route: ApiRouteCredential,
 	force: boolean,
-	options: { fetchImpl?: typeof fetch; now?: () => number; metadata?: ApiModelCapabilities; signal?: AbortSignal } = {},
+	options: { fetchImpl?: typeof fetch; now?: () => number; metadata?: ApiModelCapabilities; signal?: AbortSignal; programRefreshBefore?: number } = {},
 ): Promise<RouteModel[]> {
 	options.signal?.throwIfAborted();
 	const fetcher = options.fetchImpl ?? fetch;
@@ -133,7 +133,7 @@ async function enrichPersistedApiCapabilitiesImpl(
 		try {
 			return await withFileTransactionLock(join(dirname(path), "api-probe-locks", key), async () => {
 				options.signal?.throwIfAborted();
-				const capabilities = new ApiModelCapabilities(fetcher, now, withSharedProbeSlot, metadata);
+				const capabilities = new ApiModelCapabilities(fetcher, now, withSharedProbeSlot, metadata, options.programRefreshBefore);
 				let entries: Array<[string, ProbeResult]>;
 				try {
 					entries = await loadProbeCache();

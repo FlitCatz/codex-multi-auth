@@ -252,16 +252,29 @@ it("cancels a contended lease promptly without running late work or removing its
     await started;
     const controller = new AbortController();
     const action = vi.fn(async () => undefined);
+    vi.useFakeTimers();
+    let contended!: () => void;
+    const contention = new Promise<void>(resolve => { contended = resolve; });
+    const rename = fs.rename.bind(fs);
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+        try { return await rename(from, to); }
+        catch (error) { if (String(to).endsWith("state.write-lock")) contended(); throw error; }
+    });
     const waiting = withFileTransactionLock(path, action, {waitMs: 60_000, signal: controller.signal});
-    const settled = waiting.then(() => "completed", () => "aborted");
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let outcome: string | undefined;
+    const settled = waiting.then(() => { outcome = "completed"; }, () => { outcome = "aborted"; });
     try {
-        await vi.waitFor(async () => expect((await readdir(dir)).some(name => name.includes("candidate"))).toBe(true));
+        await contention;
         controller.abort();
-        expect(await Promise.race([settled, new Promise(resolve => { timer = setTimeout(() => resolve("blocked"), 1000); })])).toBe("aborted");
+        // waitFor advances fake retry timers while real filesystem cleanup drains.
+        await vi.waitFor(() => expect(outcome).toBe("aborted"), {timeout: 1000, interval: 50});
         expect(action).not.toHaveBeenCalled();
         expect((await readdir(dir)).filter(name => name.includes("candidate"))).toEqual([]);
         expect((await readdir(dir)).some(name => name.endsWith("write-lock"))).toBe(true);
-    } finally { clearTimeout(timer); release(); await owner; await settled; }
+    } finally {
+        release(); await owner;
+        try { await vi.waitFor(() => expect(outcome).toBeDefined(), {timeout: 1000, interval: 50}); await settled; }
+        finally { renameSpy.mockRestore(); vi.useRealTimers(); }
+    }
     expect(action).not.toHaveBeenCalled();
 });
