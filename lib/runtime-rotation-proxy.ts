@@ -1997,7 +1997,11 @@ async function handleRequestInner(
 						candidate.accountId === previous.accountId && sanitizeEmail(candidate.email) === sourceEmail))
 					: null) ??
 				(previous.accountId
-					? uniqueAccount(compatible.filter((candidate) => candidate.accountId === previous.accountId))
+					? uniqueAccount(compatible.filter((candidate) => {
+						if (candidate.accountId !== previous.accountId) return false;
+						const candidateEmail = sanitizeEmail(candidate.email);
+						return !sourceEmail || !candidateEmail || candidateEmail === sourceEmail;
+					}))
 					: null)
 			);
 		};

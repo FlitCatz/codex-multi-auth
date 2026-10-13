@@ -764,6 +764,46 @@ describe("runtime transcription proxy", () => {
 		expect(calls[0]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("acc_1");
 	});
 
+	it("fails closed when a removed pinned legacy login has a different-email accountId sibling", async () => {
+		const now = Date.now();
+		const legacyStorage = createStorage(now, 1);
+		const legacyRow = legacyStorage.accounts[0];
+		if (!legacyRow) throw new Error("missing legacy row");
+		delete legacyRow.recordId;
+		const manager = new AccountManager(undefined, legacyStorage);
+		const stale = manager.getAccountByIndex(0);
+		if (!stale) throw new Error("missing stale legacy account");
+		manager.markAuthInvalidated(stale, "test_invalidated");
+
+		const replacementStorage = createStorage(now, 1);
+		const siblingRow = replacementStorage.accounts[0];
+		if (!siblingRow) throw new Error("missing sibling row");
+		delete siblingRow.recordId;
+		siblingRow.accountId = legacyRow.accountId;
+		siblingRow.email = "different-member@example.com";
+		siblingRow.refreshToken = "different-refresh";
+		siblingRow.accessToken = "different-access";
+		const replacement = new AccountManager(undefined, replacementStorage);
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(replacement);
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ text: "wrong login" }), {
+				status: HTTP_STATUS.OK,
+				headers: { "content-type": "application/json" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl, { forcedAccountIndex: 0 });
+
+		const response = await postTranscribe(proxy, Buffer.from("--removed-legacy-pin--\r\n"));
+		const payload = (await response.json()) as { error: { code: string; reason: string | null } };
+
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(payload.error).toMatchObject({
+			code: "codex_pinned_account_unavailable",
+			reason: "missing",
+		});
+		expect(calls).toHaveLength(0);
+	});
+
 	it("preserves inference updates that arrive while credential reload is pending", async () => {
 		const now = Date.now();
 		const manager = new AccountManager(undefined, createStorage(now, 1));
