@@ -131,8 +131,19 @@ export function resolveRuntimeRefreshTarget(
 					candidate.accountId === account.accountId && sanitizeEmail(candidate.email) === sourceEmail,
 			)
 			: null) ??
+		// accountId alone cannot merge logins: two members of one workspace share
+		// it. When both rows carry known-but-different emails they are different
+		// logins, and the in-flight refresh belongs to the removed one — let the
+		// caller restart selection instead of adopting the sibling's credentials.
 		(account.accountId
-			? uniqueMatch(compatibleAccounts, (candidate) => candidate.accountId === account.accountId)
+			? uniqueMatch(
+				compatibleAccounts,
+				(candidate) =>
+					candidate.accountId === account.accountId &&
+					(!sourceEmail ||
+						!sanitizeEmail(candidate.email) ||
+						sanitizeEmail(candidate.email) === sourceEmail),
+			)
 			: null) ??
 		(sourceEmail
 			? uniqueMatch(compatibleAccounts, (candidate) => sanitizeEmail(candidate.email) === sourceEmail)

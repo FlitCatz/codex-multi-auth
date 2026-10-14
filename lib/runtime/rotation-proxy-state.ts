@@ -152,6 +152,24 @@ function carryRotatedCredentials(
 		live.access = previous.access;
 		live.refreshToken = previous.refreshToken;
 		live.expires = previous.expires;
+		// Token-bound identity (accountId/accountIdSource/email) rides along with
+		// the rotated credential — `commitRefreshedAuth` can refresh it during the
+		// same window, and without it the row keeps a workspace binding issued for
+		// the spent token. Explicit manual/org bindings stay authoritative.
+		const tokenBoundIdentityChanged =
+			baseline.accountId !== previous.accountId ||
+			baseline.accountIdSource !== previous.accountIdSource;
+		const liveHasExplicitBinding =
+			live.accountIdSource === "manual" || live.accountIdSource === "org";
+		const previousHasTokenBinding =
+			previous.accountIdSource === "token" || previous.accountIdSource === "id_token";
+		if (tokenBoundIdentityChanged && previousHasTokenBinding && !liveHasExplicitBinding) {
+			live.accountId = previous.accountId;
+			live.accountIdSource = previous.accountIdSource;
+		}
+		if (baseline.email !== previous.email) {
+			live.email = previous.email;
+		}
 	}
 }
 
@@ -444,11 +462,16 @@ export async function reloadRuntimeCredentials(
 			const sameCredential =
 				live.access === previous.access && live.refreshToken === previous.refreshToken;
 			// Auth-invalidation and workspace-disable markers are written in memory
-			// first and only reach disk through the debounced save. Carry them while
-			// the credential is unchanged so a mid-window reload cannot re-admit the
-			// account; a re-login (rotated credential) legitimately clears them.
+			// first and only reach disk through the debounced save. Carry only a
+			// marker that landed during the load window (absent from the baseline):
+			// a pre-existing marker may have been legitimately cleared on disk by
+			// another process, which is then authoritative. A re-login (rotated
+			// credential) legitimately clears them either way.
+			const baselineInvalidated =
+				baseline !== undefined && previousManager.isAccountAuthInvalidated(baseline);
 			if (
 				sameCredential &&
+				!baselineInvalidated &&
 				previousManager.isAccountAuthInvalidated(previous) &&
 				!reloaded.isAccountAuthInvalidated(live)
 			) {
@@ -457,6 +480,12 @@ export async function reloadRuntimeCredentials(
 			}
 			if (sameCredential) {
 				for (const workspace of previous.workspaces ?? []) {
+					const baselineWorkspace = baseline?.workspaces?.find(
+						(item) => item.id === workspace.id,
+					);
+					// A disable that predates the load is already in the baseline —
+					// disk may have re-enabled the workspace, and that wins.
+					if (baselineWorkspace?.enabled === false) continue;
 					const target = live.workspaces?.find((item) => item.id === workspace.id);
 					if (
 						target &&

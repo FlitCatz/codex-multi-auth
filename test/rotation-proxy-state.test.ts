@@ -485,6 +485,35 @@ describe("reloadRuntimeCredentials", () => {
 			disabledAt: NOW,
 		});
 	});
+
+	it("does not resurrect a pre-existing disable over an external re-enable", async () => {
+		const initialStorage = storageWith(1);
+		initialStorage.accounts[0]!.workspaces = [{ id: "w-1", enabled: true }];
+		const resident = new AccountManager(undefined, initialStorage);
+		const state = createRotationProxyState({ ...stateInit(), activeAccountManager: resident });
+		const previous = resident.getAccountByIndex(0);
+		if (!previous?.workspaces?.[0]) throw new Error("missing resident account");
+		// The disable lands BEFORE the reload starts, so it is part of the
+		// baseline — another process has since re-enabled the workspace on disk.
+		previous.workspaces[0].enabled = false;
+		previous.workspaces[0].disabledAt = NOW - 5_000;
+		previous.authInvalidatedAt = NOW - 5_000;
+
+		const diskStorage = storageWith(2);
+		diskStorage.accounts[0]!.workspaces = [{ id: "w-1", enabled: true }];
+		const reloaded = new AccountManager(undefined, diskStorage);
+		loadFromDisk.mockResolvedValueOnce(reloaded);
+
+		const result = await reloadRuntimeCredentials(state);
+		const active = result?.getAccountByIndex(0);
+		if (!active) throw new Error("missing reloaded account");
+
+		// Disk is authoritative for pre-existing markers: the external re-enable
+		// and cleared invalidation must not be undone by the resident's stale state.
+		expect(result).toBe(reloaded);
+		expect(active.workspaces?.[0]).toMatchObject({ id: "w-1", enabled: true });
+		expect(reloaded.isAccountAuthInvalidated(active)).toBe(false);
+	});
 });
 
 describe("recoverStaleRuntimeState", () => {
@@ -689,6 +718,73 @@ describe("recoverStaleRuntimeState", () => {
 		expect(active?.expires).toBe(NOW + 7_200_000);
 	});
 
+	it("carries token-bound identity alongside the rotated credential", async () => {
+		const initialStorage = storageWith(1);
+		initialStorage.accounts[0]!.recordId = "row-a";
+		const resident = new AccountManager(undefined, initialStorage);
+		const state = createRotationProxyState({ ...stateInit(), activeAccountManager: resident });
+		const previous = resident.getAccountByIndex(0);
+		if (!previous) throw new Error("missing resident account");
+		previous.expires = NOW + 10_000;
+
+		const reloaded = new AccountManager(undefined, structuredClone(initialStorage));
+		let signalLoadStarted!: () => void;
+		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
+		let releaseLoad!: () => void;
+		const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+		loadFromDisk.mockImplementationOnce(async () => {
+			signalLoadStarted();
+			await loadGate;
+			return reloaded;
+		});
+
+		let releaseCommit!: () => void;
+		const commitGate = new Promise<void>((resolve) => { releaseCommit = resolve; });
+		vi.spyOn(resident, "commitRefreshedAuth").mockImplementationOnce(async (_source, auth) => {
+			await commitGate;
+			previous.access = auth.access;
+			previous.refreshToken = auth.refresh;
+			previous.expires = auth.expires;
+			// The refresh response also rebinds the token-derived identity; both
+			// must land on the reloaded row or it keeps a stale workspace binding.
+			previous.accountId = "acc_rotated_workspace";
+			previous.accountIdSource = "token";
+			previous.email = "rotated@example.com";
+			return previous;
+		});
+		queuedRefreshMock.mockResolvedValueOnce({
+			type: "success",
+			access: "access-rotated",
+			refresh: "refresh-rotated",
+			expires: NOW + 7_200_000,
+		});
+
+		const recoveryPending = recoverStaleRuntimeState(state);
+		await loadStarted;
+		const refreshPending = ensureFreshAccessToken({
+			accountManager: resident,
+			account: previous,
+			family: "gpt-5-codex",
+			model: null,
+			now: NOW,
+			tokenRefreshSkewMs: 30_000,
+			tokenInvalidationCooldownMs: 300_000,
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		releaseLoad();
+		releaseCommit();
+		await refreshPending;
+		const result = await recoveryPending;
+		const active = result?.getAccountByIndex(0);
+
+		expect(state.activeAccountManager).toBe(reloaded);
+		expect(active?.access).toBe("access-rotated");
+		expect(active?.refreshToken).toBe("refresh-rotated");
+		expect(active?.accountId).toBe("acc_rotated_workspace");
+		expect(active?.accountIdSource).toBe("token");
+		expect(active?.email).toBe("rotated@example.com");
+	});
+
 	it("abandons the recovered snapshot when a concurrent swap wins mid-load", async () => {
 		const state = createRotationProxyState(stateInit());
 		const previousManager = state.activeAccountManager;
@@ -802,6 +898,31 @@ describe("resolveRuntimeRefreshTarget", () => {
 		const replacement = new AccountManager(undefined, replacementStorage);
 		redirectRuntimeRefreshCommits(previousManager, replacement);
 
+		expect(resolveRuntimeRefreshTarget(previousManager, previous)).toBeNull();
+	});
+
+	it("rejects an accountId fallback onto a different-email workspace member", () => {
+		const initialStorage = storageWith(1);
+		initialStorage.accounts[0]!.accountId = "workspace-shared";
+		initialStorage.accounts[0]!.workspaces = [{ id: "workspace-shared", enabled: true }];
+		const previousManager = new AccountManager(undefined, initialStorage);
+		const previous = previousManager.getAccountByIndex(0);
+		if (!previous) throw new Error("missing resident account");
+		// Legacy login: derived record id, so the refresh falls through to the
+		// accountId fallback. The original row was removed from the pool.
+		expect(previousManager.hasPersistedRecordId(previous)).toBe(false);
+
+		const replacementStorage = storageWith(1);
+		replacementStorage.accounts[0]!.email = "other-member@example.com";
+		replacementStorage.accounts[0]!.accountId = "workspace-shared";
+		replacementStorage.accounts[0]!.refreshToken = "refresh-other";
+		replacementStorage.accounts[0]!.workspaces = [{ id: "workspace-shared", enabled: true }];
+		const replacement = new AccountManager(undefined, replacementStorage);
+		redirectRuntimeRefreshCommits(previousManager, replacement);
+
+		// The sibling member shares the workspace accountId but is a different
+		// login — the refresh belongs to the removed row, so it must not commit
+		// onto the sibling (which would skip its own cooldown/policy checks).
 		expect(resolveRuntimeRefreshTarget(previousManager, previous)).toBeNull();
 	});
 });

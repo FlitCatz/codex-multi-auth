@@ -1908,8 +1908,15 @@ async function handleRequestInner(
 					? uniqueAccount(compatible.filter((candidate) =>
 						candidate.accountId === previous.accountId && sanitizeEmail(candidate.email) === sourceEmail))
 					: null) ??
+				// accountId alone cannot merge logins: two members of one workspace
+				// share it. Known-but-different emails are different logins, so the
+				// remap must not adopt the sibling row for the removed account.
 				(previous.accountId
-					? uniqueAccount(compatible.filter((candidate) => candidate.accountId === previous.accountId))
+					? uniqueAccount(compatible.filter((candidate) =>
+						candidate.accountId === previous.accountId &&
+							(!sourceEmail ||
+								!sanitizeEmail(candidate.email) ||
+								sanitizeEmail(candidate.email) === sourceEmail)))
 					: null) ??
 				(sourceEmail
 					? uniqueAccount(compatible.filter((candidate) => sanitizeEmail(candidate.email) === sourceEmail))
