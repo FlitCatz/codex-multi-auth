@@ -4095,6 +4095,9 @@ describe("sequential mode survives the routing-mutex path (issue #509)", () => {
 			metadata: { session_id: session },
 		});
 
+		process.env.CODEX_AUTH_SCHEDULING_STRATEGY = "hybrid";
+		expect(proxy.getStatus().schedulingStrategy).toBe("sequential");
+
 		// Distinct sessions so any per-session affinity would scatter them; sequential
 		// mode must ignore affinity and keep all three on the same active account.
 		for (const session of ["s-1", "s-2", "s-3"]) {

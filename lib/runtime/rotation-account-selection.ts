@@ -119,8 +119,13 @@ export function chooseAccount(params: {
   }
 		const tier = Math.min(...candidates.map(a => priorities[a.index] ?? 1));
 		const tierIndexes = new Set(candidates.filter(a => (priorities[a.index] ?? 1) === tier).map(a => a.index));
-		let preferred = params.preferredIndex;
-  if (quotaByAccount) {
+		// Runtime policy fills default priority 1 even without a configured order.
+		const useSavedOrder = schedulingStrategy === "sequential" &&
+			Object.values(priorities).some(priority => priority !== 1);
+		let preferred = useSavedOrder
+			? candidates.find(account => tierIndexes.has(account.index))?.index
+			: params.preferredIndex;
+  if (quotaByAccount && schedulingStrategy !== "sequential") {
    // Rank only measured accounts: "no data" compares equal to everything, which
    // is not transitive and would make the winner depend on storage order.
    const ranked = candidates.flatMap(a=>{
@@ -135,19 +140,26 @@ export function chooseAccount(params: {
    }
   }
 		// Re-evaluate tiers on every attempt. Never persist a temporary tier block.
-		return chooseAccount({
+		const selected = chooseAccount({
 			...params,
 			policy: {
 				...policy,
 				priorityByAccount: undefined,
 				blockedAccountIndexes: new Set([
 					...policy.blockedAccountIndexes,
-					...accountManager.getAccountsSnapshot().filter(a => !tierIndexes.has(a.index)).map(a => a.index),
+					// A retry alone must not make a healthy sequential primary unusable.
+					...accountManager.getAccountsSnapshot().filter(a => !tierIndexes.has(a.index) && (
+						schedulingStrategy !== "sequential" || !attemptedIndexes.has(a.index) ||
+						quotaByAccount?.[a.index]?.exhausted ||
+						(hasNonReserve && usesSubscriptionReserve(quotaByAccount?.[a.index]))
+					)).map(a => a.index),
 				]),
 			},
 			fallbackPinnedIndex: null,
 			pinnedIndex: typeof preferred === "number" && tierIndexes.has(preferred) ? preferred : null,
 		});
+		if (selected && schedulingStrategy === "sequential") selected.lastUsed = now;
+		return selected;
 	}
 
 	// Manual pin (from `codex-multi-auth switch <n>`) overrides every other

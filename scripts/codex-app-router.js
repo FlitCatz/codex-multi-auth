@@ -200,6 +200,7 @@ function createStatusPayload({
 			null,
 		updatedAt: Date.now(),
 		baseUrl: proxyServer?.baseUrl ?? stateRecord?.baseUrl ?? null,
+		schedulingStrategy: proxyStatus.schedulingStrategy,
 		totalRequests: proxyStatus.totalRequests ?? 0,
 		upstreamRequests: proxyStatus.upstreamRequests ?? 0,
 		websocketConnections: proxyStatus.websocketConnections ?? 0,

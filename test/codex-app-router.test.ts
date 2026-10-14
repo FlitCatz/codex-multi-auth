@@ -48,6 +48,7 @@ function createRouterFixture(root: string, options: { withProxyModule?: boolean 
 				"    baseUrl: `http://${options.host}:${options.port || 4567}`,",
 				"    close: async () => marker('close'),",
 				"    getStatus: () => ({",
+				"      schedulingStrategy: 'sequential',",
 				"      totalRequests: 2,",
 				"      upstreamRequests: 1,",
 				"      websocketConnections: 3,",
@@ -137,6 +138,7 @@ describe("codex app router daemon", () => {
 			expect(running.kind).toBe("codex-app-runtime-rotation-router");
 			expect(running.startedAt).toBeTypeOf("number");
 			expect(running.baseUrl).toBe("http://127.0.0.1:4567");
+			expect(running.schedulingStrategy).toBe("sequential");
 			expect(running.lastAccountLabel).toBe("Account 2");
 			expect(running.websocketConnections).toBe(3);
 			expect(running.websocketUpstreamRequests).toBe(7);

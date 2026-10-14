@@ -89,6 +89,7 @@ export interface AppBindState {
 
 export interface AppBindRouterStatus {
 	lastWebsocketDisconnect?: WebSocketDisconnectDiagnostic | null;
+	schedulingStrategy?: "hybrid" | "sequential";
 	state: string | null;
 	pid: number | null;
 	startedAt?: number | null;
@@ -429,6 +430,8 @@ async function readRouterStatus(path: string): Promise<AppBindRouterStatus | nul
 	if (!record) return null;
 	return {
 		lastWebsocketDisconnect: readWebsocketDisconnect(record.lastWebsocketDisconnect),
+		schedulingStrategy: record.schedulingStrategy === "hybrid" || record.schedulingStrategy === "sequential"
+			? record.schedulingStrategy : undefined,
 		state: readString(record, "state"),
 		pid: readNumber(record, "pid"),
 		startedAt: readNumber(record, "startedAt"),

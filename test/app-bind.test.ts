@@ -2095,6 +2095,20 @@ describe("orphaned app-bind recovery (#614)", () => {
 	});
 });
 
+it.each([
+	["sequential", "sequential"],
+	["hybrid", "hybrid"],
+	["unknown", undefined],
+	[undefined, undefined],
+] as const)("reads router scheduling strategy %s with backward-compatible validation", async (value, expected) => {
+	const root = await createTempRoot("app-bind-router-strategy-");
+	const options = { platform: "linux" as const, home: root, env: { CODEX_MULTI_AUTH_DIR: join(root, "multi-auth") } };
+	const paths = resolveAppBindPaths(options);
+	await mkdir(dirname(paths.statusPath), { recursive: true });
+	await writeFile(paths.statusPath, JSON.stringify({ state: "running", schedulingStrategy: value }));
+	expect((await getAppBindStatus(options)).router?.schedulingStrategy).toBe(expected);
+});
+
 describe("native app binding", () => {
 	it("persists reference identity and restores unrelated config edits on unbind", async () => {
 		const root = await createTempRoot("native-app-bind-");

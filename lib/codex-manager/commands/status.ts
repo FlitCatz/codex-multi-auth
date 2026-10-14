@@ -7,6 +7,7 @@ import { inferenceAccountKey } from "../../runtime/inference-activity.js";
 import type { ApiRouteCredential } from "../../api-route-store.js";
 import { modelScopeId } from "../../runtime/workspace-model-scopes.js";
 import { loadAccountPolicyStore, getAccountPolicyKey } from "../../account-policy.js";
+import { getSchedulingStrategy, loadPluginConfig } from "../../config.js";
 import { formatModelInventory, type ModelInventory } from "../../runtime/model-discovery-status.js";
 import {
 	AUTH_INVALIDATION_MARKER,
@@ -264,10 +265,20 @@ export async function runStatusCommand(
  const quotaPreferences = forecastQuotas.map(quota=>subscriptionQuotaPreference(quota,now));
  const automaticOrder = new Map<number,number>();
  if (appBindStatus?.nativeOpenai) {
-  const candidates=storage.accounts.map((account,index)=>({account,index,quota:quotaPreferences[index] ?? subscriptionQuotaPreference(null,now),tier:accountPolicies.accounts[getAccountPolicyKey(account,index)]?.priority ?? 1}))
-   .filter(a=>forecastResults[a.index]?.availability === "ready" && !a.quota.exhausted);
-  candidates.sort((a,b)=>Number(usesSubscriptionReserve(a.quota))-Number(usesSubscriptionReserve(b.quota)) ||
-   a.tier-b.tier || compareSubscriptionQuota(a.quota,b.quota) || Number(b.index===activeIndex)-Number(a.index===activeIndex) || a.index-b.index);
+  const schedulingStrategy = appBindStatus.schedulingStrategy ?? getSchedulingStrategy(loadPluginConfig());
+  let candidates=storage.accounts.map((account,index)=>({account,index,quota:quotaPreferences[index] ?? subscriptionQuotaPreference(null,now),tier:accountPolicies.accounts[getAccountPolicyKey(account,index)]?.priority ?? 1}));
+  const useSavedOrder = candidates.some(account => account.tier !== 1);
+  candidates = candidates.filter(a=>forecastResults[a.index]?.availability === "ready" && !a.quota.exhausted);
+  candidates.sort((a,b)=>{
+   const tierOrder = Number(usesSubscriptionReserve(a.quota))-Number(usesSubscriptionReserve(b.quota)) || a.tier-b.tier;
+   if (tierOrder) return tierOrder;
+   if (schedulingStrategy === "sequential") {
+    if (useSavedOrder) return a.index-b.index;
+    const count = storage.accounts.length;
+    return (a.index-activeIndex+count)%count - (b.index-activeIndex+count)%count;
+   }
+   return compareSubscriptionQuota(a.quota,b.quota) || Number(b.index===activeIndex)-Number(a.index===activeIndex) || a.index-b.index;
+  });
   // A switch pin is strict in native mode too: no other account is tried, so none gets an order.
   const pinned=typeof storage.pinnedAccountIndex==="number" ? candidates.filter(a=>a.index===storage.pinnedAccountIndex) : candidates;
   pinned.forEach((a,index)=>{automaticOrder.set(a.index,index+1);});
@@ -468,7 +479,7 @@ export async function runStatusCommand(
   if (appBindStatus?.nativeOpenai) {
    const preference=quotaPreferences[i];
    const order=automaticOrder.get(i);
-   const reset=preference?.resetAtMs ? `; limiting window resets in ${formatWaitTime(Math.max(0,preference.resetAtMs-now))}` : "; reset ordering unknown; run check";
+   const reset=preference?.resetAtMs ? `; limiting window resets in ${formatWaitTime(Math.max(0,preference.resetAtMs-now))}` : "; quota reset unknown; run check";
    const reserve=usesSubscriptionReserve(preference)?`; ${SUBSCRIPTION_RESERVE_PERCENT}% reserve (last resort)`:"";
    const pinnedElsewhere=typeof storage.pinnedAccountIndex==="number" && storage.pinnedAccountIndex!==i;
    logInfo(paint(`   automatic order: ${order ? `#${order}` : pinnedElsewhere ? `none (account ${(storage.pinnedAccountIndex ?? 0)+1} is pinned)` : "unavailable"}${reset}${reserve}`,reserve?"warning":"accent"));

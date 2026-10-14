@@ -368,6 +368,10 @@ codex-multi-auth account policy list [--json]
   pick tiers 1–9, 9 recommended). A stored `switch` pin is strict and overrides
   tiers entirely. Eligibility (requested model/reasoning/speed) is filtered
   before priority applies. `account policy list` and `status` show priorities.
+  In sequential mode, setting any priority to a value other than the default
+  `1` makes equal-priority accounts follow saved list order; quota reset timing
+  and active-account preference do not change that order. With all priorities
+  at `1`, sequential mode keeps the healthy active cursor.
 - `tag` values normalize to lowercase filesystem-safe labels and interact with
   routing-profile preferred/avoid tags.
 
@@ -423,8 +427,14 @@ soft preference inside its first eligible tier; a stored `switch` pin is strict.
 
 For native subscription requests, `automatic order` estimates routing order
 from the last check: eligible accounts above a 5% quota reserve go first, then
-configured tiers, earliest limiting-window reset, and remaining percentage as
-tie-breaker. API/ZDR pools are never automatic paid fallbacks for subscription
+configured tiers. Hybrid mode ranks each tier by earliest limiting-window reset
+and remaining percentage. Sequential mode follows saved list order when any
+priority differs from `1`; with all priorities at `1`, it follows the active
+cursor and wraps the saved pool. The text `automatic order` and JSON
+`automaticOrder` fields use the running router's scheduling strategy when
+reported; older routers fall back to the current configuration. Requested
+models/workspaces and live health can still change this cached estimate.
+API/ZDR pools are never automatic paid fallbacks for subscription
 requests, and explicit strict invocation pins bypass the whole order.
 
 ---
