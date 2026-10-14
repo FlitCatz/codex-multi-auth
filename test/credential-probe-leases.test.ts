@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { clearCredentialSidecars } from "../lib/storage/credential-sidecars.js";
 import { withFileTransactionLock } from "../lib/storage/file-lock.js";
@@ -18,23 +18,28 @@ it("wipes crashed published and candidate probe locks, including a prior interru
  expect(await fs.readdir(root)).not.toEqual(expect.arrayContaining([expect.stringMatching(/^api-probe-locks/)]));
  expect(await fs.readFile(join(root,"unrelated"),"utf8")).toBe("preserve");
 });
-it("old holder and candidate cleanup cannot remove a replacement probe lease after wipe",async()=>{
+it.each(["POSIX","Windows"])("old holder and candidate cleanup preserve a replacement lease with %s path spelling",async style=>{
  const path=join(root,"api-probe-locks","b".repeat(64));
- let enterOld!:()=>void,releaseOld!:()=>void,enterCandidate!:()=>void,releaseCandidate!:()=>void,enterNew!:()=>void,releaseNew!:()=>void;
+ let enterOld!:()=>void,releaseOld!:()=>void,enterCandidate!:(matched:boolean)=>void,releaseCandidate!:()=>void,enterNew!:()=>void,releaseNew!:()=>void;
  const oldEntered=new Promise<void>(r=>enterOld=r),oldGate=new Promise<void>(r=>releaseOld=r);
- const candidateEntered=new Promise<void>(r=>enterCandidate=r),candidateGate=new Promise<void>(r=>releaseCandidate=r);
+ const candidateEntered=new Promise<boolean>(r=>enterCandidate=r),candidateGate=new Promise<void>(r=>releaseCandidate=r);
  const newEntered=new Promise<void>(r=>enterNew=r),newGate=new Promise<void>(r=>releaseNew=r);
  const old=withFileTransactionLock(path,async()=>{enterOld();await oldGate;});
  await oldEntered;
  const rename=fs.rename.bind(fs);let block=true;
  vi.spyOn(fs,"rename").mockImplementation(async(from,to)=>{
-  if(block&&String(to).endsWith(`/${"b".repeat(64)}.write-lock`)){block=false;enterCandidate();await candidateGate;}
+  if(block){
+   // Exercise both platform spellings while renaming the native filesystem path.
+   const destination=String(to).replaceAll("\\","/").replaceAll("/",style==="Windows"?"\\":"/");
+   const matched=win32.basename(destination)===`${"b".repeat(64)}.write-lock`;
+   block=false;enterCandidate(matched);if(matched)await candidateGate;
+  }
   return rename(from,to);
  });
  let waiter:Promise<unknown>|undefined,replacement:Promise<unknown>|undefined;
  try{
   waiter=withFileTransactionLock(path,async()=>{throw Error("Old candidate must not acquire");}).catch(error=>error);
-  await candidateEntered;
+  expect(await candidateEntered).toBe(true);
   await clearCredentialSidecars();
   await expect(fs.stat(join(root,"api-probe-locks"))).rejects.toMatchObject({code:"ENOENT"});
   replacement=withFileTransactionLock(path,async()=>{enterNew();await newGate;});await newEntered;
