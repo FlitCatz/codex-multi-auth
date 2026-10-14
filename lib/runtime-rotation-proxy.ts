@@ -121,10 +121,11 @@ import {
 	withTimeout,
 } from "./request/stream-failover-runtime.js";
 import { getAccountRecoveryBoundsForFamily } from "./runtime/account-status.js";
-import { chooseAccount } from "./runtime/rotation-account-selection.js";
+import { chooseAccount, chooseTranscriptionAccount } from "./runtime/rotation-account-selection.js";
 import {
 	createRotationProxyState,
 	recoverStaleRuntimeState,
+	reloadRuntimeCredentials,
 	type RotationProxyState,
 } from "./runtime/rotation-proxy-state.js";
 import type {
@@ -141,6 +142,8 @@ import {
 	applyMonotonicAuthCooldown,
 	DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
 	ensureFreshAccessToken,
+	redirectRuntimeRefreshCommits,
+	resolveRuntimeRefreshTarget,
 } from "./runtime/rotation-token-refresh.js";
 import { SessionAffinityStore } from "./session-affinity.js";
 import type { RequestBody } from "./types.js";
@@ -531,6 +534,9 @@ const ALLOWED_IMAGE_PATHS = new Set([
 	"/images/edits",
 	"/v1/images/generations",
 	"/v1/images/edits",
+]);
+const ALLOWED_TRANSCRIBE_PATHS = new Set<string>([
+	URL_PATHS.TRANSCRIBE,
 ]);
 const ALLOWED_THREAD_GOAL_PATHS = new Set([
 	"/thread/goal/get",
@@ -978,6 +984,23 @@ function buildImageRequestContext(
 	};
 }
 
+function buildTranscribeRequestContext(
+	req: IncomingMessage,
+	body: Buffer,
+): RequestContext {
+	return {
+		body,
+		headers: headersFromIncoming(req),
+		method: "POST",
+		upstreamPath: URL_PATHS.TRANSCRIBE,
+		model: null,
+		family: "codex",
+		stream: false,
+		sessionKey: null,
+		stableSessionKey: null,
+	};
+}
+
 function buildModelsRequestContext(req: IncomingMessage): RequestContext {
 	return {
 		body: Buffer.alloc(0),
@@ -1050,7 +1073,7 @@ function writeMethodOrPathError(res: ServerResponse): void {
 	writeJson(res, 404, {
 		error: {
 			message:
-				"Runtime rotation proxy only accepts Responses API, images, model discovery, and Codex thread goal requests.",
+				"Runtime rotation proxy only accepts Responses API, images, transcription, model discovery, and Codex thread goal requests.",
 			code: "runtime_rotation_proxy_not_found",
 		},
 	});
@@ -1072,9 +1095,10 @@ function writePoolExhausted(params: {
 	model: string | null;
 	reason: ExhaustionReason;
 	accountSkipReasons?: Record<string, string>;
+	retryAfterMs?: number;
 }): void {
 	const { res, accountManager, family, model, reason } = params;
-	const waitMs = accountManager.getMinWaitTimeForFamily(family, model);
+	const waitMs = params.retryAfterMs ?? accountManager.getMinWaitTimeForFamily(family, model);
 	const accountCount = accountManager.getAccountCount();
 	const accountSkipReasons = params.accountSkipReasons ?? {};
 	recordRuntimePoolExhaustion({
@@ -1413,8 +1437,10 @@ async function handleRequestInner(
 			const accounts = accountManager.getAccountsSnapshot();
 			const sameInventory = accounts.length === disk.accounts.length && accounts.every((a, i) => isSameNativeAccount(a, disk.accounts[i]));
 			if (!sameInventory) {
+				const previousManager = accountManager;
 				accountManager = new AccountManager(undefined, disk);
 				accountManager.setRoutingMutexMode(state.routingMutexMode);
+				redirectRuntimeRefreshCommits(previousManager, accountManager);
                 // Preserve independently learned limits by identity, never by the old index.
                 // A record id survives an email change; the account identity survives a
                 // re-login that re-derives an unstored record id. Rows with neither an
@@ -1486,12 +1512,14 @@ async function handleRequestInner(
 			req.method === "GET" && isModelsPath(incomingUrl.pathname);
 		const isImageRequest =
 			req.method === "POST" && ALLOWED_IMAGE_PATHS.has(incomingUrl.pathname);
+		const isTranscribeRequest =
+			req.method === "POST" && ALLOWED_TRANSCRIBE_PATHS.has(incomingUrl.pathname);
 		const isThreadGoalRequest =
 			(req.method === "GET" || req.method === "POST") &&
 			isThreadGoalPath(incomingUrl.pathname);
 		if (
 			!isResponsesRequest && !isModelsRequest &&
-			!isThreadGoalRequest && !isImageRequest
+			!isThreadGoalRequest && !isImageRequest && !isTranscribeRequest
 		) {
 			writeMethodOrPathError(res);
 			return;
@@ -1499,7 +1527,7 @@ async function handleRequestInner(
 
 		state.status.totalRequests += 1;
 		let requestBody =
-			isResponsesRequest || isImageRequest ||
+			isResponsesRequest || isImageRequest || isTranscribeRequest ||
 			(isThreadGoalRequest && req.method === "POST")
 				? await readRequestBody(req, state.maxRequestBodyBytes)
 				: Buffer.alloc(0);
@@ -1523,7 +1551,9 @@ async function handleRequestInner(
 				? buildThreadGoalRequestContext(req, requestBody, incomingUrl.pathname)
 				: isImageRequest
 					? buildImageRequestContext(req, requestBody, incomingUrl.pathname)
-						: buildResponsesRequestContext(req, requestBody);
+					: isTranscribeRequest
+						? buildTranscribeRequestContext(req, requestBody)
+							: buildResponsesRequestContext(req, requestBody);
 		if (isResponsesRequest) {
 			context.headers.delete("content-encoding");
 			context.headers.delete("content-length");
@@ -1578,7 +1608,9 @@ async function handleRequestInner(
 					? "thread-goal"
 					: isImageRequest
 						? "images"
-						: "responses",
+						: isTranscribeRequest
+							? "transcribe"
+							: "responses",
 			model,
 			projectKey,
 			requestId: traceId,
@@ -1847,6 +1879,91 @@ async function handleRequestInner(
   const readSubscriptionQuota = state.readSubscriptionQuota;
   const subscriptionQuotaCache = state.nativeOpenai && isResponsesRequest && readSubscriptionQuota ? await cachedRead(state, "subscription-quota", readSubscriptionQuota).catch(()=>null) ?? null : null;
   const subscriptionQuotaByAccount: Record<number, SubscriptionQuotaPreference> = {};
+		const workspaceIds = (account: ManagedAccount): Set<string> =>
+			new Set(
+				[
+					account.accountId?.trim(),
+					...(account.workspaces ?? []).map((workspace) => workspace.id.trim()),
+				].filter((value): value is string => Boolean(value)),
+			);
+		const uniqueAccount = (candidates: ManagedAccount[]): ManagedAccount | null =>
+			candidates.length === 1 ? candidates[0] ?? null : null;
+		const matchReplacementAccount = (
+			previous: ManagedAccount,
+			previousManager: AccountManager,
+			replacementManager: AccountManager,
+		): ManagedAccount | null => {
+			const replacementAccounts = replacementManager.getAccountsSnapshot();
+			// Only a persisted record id is stable across re-login; a derived
+			// in-memory id hashes the refresh token and changes on rotation.
+			if (previous.recordId && previousManager.hasPersistedRecordId(previous)) {
+				return uniqueAccount(replacementAccounts.filter((candidate) => candidate.recordId === previous.recordId));
+			}
+			const sourceIds = workspaceIds(previous);
+			const compatible = replacementAccounts.filter((candidate) => {
+				const candidateIds = workspaceIds(candidate);
+				return !(
+					sourceIds.size > 0 &&
+					candidateIds.size > 0 &&
+					![...sourceIds].some((id) => candidateIds.has(id))
+				);
+			});
+			const sourceEmail = sanitizeEmail(previous.email);
+			return (
+				uniqueAccount(compatible.filter((candidate) => candidate.refreshToken === previous.refreshToken)) ??
+				(previous.accountId && sourceEmail
+					? uniqueAccount(compatible.filter((candidate) =>
+						candidate.accountId === previous.accountId && sanitizeEmail(candidate.email) === sourceEmail))
+					: null) ??
+				// accountId alone cannot merge logins: two members of one workspace
+				// share it. Known-but-different emails are different logins, so the
+				// remap must not adopt the sibling row for the removed account.
+				(previous.accountId
+					? uniqueAccount(compatible.filter((candidate) =>
+						candidate.accountId === previous.accountId &&
+							(!sourceEmail ||
+								!sanitizeEmail(candidate.email) ||
+								sanitizeEmail(candidate.email) === sourceEmail)))
+					: null) ??
+				(sourceEmail
+					? uniqueAccount(compatible.filter((candidate) => sanitizeEmail(candidate.email) === sourceEmail))
+					: null)
+			);
+		};
+		const remapRequestWorkspaceState = (
+			previousManager: AccountManager,
+			replacementManager: AccountManager,
+		): void => {
+			const previousAccounts = previousManager.getAccountsSnapshot();
+			const oldCandidates = [...workspaceCandidates.entries()];
+			const oldQuota = { ...subscriptionQuotaByAccount };
+			workspaceCandidates.clear();
+			for (const key of Object.keys(subscriptionQuotaByAccount)) {
+				delete subscriptionQuotaByAccount[Number(key)];
+			}
+
+			for (const [previousIndex, scopes] of oldCandidates) {
+				const previous = previousAccounts.find((account) => account.index === previousIndex);
+				if (!previous) continue;
+				const replacement = matchReplacementAccount(previous, previousManager, replacementManager);
+				if (!replacement) continue;
+				const live = replacementManager.getAccountByIndex(replacement.index);
+				if (!live) continue;
+				const currentScopes = new Map(
+					workspaceModelScopes(live).map((scope) => [scope.accountId, scope] as const),
+				);
+				const remapped = scopes
+					.map((scope) => currentScopes.get(scope.accountId))
+					.filter((scope): scope is ReturnType<typeof workspaceModelScopes>[number] => Boolean(scope?.routable));
+				// Keep an explicit empty candidate list: it is a request-local guard that
+				// prevents fallback to a stored workspace binding when every catalog-approved
+				// scope disappeared or became unroutable during the manager swap.
+				workspaceCandidates.set(live.index, remapped);
+				if (oldQuota[previousIndex] !== undefined) {
+					subscriptionQuotaByAccount[live.index] = oldQuota[previousIndex];
+				}
+			}
+		};
   const resetCreditState=state.nativeOpenai&&isResponsesRequest ? await cachedRead(state, "reset-credits", loadResetCreditState).catch(()=>null):null;
   const quotaForScope = (account: ManagedAccount, scope: ReturnType<typeof workspaceModelScopes>[number]) => {
    // Scoped observations belong to this credential and workspace; legacy entries only describe the binding.
@@ -1859,8 +1976,74 @@ async function handleRequestInner(
   // A stored `switch` pin is a hard constraint in native mode too (#702), not a
   // preference: it fails with codex_pinned_account_unavailable rather than
   // silently serving from another account.
-  const pinnedIndex = state.forcedAccountIndex ?? storageMeta.pinnedAccountIndex;
+  let pinnedIndex = state.forcedAccountIndex ?? storageMeta.pinnedAccountIndex;
 		const isPinned = typeof pinnedIndex === "number";
+		let pinnedIdentityAccount = isPinned && typeof pinnedIndex === "number"
+			? accountManager.getAccountByIndex(pinnedIndex) ?? null
+			: null;
+		let pinnedIdentityMissing = false;
+		const matchPinnedReplacementAccount = (
+			previousManager: AccountManager,
+			previous: ManagedAccount,
+			replacementManager: AccountManager,
+		): ManagedAccount | null => {
+			const replacements = replacementManager.getAccountsSnapshot();
+			// A persisted record id is authoritative. Legacy rows receive a derived
+			// in-memory id whose hash includes the refresh token; an external re-login
+			// can therefore change that derived id for the same workspace. In that legacy
+			// case continue to the strict workspace/account fallback below.
+			if (previous.recordId && previousManager.hasPersistedRecordId(previous)) {
+				return uniqueAccount(replacements.filter((candidate) => candidate.recordId === previous.recordId));
+			}
+			const sourceIds = workspaceIds(previous);
+			const compatible = replacements.filter((candidate) => {
+				const candidateIds = workspaceIds(candidate);
+				return !(
+					sourceIds.size > 0 &&
+					candidateIds.size > 0 &&
+					![...sourceIds].some((id) => candidateIds.has(id))
+				);
+			});
+			const sourceEmail = sanitizeEmail(previous.email);
+			// Hard pins deliberately omit the email-only fallback used by request-local
+			// workspace remapping. Same-email sibling logins are not interchangeable.
+			return (
+				uniqueAccount(compatible.filter((candidate) => candidate.refreshToken === previous.refreshToken)) ??
+				(previous.accountId && sourceEmail
+					? uniqueAccount(compatible.filter((candidate) =>
+						candidate.accountId === previous.accountId && sanitizeEmail(candidate.email) === sourceEmail))
+					: null) ??
+				(previous.accountId
+					? uniqueAccount(compatible.filter((candidate) => {
+						if (candidate.accountId !== previous.accountId) return false;
+						const candidateEmail = sanitizeEmail(candidate.email);
+						return !sourceEmail || !candidateEmail || candidateEmail === sourceEmail;
+					}))
+					: null)
+			);
+		};
+		const remapPinnedAccount = (
+			previousManager: AccountManager,
+			replacementManager: AccountManager,
+		): void => {
+			if (!isPinned || typeof pinnedIndex !== "number" || pinnedIdentityMissing) return;
+			// If the pin resolved when this request began, bind the request to that
+			// account identity rather than to an index that can be reused after a
+			// concurrent inventory change. A pin that was already out of range keeps
+			// the legacy numeric behavior because there is no identity to preserve.
+			const source = pinnedIdentityAccount ?? previousManager.getAccountByIndex(pinnedIndex) ?? null;
+			if (!source) return;
+			const replacement = matchPinnedReplacementAccount(previousManager, source, replacementManager);
+			const live = replacement ? replacementManager.getAccountByIndex(replacement.index) ?? null : null;
+			if (!live) {
+				pinnedIdentityMissing = true;
+				pinnedIdentityAccount = source;
+				accountSkipReasons.set(pinnedIndex, "missing");
+				return;
+			}
+			pinnedIndex = live.index;
+			pinnedIdentityAccount = live;
+		};
 		let requestModelCatalog: AccountModelCatalog | undefined;
 		/** Rebuild native routing scopes after Luna is rewritten to separately metered Reserve. */
 		const rebuildReserveWorkspaceCandidates = async (): Promise<void> => {
@@ -2136,7 +2319,7 @@ async function handleRequestInner(
 			isPinned &&
 			(context.model === "gpt-6-luna" || context.model === "gpt-5.6-luna")
 		) {
-			const pinnedAccount = accountManager.getAccountByIndex(pinnedIndex);
+			const pinnedAccount = typeof pinnedIndex === "number" ? accountManager.getAccountByIndex(pinnedIndex) : null;
 			const now = state.now();
 			const familyResetAt = pinnedAccount?.rateLimitResetTimes[getQuotaKey(context.family)];
 			const modelResetAt = pinnedAccount?.rateLimitResetTimes[getQuotaKey(context.family, context.model)];
@@ -2180,9 +2363,10 @@ async function handleRequestInner(
 
 		// The token bucket spreads load across a selectable pool. A pin has no
 		// alternative account, so exhausting that local heuristic can only reject a
-		// request that the pinned account could serve. Keep circuit-breaker admission
-		// inside consumeToken, but do not debit the pool-scoring bucket for a pin.
-		const bypassPoolTokenBucket = isPinned;
+		// request that the pinned account could serve. Transcription is not inference
+		// and must not debit the Codex model pool or claim its inference circuit probe.
+		// Transcription uses credential-only admission below.
+		const bypassPoolTokenBucket = isPinned || isTranscribeRequest;
 		const refundConsumedPoolToken = (account: ManagedAccount): void => {
 			if (!bypassPoolTokenBucket) {
 				accountManager.refundToken(account, context.family, context.model);
@@ -2278,7 +2462,9 @@ async function handleRequestInner(
 
 		let runtimeSelectionIterations = 0;
 		while (
-			(isPinned || attemptedIndexes.size < accountCount) &&
+			(isPinned ||
+				attemptedIndexes.size < accountCount ||
+				(isTranscribeRequest && !state.nativeOpenai && accountCount === 0 && !reloadedAfterNoAccount)) &&
 			transientAttempts < transientAttemptLimit &&
 			(!isPinned ||
 				runtimeSelectionIterations - capacityRetries <
@@ -2314,6 +2500,10 @@ async function handleRequestInner(
 			// calls inside `chooseAccount` are used unchanged and no lock is taken,
 			// so default behavior and perf are identical to before.
 			const selectAccount = (): ManagedAccount | null => {
+				if (pinnedIdentityMissing && typeof pinnedIndex === "number") {
+					accountSkipReasons.set(pinnedIndex, "missing");
+					return null;
+				}
     if (context.model !== LUNA_RESERVE_MODEL) {
      for(const [index,scopes] of workspaceCandidates){
       const account=accountManager.getAccountByIndex(index);
@@ -2323,13 +2513,34 @@ async function handleRequestInner(
       if(scope)subscriptionQuotaByAccount[index]=subscriptionQuotaPreference(quotaForScope(account,scope),state.now());
      }
     }
+				const attemptedForSelection = new Set([...attemptedIndexes, ...catalogExcludedIndexes()]);
+				if (isTranscribeRequest) {
+					const candidate = chooseTranscriptionAccount({
+						accountManager,
+						attemptedIndexes: attemptedForSelection,
+						policy: policyDecision,
+						pinnedIndex,
+						now: state.now(),
+						transcriptionRateLimitUntilByRecordId: state.transcriptionRateLimitUntilByRecordId,
+						startIndex: state.transcriptionNextAccountIndex,
+						// Native inference preference must not pin dictation to the current
+						// Responses account; transcription owns an independent round-robin cursor.
+						preferredIndex: null,
+						fallbackPinnedIndex: state.nativeOpenai ? storageMeta.pinnedAccountIndex : null,
+						skipReasons: accountSkipReasons,
+					});
+					if (candidate && pinnedIndex === null) {
+						state.transcriptionNextAccountIndex = candidate.index + 1;
+					}
+					return candidate;
+				}
 				const result=chooseAccount({
 					accountManager,
 					sessionAffinityStore: state.sessionAffinityStore,
 					sessionKey: context.sessionKey,
 					family: context.family,
 					model: context.model,
-					attemptedIndexes: new Set([...attemptedIndexes, ...catalogExcludedIndexes()]),
+					attemptedIndexes: attemptedForSelection,
 					now: state.now(),
 					policy: policyDecision,
 					pinnedIndex,
@@ -2355,6 +2566,7 @@ async function handleRequestInner(
 							const candidate = selectAccount();
 							if (
 								candidate &&
+								!isTranscribeRequest &&
 								pinnedIndex === null &&
 								state.schedulingStrategy !== "sequential"
 							) {
@@ -2379,6 +2591,74 @@ async function handleRequestInner(
             for (const index of catalogExcludedIndexes()) accountSkipReasons.set(index, "model-not-supported");
 			if (!selected) {
 				if (
+					isTranscribeRequest &&
+					!state.nativeOpenai &&
+					!reloadedAfterNoAccount
+				) {
+					reloadedAfterNoAccount = true;
+					const reloadedManager = await reloadRuntimeCredentials(state);
+					if (reloadedManager && reloadedManager !== accountManager) {
+						const previousManager = accountManager;
+						remapPinnedAccount(previousManager, reloadedManager);
+						accountManager = reloadedManager;
+						accountCount = accountManager.getAccountCount();
+						transientAttemptLimit = Math.max(
+							1,
+							Math.min(accountCount, state.maxRuntimeAccountAttempts),
+						);
+						if (runtimePolicyState) {
+							try {
+								const reloadedPolicyDecision = await evaluateRuntimePolicy({
+									state: runtimePolicyState,
+									accounts: accountManager.getAccountsSnapshot(),
+									model: context.model,
+									now: state.now(),
+								});
+								policyDecision = reloadedPolicyDecision;
+								mutateRuntimeObservabilitySnapshot((snapshot) => {
+									snapshot.policyBlockedIndexes = [...reloadedPolicyDecision.blockedAccountIndexes];
+									snapshot.policyBlockedReasons = Object.fromEntries(
+										[...reloadedPolicyDecision.blockedAccountIndexes].map((index) => [String(index), "policy-blocked"]),
+									);
+								});
+								if (!reloadedPolicyDecision.allowed) {
+									await usageRecorder.record({
+										outcome: "blocked",
+										statusCode: reloadedPolicyDecision.statusCode,
+										errorCode: reloadedPolicyDecision.errorCode,
+									});
+									writeJson(res, reloadedPolicyDecision.statusCode, {
+										error: {
+											message: "Runtime policy blocked this local request.",
+											code: reloadedPolicyDecision.errorCode ?? "policy_blocked",
+											reasons: reloadedPolicyDecision.reasons,
+										},
+									});
+									return;
+								}
+							} catch (error) {
+								state.status.lastError = error instanceof Error ? error.message : String(error);
+								await usageRecorder.record({
+									outcome: "failure",
+									statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
+									errorCode: "runtime_policy_unavailable",
+								});
+								writeJson(res, HTTP_STATUS.SERVICE_UNAVAILABLE, {
+									error: {
+										message: "Runtime policy could not be loaded for this local request.",
+										code: "runtime_policy_unavailable",
+									},
+								});
+								return;
+							}
+						}
+						accountSkipReasons.clear();
+						attemptedIndexes.clear();
+						continue;
+					}
+				}
+				if (
+					!isTranscribeRequest &&
 					!reloadedAfterNoAccount &&
 					!isPinned &&
 					accountCount > 0 &&
@@ -2431,6 +2711,7 @@ async function handleRequestInner(
 				state.now(),
 			);
 			if (
+				!isTranscribeRequest &&
 				context.model !== LUNA_RESERVE_MODEL &&
 				preemptiveDeferral.defer &&
 				preemptiveDeferral.waitMs > 0
@@ -2454,17 +2735,18 @@ async function handleRequestInner(
 				continue;
 			}
 
-			// consumeToken also takes the race-safe circuit admission slot, so it
-			// can reject for either gate. Take the reason from the call that
-			// rejected rather than re-deriving it: a second evaluation reports the
-			// first blocker it finds (a live cooldown would mask a drained bucket)
-			// and cannot see a half-open probe slot that was just claimed.
-			const admission = accountManager.consumeTokenWithReason(
-				selected,
-				context.family,
-				context.model,
-				{ bypassTokenBucket: bypassPoolTokenBucket },
-			);
+			// Inference consumes both the pool token and the race-safe circuit probe.
+			// Transcription deliberately bypasses both: its credential-only selector
+			// already enforced disabled/workspace/auth/policy gates, and claiming the
+			// inference probe here could strand a half-open account after dictation.
+			const admission = isTranscribeRequest
+				? { ok: true as const }
+				: accountManager.consumeTokenWithReason(
+					selected,
+					context.family,
+					context.model,
+					{ bypassTokenBucket: bypassPoolTokenBucket },
+				);
 			if (!admission.ok) {
 				accountSkipReasons.set(selected.index, admission.reason);
 				exhaustionReason = "rate-limit";
@@ -2489,8 +2771,79 @@ async function handleRequestInner(
 				tokenRefreshSkewMs: state.tokenRefreshSkewMs,
 				tokenInvalidationCooldownMs: state.tokenInvalidationCooldownMs,
 			});
+			// A credential reload may have published a replacement manager while this
+			// request was awaiting refresh. Keep the refreshed account and its owner
+			// together for every later mutation/persist; account indexes are local to
+			// one manager and can shift when rows are removed or reordered.
+			if (refreshed.accountManager !== accountManager) {
+				const previousManager = accountManager;
+				remapRequestWorkspaceState(previousManager, refreshed.accountManager);
+				remapPinnedAccount(previousManager, refreshed.accountManager);
+				accountManager = refreshed.accountManager;
+				accountCount = accountManager.getAccountCount();
+				transientAttemptLimit = Math.max(
+					1,
+					Math.min(accountCount, state.maxRuntimeAccountAttempts),
+				);
+				if (runtimePolicyState) {
+					try {
+						const refreshedPolicyDecision = await evaluateRuntimePolicy({
+							state: runtimePolicyState,
+							accounts: accountManager.getAccountsSnapshot(),
+							model: context.model,
+							now: state.now(),
+						});
+						policyDecision = refreshedPolicyDecision;
+						mutateRuntimeObservabilitySnapshot((snapshot) => {
+							snapshot.policyBlockedIndexes = [...refreshedPolicyDecision.blockedAccountIndexes];
+							snapshot.policyBlockedReasons = Object.fromEntries(
+								[...refreshedPolicyDecision.blockedAccountIndexes].map((index) => [String(index), "policy-blocked"]),
+							);
+						});
+						if (!refreshedPolicyDecision.allowed) {
+							await usageRecorder.record({
+								outcome: "blocked",
+								statusCode: refreshedPolicyDecision.statusCode,
+								errorCode: refreshedPolicyDecision.errorCode,
+							});
+							writeJson(res, refreshedPolicyDecision.statusCode, {
+								error: {
+									message: "Runtime policy blocked this local request.",
+									code: refreshedPolicyDecision.errorCode ?? "policy_blocked",
+									reasons: refreshedPolicyDecision.reasons,
+								},
+							});
+							return;
+						}
+					} catch (error) {
+						state.status.lastError = error instanceof Error ? error.message : String(error);
+						await usageRecorder.record({
+							outcome: "failure",
+							statusCode: HTTP_STATUS.SERVICE_UNAVAILABLE,
+							errorCode: "runtime_policy_unavailable",
+						});
+						writeJson(res, HTTP_STATUS.SERVICE_UNAVAILABLE, {
+							error: {
+								message: "Runtime policy could not be loaded for this local request.",
+								code: "runtime_policy_unavailable",
+							},
+						});
+						return;
+					}
+				}
+				accountSkipReasons.clear();
+				attemptedIndexes.clear();
+			}
 			if (!refreshed.ok) {
 				refundConsumedPoolToken(selected);
+				if (refreshed.selectionRestart) {
+					// The credential row vanished while refresh was in flight. The manager
+					// swap above already cleared request-local attempt state; restart selection
+					// without charging a transient auth failure to the replacement pool.
+					exhaustionReason = "no-account";
+					capabilityRejectionIsLatest = false;
+					continue;
+				}
 				// No accountSkipReasons write here: ensureFreshAccessToken always
 				// applies an auth cooldown before returning !ok, so the next
 				// selection pass overwrites whatever this set with
@@ -2524,7 +2877,12 @@ async function handleRequestInner(
 				continue;
 			}
 
-			const pendingScopes = workspaceCandidates.get(refreshed.account.index);
+			let pendingScopes = workspaceCandidates.get(refreshed.account.index);
+			if (isTranscribeRequest) {
+				pendingScopes = workspaceModelScopes(refreshed.account)
+					.filter((scope) => scope.routable)
+					.sort((a, b) => Number(b.selected) - Number(a.selected) || Number(b.bound) - Number(a.bound));
+			}
    // Revalidate enabled scopes after token refresh; never write a per-request choice to the account.
    const enabledScopes = new Set(workspaceModelScopes(refreshed.account).filter(s=>s.routable).map(s=>s.id));
    while(pendingScopes?.length && !enabledScopes.has(pendingScopes[0]?.id ?? "")) pendingScopes.shift();
@@ -2595,6 +2953,27 @@ async function handleRequestInner(
 			}
 			const accountIdentity = accountIdentityFromAccount(refreshed.account, state.now());
 			recordLastRuntimeAccount(state.status, accountIdentity, accountId);
+			// A credential/inventory reload can publish while this request is waiting
+			// on upstream. Resolve response-derived health/auth mutations lazily onto
+			// the latest owner so late transport/429/401/5xx/success state cannot land
+			// only on a superseded manager. If the row vanished entirely, retain the
+			// captured object for this request; there is no replacement row to penalize.
+			const responseCredential = {
+				access: refreshed.accessToken,
+				refreshToken: refreshed.account.refreshToken,
+			};
+			const responseStateTarget = () =>
+				resolveRuntimeRefreshTarget(accountManager, refreshed.account) ?? {
+					accountManager,
+					account: refreshed.account,
+				};
+			const responseAuthStateTarget = () => {
+				const target = responseStateTarget();
+				return target.account.access === responseCredential.access &&
+					target.account.refreshToken === responseCredential.refreshToken
+					? target
+					: null;
+			};
 
 			const outboundHeaders = createOutboundHeaders(
 				context.headers,
@@ -2695,16 +3074,18 @@ async function handleRequestInner(
 					return;
 				}
 				// A timeout may occur after generation; do not retry within this request.
-				if (isImageRequest) {
+				if (isImageRequest || isTranscribeRequest) {
+					const operation = isImageRequest ? "image" : "transcribe";
+					const errorCode = `${operation}_upstream_transport_error`;
 					writeJson(res, 502, {
 						error: {
-							code: "image_upstream_transport_error",
-							message: "Image upstream transport failed; not retried by the proxy.",
+							code: errorCode,
+							message: `${isImageRequest ? "Image" : "Transcription"} upstream transport failed; not retried by the proxy.`,
 						},
 					});
 					await usageRecorder.record({
 						outcome: "failure", statusCode: 502,
-						errorCode: "image_upstream_transport_error", account: refreshed.account,
+						errorCode, account: refreshed.account,
 					});
 					return;
 				}
@@ -2720,12 +3101,13 @@ async function handleRequestInner(
 				// exhaustion 503 a non-zero `retry_after_ms` to back the client off
 				// with (`getMinWaitTimeForFamily` returns 0 while any account is
 				// still selectable).
-				accountManager.markAccountCoolingDown(
-					refreshed.account,
+				const transportState = responseStateTarget();
+				transportState.accountManager.markAccountCoolingDown(
+					transportState.account,
 					state.networkErrorCooldownMs,
 					"network-error",
 				);
-				accountManager.saveToDiskDebounced();
+				transportState.accountManager.saveToDiskDebounced();
 				accountSkipReasons.set(refreshed.account.index, "network-error");
 				exhaustionReason = "network-error";
 				capabilityRejectionIsLatest = false;
@@ -2754,7 +3136,7 @@ async function handleRequestInner(
 				}
 			};
 			const quotaSnapshot = readQuotaSchedulerSnapshot(upstream.headers, upstream.status, state.now());
-			if (quotaSnapshot && context.model !== LUNA_RESERVE_MODEL) {
+			if (quotaSnapshot && !isTranscribeRequest && context.model !== LUNA_RESERVE_MODEL) {
 				observeQuota(quotaSnapshot, upstream.headers.get("x-codex-plan-type") ?? undefined);
 			}
 
@@ -2785,6 +3167,38 @@ async function handleRequestInner(
    }
 			if (upstream.status === HTTP_STATUS.TOO_MANY_REQUESTS) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
+				if (isTranscribeRequest) {
+					const now = state.now();
+					const retryAfterMs =
+						parseRetryAfterHeaderMs(upstream.headers, now) ??
+						parseRetryAfterBodyMs(bodyText, now) ??
+						60_000;
+					for (const [recordId, until] of state.transcriptionRateLimitUntilByRecordId) {
+						if (until <= now) state.transcriptionRateLimitUntilByRecordId.delete(recordId);
+					}
+					if (refreshed.account.recordId) {
+						const boundedDelayMs = Math.min(
+							MAX_RATE_LIMIT_DELAY_MS,
+							Math.max(1_000, Math.floor(retryAfterMs)),
+						);
+						const existingUntil = state.transcriptionRateLimitUntilByRecordId.get(
+							refreshed.account.recordId,
+						) ?? 0;
+						state.transcriptionRateLimitUntilByRecordId.set(
+							refreshed.account.recordId,
+							Math.max(existingUntil, now + boundedDelayMs),
+						);
+					}
+					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
+					res.end(bodyText);
+					await usageRecorder.record({
+						outcome: "failure",
+						statusCode: upstream.status,
+						errorCode: extractErrorCodeFromBody(bodyText) ?? "transcribe_rate_limited",
+						account: refreshed.account,
+					});
+					return;
+				}
 				// Keep the upstream HINT separate from the 60s fallback. Passing the
 				// synthesized default into the capacity wait would make every
 				// hint-less capacity 429 sleep a full minute and leave the 2s/5s/15s
@@ -2825,9 +3239,10 @@ async function handleRequestInner(
 				}
 				// Every 429 still drains this account for its retry window, but only an
 				// explicit subscription-usage signal is persisted as quota exhaustion.
-				accountManager.recordRateLimit(refreshed.account, context.family, context.model);
-				accountManager.markRateLimitedWithReason(
-					refreshed.account,
+				const rateLimitState = responseStateTarget();
+				rateLimitState.accountManager.recordRateLimit(rateLimitState.account, context.family, context.model);
+				rateLimitState.accountManager.markRateLimitedWithReason(
+					rateLimitState.account,
 					retryAfterMs,
 					context.family,
 					subscriptionQuotaExceeded ? "quota" : "unknown",
@@ -2841,12 +3256,12 @@ async function handleRequestInner(
 					const confirmedResetAt =
 						state.now() +
 						Math.min(Math.max(0, Math.floor(retryAfterMs)), MAX_RATE_LIMIT_DELAY_MS);
-					refreshed.account.rateLimitResetTimes[confirmedKey] = Math.max(
-						refreshed.account.rateLimitResetTimes[confirmedKey] ?? 0,
+					rateLimitState.account.rateLimitResetTimes[confirmedKey] = Math.max(
+						rateLimitState.account.rateLimitResetTimes[confirmedKey] ?? 0,
 						confirmedResetAt,
 					);
 				}
-				accountManager.saveToDiskDebounced();
+				rateLimitState.accountManager.saveToDiskDebounced();
 				if (!modelAtCapacity && subscriptionQuotaExceeded && switchRequestToLunaReserve(context)) {
 					usageRecorder = createUsageRecorderForModel(context.model);
 					if (runtimePolicyState) {
@@ -2890,25 +3305,25 @@ async function handleRequestInner(
 				const errorCode = extractErrorCodeFromBody(bodyText);
 				if (isWorkspaceDisabledError(upstream.status, errorCode, bodyText)) {
      if(requestScope && refreshed.account.workspaces?.length) {
-      if(accountManager.disableWorkspace(refreshed.account,requestScope.accountId)) accountManager.saveToDiskDebounced();
+      const workspaceState = responseStateTarget();
+      if(workspaceState.accountManager.disableWorkspace(workspaceState.account,requestScope.accountId)) workspaceState.accountManager.saveToDiskDebounced();
       pendingScopes?.shift();
       refundConsumedPoolToken(refreshed.account);
       if(pendingScopes?.length) attemptedIndexes.delete(refreshed.account.index);
       else policyDecision?.blockedAccountIndexes.add(refreshed.account.index);
       state.status.retries++;noteRotation();continue;
      }
-					const accountWasEnabled =
-						accountManager.getAccountByIndex(refreshed.account.index)?.enabled !==
-						false;
+					const disabledState = responseStateTarget();
+					const accountWasEnabled = disabledState.account.enabled !== false;
 					refundConsumedPoolToken(refreshed.account);
 					if (accountWasEnabled) {
-						accountManager.recordFailure(
-							refreshed.account,
+						disabledState.accountManager.recordFailure(
+							disabledState.account,
 							context.family,
 							context.model,
 						);
-						accountManager.setAccountEnabled(refreshed.account.index, false);
-						accountManager.saveToDiskDebounced();
+						disabledState.accountManager.setAccountEnabled(disabledState.account.index, false);
+						disabledState.accountManager.saveToDiskDebounced();
 					}
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
 					exhaustionReason = "deactivated";
@@ -2990,27 +3405,32 @@ async function handleRequestInner(
 			if (upstream.status === HTTP_STATUS.UNAUTHORIZED) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
 				refundConsumedPoolToken(refreshed.account);
-				accountManager.recordFailure(refreshed.account, context.family, context.model);
+				const authState = responseAuthStateTarget();
+				if (authState && !isTranscribeRequest) {
+					authState.accountManager.recordFailure(authState.account, context.family, context.model);
+				}
 				if (isTokenInvalidationError(bodyText)) {
 					// The upstream explicitly revoked this OAuth token. Applying a long
 					// cooldown prevents cascade invalidation: rapidly presenting each
 					// account's token from the same IP triggers OpenAI's anti-abuse
 					// detection and invalidates them in sequence. Return the 401 directly
 					// rather than rotating so the client can prompt for re-login.
-					accountManager.markAuthInvalidated(
-						refreshed.account,
-						extractErrorCodeFromBody(bodyText) ?? "token_invalidated",
-					);
-					applyMonotonicAuthCooldown(
-						accountManager,
-						refreshed.account,
-						state.tokenInvalidationCooldownMs,
-					);
+					if (authState) {
+						authState.accountManager.markAuthInvalidated(
+							authState.account,
+							extractErrorCodeFromBody(bodyText) ?? "token_invalidated",
+						);
+						applyMonotonicAuthCooldown(
+							authState.accountManager,
+							authState.account,
+							state.tokenInvalidationCooldownMs,
+						);
+						// The invalidation marker must be durable before returning the 401.
+						// A delayed save would allow a proxy restart to reload and route the
+						// revoked account again.
+						await authState.accountManager.saveToDisk();
+					}
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
-					// The invalidation marker must be durable before returning the 401.
-					// A delayed save would allow a proxy restart to reload and route the
-					// revoked account again.
-					await accountManager.saveToDisk();
 					// Emit the same machine-readable shape as the refresh-failure path
 					// (code: "token_invalidated") instead of forwarding the raw upstream
 					// body, so the client contract is consistent across both vectors.
@@ -3026,12 +3446,25 @@ async function handleRequestInner(
 					});
 					return;
 				}
-				applyMonotonicAuthCooldown(
-					accountManager,
-					refreshed.account,
-					DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
-				);
-				accountManager.saveToDiskDebounced();
+				if (isTranscribeRequest) {
+					res.writeHead(upstream.status, responseHeadersForClient(upstream.headers));
+					res.end(bodyText);
+					await usageRecorder.record({
+						outcome: "failure",
+						statusCode: upstream.status,
+						errorCode: extractErrorCodeFromBody(bodyText) ?? "transcribe_unauthorized",
+						account: refreshed.account,
+					});
+					return;
+				}
+				if (authState) {
+					applyMonotonicAuthCooldown(
+						authState.accountManager,
+						authState.account,
+						DEFAULT_AUTH_FAILURE_COOLDOWN_MS,
+					);
+					authState.accountManager.saveToDiskDebounced();
+				}
 				exhaustionReason = "auth-failure";
 				capabilityRejectionIsLatest = false;
 				transientAttempts += 1;
@@ -3039,6 +3472,22 @@ async function handleRequestInner(
 				state.status.retries += 1;
 				noteRotation();
 				continue;
+			}
+
+			// Dictation audio may already have been accepted before any error response.
+			// Do not replay it across accounts or let its endpoint-specific status
+			// mutate Codex inference health/quota state. Explicit token invalidation
+			// and workspace-disable handling above remain account-wide signals.
+			if (isTranscribeRequest && upstream.status >= 400) {
+				const forwarded = await forwardStreamingResponse(
+					upstream, res, state.status, () => undefined, state.streamStallTimeoutMs,
+				);
+				await usageRecorder.record({
+					outcome: "failure", statusCode: upstream.status,
+					errorCode: forwarded ? "transcribe_upstream_error" : "stream_forward_failed",
+					account: refreshed.account,
+				});
+				return;
 			}
 
 			// Forward image validation/moderation/5xx errors without cross-account replay.
@@ -3078,13 +3527,14 @@ async function handleRequestInner(
 					if (outcome === "retry") continue;
 				}
 				refundConsumedPoolToken(refreshed.account);
-				accountManager.recordFailure(refreshed.account, context.family, context.model);
-				accountManager.markAccountCoolingDown(
-					refreshed.account,
+				const serverState = responseStateTarget();
+				serverState.accountManager.recordFailure(serverState.account, context.family, context.model);
+				serverState.accountManager.markAccountCoolingDown(
+					serverState.account,
 					state.serverErrorCooldownMs,
 					"server-error",
 				);
-				accountManager.saveToDiskDebounced();
+				serverState.accountManager.saveToDiskDebounced();
 				exhaustionReason = "server-error";
 				capabilityRejectionIsLatest = false;
 				transientAttempts += 1;
@@ -3127,45 +3577,48 @@ async function handleRequestInner(
 			// "rate-limited") lingers on disk until an explicit runtime reset and
 			// the forecast keeps reporting this working account as unavailable.
 			// No-op when no reason is recorded, so the hot path stays write-free.
-			const quotaDeferral = state.preemptiveQuotaScheduler.getDeferral(
-				quotaScheduleKey,
-				state.now(),
-			);
-			const nearExhaustionWaitMs =
-				context.model === LUNA_RESERVE_MODEL
-					? 0
-					: quotaDeferral.defer
-						? quotaDeferral.waitMs
-						: 0;
-			if (nearExhaustionWaitMs > 0) {
-				accountManager.markRateLimitedWithReason(
-					refreshed.account,
-					nearExhaustionWaitMs,
-					context.family,
-					"quota",
-					context.model,
-				);
-				state.sessionAffinityStore?.forgetSession(context.sessionKey);
-				accountManager.saveToDiskDebounced();
-			} else {
-				state.sessionAffinityStore?.remember(
-					context.sessionKey,
-					refreshed.account.index,
+			if (!isTranscribeRequest) {
+				const quotaDeferral = state.preemptiveQuotaScheduler.getDeferral(
+					quotaScheduleKey,
 					state.now(),
 				);
-				if (refreshed.account.index !== state.lastGlobalAccountIndex) {
-					state.lastGlobalAccountIndex = refreshed.account.index;
+				const nearExhaustionWaitMs =
+					context.model === LUNA_RESERVE_MODEL
+						? 0
+						: quotaDeferral.defer
+							? quotaDeferral.waitMs
+							: 0;
+				if (nearExhaustionWaitMs > 0) {
+					const quotaState = responseStateTarget();
+					quotaState.accountManager.markRateLimitedWithReason(
+						quotaState.account,
+						nearExhaustionWaitMs,
+						context.family,
+						"quota",
+						context.model,
+					);
+					state.sessionAffinityStore?.forgetSession(context.sessionKey);
+					quotaState.accountManager.saveToDiskDebounced();
+				} else {
+					state.sessionAffinityStore?.remember(
+						context.sessionKey,
+						refreshed.account.index,
+						state.now(),
+					);
+					if (refreshed.account.index !== state.lastGlobalAccountIndex) {
+						state.lastGlobalAccountIndex = refreshed.account.index;
+					}
+					state.lastGlobalSwitchAt = state.now();
 				}
-				state.lastGlobalSwitchAt = state.now();
+				await persistRuntimeActiveAccount(
+					accountManager,
+					refreshed.account,
+					context.family,
+					isPinned && refreshed.account.index === pinnedIndex,
+					state.schedulingStrategy,
+					state.nativeOpenai,
+				);
 			}
-			await persistRuntimeActiveAccount(
-				accountManager,
-				refreshed.account,
-				context.family,
-				isPinned && refreshed.account.index === pinnedIndex,
-				state.schedulingStrategy,
-				state.nativeOpenai,
-			);
 
 			// Recover the upstream token counts as the body streams past. Without
 			// them every ledger row lands with all-zero tokens and a zero cost, so
@@ -3176,7 +3629,7 @@ async function handleRequestInner(
 				contentType: upstream.headers.get("content-type"),
 				onEvent: (event) => {
 					responseOutcome.observe(event);
-					if (context.model === LUNA_RESERVE_MODEL) return;
+					if (isTranscribeRequest || context.model === LUNA_RESERVE_MODEL) return;
 					const snapshot = readSubscriptionQuotaEvent(event, state.now());
 					if (!snapshot) return;
 					observeQuota(snapshot, snapshot.planType);
@@ -3192,24 +3645,26 @@ async function handleRequestInner(
 				state.status,
 				() => {
 					streamErrored = true;
+					if (isTranscribeRequest) return;
 					// Deliberately NOT the pre-header transport policy above,
 					// which skips recordFailure (#677). By this point the
 					// upstream accepted the request and began responding, so a
 					// broken stream is a signal about THIS account's session
 					// (upstream tearing it down) rather than about the shared
 					// network path, and it should still credit the breaker.
-					accountManager.recordFailure(
-						refreshed.account,
+					const streamState = responseStateTarget();
+					streamState.accountManager.recordFailure(
+						streamState.account,
 						context.family,
 						context.model,
 					);
-					accountManager.markAccountCoolingDown(
-						refreshed.account,
+					streamState.accountManager.markAccountCoolingDown(
+						streamState.account,
 						state.networkErrorCooldownMs,
 						"network-error",
 					);
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
-					accountManager.saveToDiskDebounced();
+					streamState.accountManager.saveToDiskDebounced();
 				},
 				state.streamStallTimeoutMs,
 				usageScanner.push,
@@ -3220,8 +3675,17 @@ async function handleRequestInner(
 			// neither completed nor failed. That says nothing about the account.
 			const clientDisconnected = !forwarded && !streamErrored && !res.writableEnded;
 			if (forwarded && upstream.ok) {
-				accountManager.recordSuccess(refreshed.account, context.family, context.model);
-				recordRuntimeAccountRecovery(refreshed.account.index);
+				if (isTranscribeRequest && refreshed.account.recordId) {
+					const until = state.transcriptionRateLimitUntilByRecordId.get(refreshed.account.recordId);
+					if (typeof until === "number" && until <= state.now()) {
+						state.transcriptionRateLimitUntilByRecordId.delete(refreshed.account.recordId);
+					}
+				}
+				if (!isTranscribeRequest) {
+					const successState = responseStateTarget();
+					successState.accountManager.recordSuccess(successState.account, context.family, context.model);
+					recordRuntimeAccountRecovery(successState.account.index);
+				}
 			} else if (!clientDisconnected) {
 				state.sessionAffinityStore?.forgetSession(context.sessionKey);
 				const rejection = classifyCapabilityFailure(400, responseOutcome.rejection);
@@ -3248,7 +3712,7 @@ async function handleRequestInner(
 			// it here inflates the measurement by this turn's thinking budget
 			// against a deliberately tight threshold. `outputTokens` is already
 			// reasoning-stripped (lib/usage/usage-extraction.ts).
-			if (usageTokens && context.stableSessionKey && context.model) {
+			if (!isTranscribeRequest && usageTokens && context.stableSessionKey && context.model) {
 				state.contextBudgetGuard.update(context.stableSessionKey, {
 					model: context.model,
 					contextTokens: usageTokens.inputTokens + usageTokens.outputTokens,
@@ -3310,9 +3774,11 @@ async function handleRequestInner(
 		// account was selected but no skip reason was recorded) — see #486.
 		if (isPinned) {
 			const pinnedAccount =
-				typeof pinnedIndex === "number"
-					? accountManager.getAccountByIndex(pinnedIndex)
-					: null;
+				pinnedIdentityMissing
+					? null
+					: typeof pinnedIndex === "number"
+						? accountManager.getAccountByIndex(pinnedIndex)
+						: null;
 			const pinnedSkipReason =
 				typeof pinnedIndex === "number"
 					? accountSkipReasons.get(pinnedIndex) ?? null
@@ -3354,35 +3820,60 @@ async function handleRequestInner(
 			const evaluatedAtMs = state.now();
 			// Both bounds come from a single pass over the account's records.
 			const pinnedRecoveryBounds =
-				pinnedAccount === null
-					? null
-					: getAccountRecoveryBoundsForFamily(
+				!isTranscribeRequest && pinnedAccount !== null
+					? getAccountRecoveryBoundsForFamily(
 							pinnedAccount,
 							evaluatedAtMs,
 							context.family,
 							context.model,
-						);
+						)
+					: null;
 			const pinnedStateRecoveryAtMs =
 				pinnedRecoveryBounds?.recoveryAtMs ?? null;
 			// An open circuit outlives the short failure cooldowns that tripped
 			// it; its deadline lives in the breaker, not the account record.
+			// Transcription intentionally ignores the inference circuit entirely.
 			const pinnedCircuitRecoveryAtMs =
-				pinnedAccount === null
-					? null
-					: accountManager.getCircuitRecoveryTime(pinnedAccount, evaluatedAtMs);
-			const pinnedResetAtMs =
-				pinnedBlockedPermanently ||
-				(pinnedStateRecoveryAtMs === null && pinnedCircuitRecoveryAtMs === null)
-					? null
-					: Math.max(
+				!isTranscribeRequest && pinnedAccount !== null
+					? accountManager.getCircuitRecoveryTime(pinnedAccount, evaluatedAtMs)
+					: null;
+			const pinnedTranscriptionRateLimitAtMs =
+				isTranscribeRequest && pinnedAccount?.recordId
+					? state.transcriptionRateLimitUntilByRecordId.get(pinnedAccount.recordId) ?? null
+					: null;
+			const livePinnedTranscriptionRateLimitAtMs =
+				typeof pinnedTranscriptionRateLimitAtMs === "number" &&
+				pinnedTranscriptionRateLimitAtMs > evaluatedAtMs
+					? pinnedTranscriptionRateLimitAtMs
+					: null;
+			const pinnedAuthCooldownAtMs =
+				isTranscribeRequest &&
+				pinnedAccount?.cooldownReason === "auth-failure" &&
+				typeof pinnedAccount.coolingDownUntil === "number" &&
+				pinnedAccount.coolingDownUntil > evaluatedAtMs
+					? pinnedAccount.coolingDownUntil
+					: null;
+			const pinnedResetAtMs = pinnedBlockedPermanently
+				? null
+				: isTranscribeRequest
+					? livePinnedTranscriptionRateLimitAtMs === null && pinnedAuthCooldownAtMs === null
+						? null
+						: Math.max(
+							livePinnedTranscriptionRateLimitAtMs ?? 0,
+							pinnedAuthCooldownAtMs ?? 0,
+						)
+					: pinnedStateRecoveryAtMs === null && pinnedCircuitRecoveryAtMs === null
+						? null
+						: Math.max(
 							pinnedStateRecoveryAtMs ?? 0,
 							pinnedCircuitRecoveryAtMs ?? 0,
 						);
 			// The message only words the recovery deadline as a rate-limit reset
-			// when the rate-limit records are in fact what supplies it — a
+			// when the rate-limit records are in fact what supplies it - a
 			// breaker or cooldown can end later and then bounds it instead.
-			const pinnedRateLimitResetAtMs =
-				pinnedRecoveryBounds?.rateLimitAtMs ?? null;
+			const pinnedRateLimitResetAtMs = isTranscribeRequest
+				? livePinnedTranscriptionRateLimitAtMs
+				: pinnedRecoveryBounds?.rateLimitAtMs ?? null;
 			const recoveryBound =
 				pinnedResetAtMs !== null &&
 				pinnedRateLimitResetAtMs !== null &&
@@ -3430,12 +3921,46 @@ async function handleRequestInner(
 		if (isThreadGoalRequest && context.upstreamPath.endsWith("/get")) {
 			writeJson(res, HTTP_STATUS.OK, { goal: null });
 		} else {
+			const transcriptionRetryAfterMs = isTranscribeRequest
+				? (() => {
+					const now = state.now();
+					let minWaitMs: number | null = null;
+					// Read live account state, not only selection skip reasons. The final
+					// refresh attempt can install an auth cooldown after the last selection
+					// pass, so that blocker may never have been written to accountSkipReasons.
+					for (const account of accountManager.getAccountsSnapshot()) {
+						if (policyDecision?.blockedAccountIndexes.has(account.index)) continue;
+						if (account.enabled === false) continue;
+						if (!accountManager.hasEnabledWorkspaces(account)) continue;
+						if (accountManager.isAccountAuthInvalidated(account)) continue;
+						const transcriptionUntil = account.recordId
+							? state.transcriptionRateLimitUntilByRecordId.get(account.recordId)
+							: undefined;
+						const authUntil =
+							account.cooldownReason === "auth-failure" &&
+							typeof account.coolingDownUntil === "number"
+								? account.coolingDownUntil
+								: undefined;
+						const readyAt = Math.max(
+							typeof transcriptionUntil === "number" && transcriptionUntil > now
+								? transcriptionUntil
+								: 0,
+							typeof authUntil === "number" && authUntil > now ? authUntil : 0,
+						);
+						if (readyAt <= now) return 0;
+						const waitMs = readyAt - now;
+						minWaitMs = minWaitMs === null ? waitMs : Math.min(minWaitMs, waitMs);
+					}
+					return minWaitMs ?? 0;
+				})()
+				: undefined;
 			writePoolExhausted({
 				res,
 				accountManager,
 				family: context.family,
 				model: context.model,
 				reason: exhaustionReason,
+				retryAfterMs: transcriptionRetryAfterMs,
 				accountSkipReasons: Object.fromEntries(
 					[...accountSkipReasons.entries()].map(([index, reason]) => [
 						String(index),

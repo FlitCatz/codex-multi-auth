@@ -88,6 +88,7 @@ const arbAppendInput: fc.Arbitrary<UsageLedgerAppendInput> = fc.record(
 				"images",
 				"models",
 				"thread-goal",
+				"transcribe",
 				"auth-refresh",
 				"diagnostic",
 				"bogus-op",
