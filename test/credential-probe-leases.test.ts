@@ -2,12 +2,32 @@ import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { clearCredentialSidecars } from "../lib/storage/credential-sidecars.js";
+import { clearAccountsAndCredentialSidecars, clearCredentialSidecars } from "../lib/storage/credential-sidecars.js";
 import { withFileTransactionLock } from "../lib/storage/file-lock.js";
 import { removeWithRetry } from "./helpers/remove-with-retry.js";
 let root:string;
 beforeEach(async()=>{root=await fs.mkdtemp(join(tmpdir(),"probe-lease-wipe-"));vi.stubEnv("CODEX_MULTI_AUTH_DIR",root);});
 afterEach(async()=>{vi.restoreAllMocks();vi.unstubAllEnvs();await removeWithRetry(root,{recursive:true,force:true});});
+it("finishes account reset when a concurrent uninstall removes the root before the lease sweep",async()=>{
+ const read=fs.readdir.bind(fs),remove=vi.spyOn(fs,"rm");let removed=false;
+ vi.spyOn(fs,"readdir").mockImplementation(async(...args)=>{
+  if(String(args[0])===root&&args[1]===undefined&&!removed){removed=true;await removeWithRetry(root,{recursive:true,force:true});}
+  return read(...args);
+ });
+ const clearPool=vi.fn(async()=>{});
+ await expect(clearAccountsAndCredentialSidecars(clearPool)).resolves.toBeUndefined();
+ expect(clearPool).toHaveBeenCalledOnce();expect(removed).toBe(true);
+ expect(remove).toHaveBeenCalledWith(join(root,"inference-activity"),{recursive:true,force:true});
+ await expect(fs.stat(root)).rejects.toMatchObject({code:"ENOENT"});
+});
+it.each(["EACCES","EIO"])("reports %s while enumerating old leases",async code=>{
+ const read=fs.readdir.bind(fs),error=Object.assign(Error("unreadable"),{code});
+ vi.spyOn(fs,"readdir").mockImplementation(async(...args)=>{
+  if(String(args[0])===root&&args[1]===undefined)throw error;
+  return read(...args);
+ });
+ await expect(clearCredentialSidecars()).rejects.toBe(error);
+});
 it("wipes crashed published and candidate probe locks, including a prior interrupted wipe",async()=>{
  const trees=["api-probe-locks","api-probe-locks.wiped-00000000-0000-4000-8000-000000000001"];
  for(const tree of trees)for(const suffix of [".write-lock",".write-lock.candidate-fixture"]){

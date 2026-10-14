@@ -1311,7 +1311,7 @@ export async function startRuntimeRotationProxy(
 	if (state.nativeOpenai) websocketGateway.attach(server, `http://${urlHost}:${resolvedPort}`);
 	// Embedded managers own their own lifecycle; ordinary CLI/app routers check opted-in accounts periodically.
 	const automaticChecks = options.accountManager ? undefined : startAutomaticAccountChecks(createAutomaticSubscriptionCheck());
-	const automaticApiChecks = options.accountManager || options.readApiRoutes ? undefined : startAutomaticApiChecks(createAutomaticApiCheck());
+	const automaticApiChecks = options.accountManager || options.readApiRoutes ? undefined : startAutomaticApiChecks(createAutomaticApiCheck(fetchImpl));
 	return {
 		host: bindHost,
 		port: resolvedPort,

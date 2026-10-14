@@ -59,6 +59,9 @@ function validate(value: unknown): ApiRouteCredential[] {
 		throw new Error("Invalid API route configuration");
 	return parsed.data.routes;
 }
+class InvalidApiRouteContentsError extends Error {
+	constructor() { super("Invalid API route configuration"); }
+}
 export async function loadApiRoutes(
 	path = getApiRoutesPath(),
 ): Promise<ApiRouteCredential[]> {
@@ -83,7 +86,7 @@ export async function loadApiRoutes(
 	try {
 		return validate(JSON.parse(raw));
 	} catch {
-		throw new Error("Invalid API route configuration");
+		throw new InvalidApiRouteContentsError();
 	}
 }
 export function saveApiRoutes(routes: ApiRouteCredential[], path = getApiRoutesPath(), expected?: ApiRouteCredential[]): Promise<void> {
@@ -124,10 +127,9 @@ async function saveApiRoutesLocked(
 	try {
 		current = await loadApiRoutes(path);
 	} catch (error) {
-		// A strict save needs a readable baseline to compare `expected` against.
-		// An unconditional save is the only repair path for a corrupt file, so
-		// it treats unreadable contents as empty rather than failing forever.
-		if (expected !== undefined) throw error;
+		// Only explicit replacement may repair parsed-content corruption. CAS,
+		// oversized reads and I/O failures must not be treated as an empty store.
+		if (expected !== undefined || !(error instanceof InvalidApiRouteContentsError)) throw error;
 		current = [];
 	}
 	await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });

@@ -246,3 +246,24 @@ it("returns its own canonical save snapshot and still rejects a later writer's e
   expect((await loadApiRoutes(file))[0]).toMatchObject({priority:2,enabled:false});
  }finally{spy.mockRestore();}
 });
+
+it.each(["not-json", JSON.stringify({version:1,routes:[{id:"broken"}]})])("repairs an invalid store only with an unconditional save: %s", async raw => {
+ const file=join(await tempDir(),"routes.json");
+ const route={id:"repair",label:"Repair",kind:"api" as const,apiKey:"fixture",enabled:true,priority:0,visibleModels:["fixture"],capabilityEpoch:"00000000-0000-4000-8000-000000000001",legacyCapabilityCache:true};
+ await writeFile(file,raw);
+ await expect(saveApiRoutes([route],file,[])).rejects.toThrow("Invalid API route configuration");
+ expect(await readFile(file,"utf8")).toBe(raw);
+ await saveApiRoutes([route],file);
+ const [saved]=await loadApiRoutes(file);
+ expect(saved).toMatchObject({id:"repair",apiKey:"fixture",visibleModels:["fixture"]});
+ expect(saved.capabilityEpoch).toEqual(expect.any(String));
+ expect(saved.capabilityEpoch).not.toBe(route.capabilityEpoch);
+ expect(saved.legacyCapabilityCache).toBeUndefined();
+});
+it.each(["oversized","EACCES","EIO"])("does not repair an unreadable store (%s)",async failure=>{
+ const file=join(await tempDir(),"routes.json"),raw=failure==="oversized"?"x".repeat(1024*1024+1):"not-json";
+ await writeFile(file,raw);
+ const open=fs.open.bind(fs);
+ const spy=vi.spyOn(fs,"open").mockImplementation(async(...args)=>{if(args[0]===file&&failure!=="oversized")throw Object.assign(Error("unreadable"),{code:failure});return open(...args);});
+ try{await expect(saveApiRoutes([],file)).rejects.toThrow("Unable to read API route configuration");expect(await readFile(file,"utf8")).toBe(raw);}finally{spy.mockRestore();}
+});

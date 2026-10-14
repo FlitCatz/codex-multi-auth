@@ -68,7 +68,7 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
  }
  return nextRunAt;
 }
-export function createAutomaticApiCheck(){return async(signal:AbortSignal)=>{
+export function createAutomaticApiCheck(upstreamFetch:typeof fetch=fetch){return async(signal:AbortSignal)=>{
  return runAutomaticApiChecks({
  path:join(getCodexMultiAuthDir(),"automatic-api-checks.json"),loadRoutes:loadApiRoutes,signal,prepareRoute:ensureApiRouteCapabilityEpoch,
  check:async(route,stop,programRefreshBefore)=>{
@@ -89,7 +89,7 @@ export function createAutomaticApiCheck(){return async(signal:AbortSignal)=>{
    signal.throwIfAborted();
    if(init?.method?.toUpperCase()==="POST" && (!discoveryAccepted || !(await loadApiRoutes()).some(r=>eligible(r)&&sameRoute(r,acceptedRoute))))throw Error("API check route changed");
    signal.throwIfAborted();
-   return fetch(input,{...init,signal});
+   return upstreamFetch(input,{...init,signal});
   };
   const inventory=await discoverModelInventory(null,[route],{fetchImpl:fetcher,signal:stop,persistProbes:true,programRefreshBefore,updateApiDiscovery:updateDiscovery});
   if(stop.aborted||!discoveryAccepted)return;
