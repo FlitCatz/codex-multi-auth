@@ -315,6 +315,7 @@ beforeEach(() => {
 	resetTrackers();
 	clearCircuitBreakers();
 	resetRefreshQueue();
+	tokenRefreshRuntime.resetRuntimeRefreshStateForTests();
 	__resetRoutingMutexForTests();
 	refreshAccessTokenMock.mockReset();
 	saveAccountsMock.mockReset();
@@ -957,7 +958,7 @@ describe("runtime rotation proxy", () => {
 		expect(await authUnknownPath.json()).toEqual({
 			error: {
 				message:
-					"Runtime rotation proxy only accepts Responses API, images, model discovery, and Codex thread goal requests.",
+					"Runtime rotation proxy only accepts Responses API, images, transcription, model discovery, and Codex thread goal requests.",
 				code: "runtime_rotation_proxy_not_found",
 			},
 		});
@@ -3196,6 +3197,367 @@ describe("runtime rotation proxy", () => {
 			"Bearer fresh-access",
 		]);
 		await accountManager.flushPendingSave();
+	});
+
+	it("persists redirected refresh bookkeeping on the replacement manager when indexes shift", async () => {
+		const now = Date.now();
+		const storage = createStorage(now, 2);
+		const removed = storage.accounts[0];
+		const refreshing = storage.accounts[1];
+		if (!removed || !refreshing) throw new Error("expected accounts");
+		removed.recordId = "row-a";
+		removed.enabled = false;
+		refreshing.recordId = "row-b";
+		refreshing.accessToken = "expired-access-2";
+		refreshing.expiresAt = now - 60_000;
+
+		const previous = new AccountManager(undefined, storage);
+		const replacementStorage: AccountStorageV3 = {
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [structuredClone(refreshing)],
+		};
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(replacement);
+		vi.spyOn(previous, "saveToDiskDebounced").mockImplementation(() => undefined);
+		vi.spyOn(replacement, "saveToDiskDebounced").mockImplementation(() => undefined);
+		const previousSync = vi
+			.spyOn(previous, "syncCodexCliActiveSelectionForIndex")
+			.mockResolvedValue();
+		const replacementSync = vi
+			.spyOn(replacement, "syncCodexCliActiveSelectionForIndex")
+			.mockResolvedValue();
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(null, async () => undefined),
+		);
+
+		let releaseRefresh!: () => void;
+		const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+		refreshAccessTokenMock.mockImplementation(async () => {
+			await refreshGate;
+			return {
+				type: "success",
+				access: "fresh-access-2",
+				refresh: "refresh-2-new",
+				expires: now + 3_600_000,
+			};
+		});
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager: previous, fetchImpl });
+
+		const pending = postResponses(proxy, { model: "gpt-5-codex" });
+		await vi.waitFor(() => expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1));
+		tokenRefreshRuntime.redirectRuntimeRefreshCommits(previous, replacement);
+		releaseRefresh();
+		const response = await pending;
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		await response.text();
+
+		expect(previousSync).not.toHaveBeenCalled();
+		expect(replacementSync).toHaveBeenCalledWith(0);
+		expect(replacement.getAccountByIndex(0)).toMatchObject({
+			recordId: "row-b",
+			access: "fresh-access-2",
+			refreshToken: "refresh-2-new",
+		});
+		expect(calls.filter((call) => call.url.endsWith("/responses"))).toHaveLength(1);
+		expect(calls.find((call) => call.url.endsWith("/responses"))?.headers.get("authorization")).toBe(
+			"Bearer fresh-access-2",
+		);
+	});
+
+
+	it("retargets a late inference 429 onto the replacement manager after redirect", async () => {
+		const now = Date.now();
+		const storage = createStorage(now, 1);
+		const source = storage.accounts[0];
+		if (!source) throw new Error("expected account");
+		source.recordId = "row-a";
+		const previous = new AccountManager(undefined, storage);
+		const replacement = new AccountManager(undefined, structuredClone(storage));
+		openManagers.push(replacement);
+		vi.spyOn(previous, "saveToDiskDebounced").mockImplementation(() => undefined);
+		vi.spyOn(replacement, "saveToDiskDebounced").mockImplementation(() => undefined);
+		const previousRateLimit = vi.spyOn(previous, "recordRateLimit");
+		const replacementRateLimit = vi.spyOn(replacement, "recordRateLimit");
+		const replacementMarkRateLimited = vi.spyOn(replacement, "markRateLimitedWithReason");
+
+		let markUpstreamStarted!: () => void;
+		const upstreamStarted = new Promise<void>((resolve) => { markUpstreamStarted = resolve; });
+		let releaseUpstream!: () => void;
+		const upstreamGate = new Promise<void>((resolve) => { releaseUpstream = resolve; });
+		const { fetchImpl } = createRecordingFetch(async (call) => {
+			if (call.url.endsWith("/responses")) {
+				markUpstreamStarted();
+				await upstreamGate;
+				return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+					status: HTTP_STATUS.TOO_MANY_REQUESTS,
+					headers: { "content-type": "application/json", "retry-after": "60" },
+				});
+			}
+			return textEventStream();
+		});
+		const proxy = await startProxy({ accountManager: previous, fetchImpl });
+
+		const pending = postResponses(proxy, { model: "gpt-5-codex", input: "fixture" });
+		await upstreamStarted;
+		tokenRefreshRuntime.redirectRuntimeRefreshCommits(previous, replacement);
+		releaseUpstream();
+		const response = await pending;
+		await response.text();
+
+		expect(previousRateLimit).not.toHaveBeenCalled();
+		expect(replacementRateLimit).toHaveBeenCalledTimes(1);
+		expect(replacementMarkRateLimited).toHaveBeenCalledWith(
+			expect.objectContaining({ recordId: "row-a" }),
+			expect.any(Number),
+			expect.any(String),
+			"unknown",
+			"gpt-5-codex",
+		);
+	});
+
+	it("remaps approved workspace candidates when a refreshed account moves indexes", async () => {
+		const now = Date.now();
+		const storage = createStorage(now, 2);
+		const removed = storage.accounts[0];
+		const moving = storage.accounts[1];
+		if (!removed || !moving) throw new Error("expected accounts");
+		removed.recordId = "row-a";
+		removed.accountId = "removed-workspace";
+		removed.workspaces = [{ id: "removed-workspace", enabled: true }];
+		moving.recordId = "row-b";
+		moving.accountId = "disabled-binding";
+		moving.workspaces = [
+			{ id: "disabled-binding", enabled: false },
+			{ id: "enabled-workspace", enabled: true },
+		];
+		moving.currentWorkspaceIndex = 1;
+		const previous = new AccountManager(undefined, storage);
+		const replacementStorage: AccountStorageV3 = {
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [structuredClone(moving)],
+		};
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(replacement);
+		const { calls, fetchImpl } = createRecordingFetch((call) => {
+			if (call.url.includes("/models")) {
+				const workspace = call.headers.get(OPENAI_HEADERS.ACCOUNT_ID);
+				return Response.json({ models: workspace === "enabled-workspace" ? [{ slug: "model-test" }] : [{ slug: "other" }] });
+			}
+			return textEventStream();
+		});
+		const proxy = await startProxy({
+			accountManager: previous,
+			fetchImpl,
+			options: { nativeOpenai: true, readApiRoutes: async () => [] },
+		});
+		const catalog = await getModels(proxy, "/models?refresh_capabilities=1");
+		expect(catalog.status).toBe(HTTP_STATUS.OK);
+		await catalog.text();
+		const refresh = vi
+			.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken")
+			.mockImplementation(async ({ account, accountManager }) => {
+				if (account.recordId !== "row-b") {
+					return { ok: true, accessToken: account.access!, account, accountManager };
+				}
+				const replacementAccount = replacement.getAccountByIndex(0);
+				if (!replacementAccount) throw new Error("replacement account missing");
+				return {
+					ok: true,
+					accessToken: replacementAccount.access!,
+					account: replacementAccount,
+					accountManager: replacement,
+				};
+			});
+		try {
+			const response = await postResponses(proxy, { model: "model-test", input: "fixture" });
+			expect(response.status).toBe(HTTP_STATUS.OK);
+			await response.text();
+		} finally {
+			refresh.mockRestore();
+		}
+		const inference = calls.filter((call) => call.url.endsWith("/responses"));
+		expect(inference).toHaveLength(1);
+		expect(inference[0]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("enabled-workspace");
+	});
+
+
+	it("keeps an empty approved-workspace guard when every approved scope disappears during refresh", async () => {
+		const now = Date.now();
+		const storage = createStorage(now, 1);
+		const moving = storage.accounts[0];
+		if (!moving) throw new Error("expected account");
+		moving.recordId = "row-a";
+		moving.accountId = "fallback-workspace";
+		moving.workspaces = [
+			{ id: "fallback-workspace", enabled: true },
+			{ id: "approved-workspace", enabled: true },
+		];
+		moving.currentWorkspaceIndex = 0;
+		const previous = new AccountManager(undefined, storage);
+		const replacementStorage: AccountStorageV3 = {
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [structuredClone(moving)],
+		};
+		replacementStorage.accounts[0]!.workspaces = [
+			{ id: "fallback-workspace", enabled: true },
+			{ id: "approved-workspace", enabled: false },
+		];
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(replacement);
+		const { calls, fetchImpl } = createRecordingFetch((call) => {
+			if (call.url.includes("/models")) {
+				const workspace = call.headers.get(OPENAI_HEADERS.ACCOUNT_ID);
+				return Response.json({
+					models: workspace === "approved-workspace" ? [{ slug: "model-test" }] : [{ slug: "other" }],
+				});
+			}
+			return textEventStream();
+		});
+		const proxy = await startProxy({
+			accountManager: previous,
+			fetchImpl,
+			options: { nativeOpenai: true, readApiRoutes: async () => [] },
+		});
+		const catalog = await getModels(proxy, "/models?refresh_capabilities=1");
+		expect(catalog.status).toBe(HTTP_STATUS.OK);
+		await catalog.text();
+		const refresh = vi
+			.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken")
+			.mockImplementation(async () => {
+				const replacementAccount = replacement.getAccountByIndex(0);
+				if (!replacementAccount) throw new Error("replacement account missing");
+				return {
+					ok: true,
+					accessToken: replacementAccount.access!,
+					account: replacementAccount,
+					accountManager: replacement,
+				};
+			});
+		try {
+			const response = await postResponses(proxy, { model: "model-test", input: "fixture" });
+			expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+			await response.text();
+		} finally {
+			refresh.mockRestore();
+		}
+		expect(calls.filter((call) => call.url.endsWith("/responses"))).toHaveLength(0);
+	});
+
+	it("restarts selection on the replacement manager when the refreshed row was removed", async () => {
+		const now = Date.now();
+		const oldStorage = createStorage(now, 1);
+		const old = oldStorage.accounts[0];
+		if (!old) throw new Error("expected old account");
+		old.recordId = "row-old";
+		old.accessToken = "expired-old";
+		old.expiresAt = now - 60_000;
+		const previous = new AccountManager(undefined, oldStorage);
+
+		const replacementStorage = createStorage(now, 1);
+		const healthy = replacementStorage.accounts[0];
+		if (!healthy) throw new Error("expected replacement account");
+		healthy.recordId = "row-new";
+		healthy.accessToken = "healthy-access";
+		healthy.refreshToken = "healthy-refresh";
+		healthy.expiresAt = now + 3_600_000;
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(replacement);
+
+		const refresh = vi
+			.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken")
+			.mockImplementation(async ({ accountManager, account }) => {
+				if (accountManager === previous) {
+					return {
+						ok: false,
+						retryable: true,
+						selectionRestart: true,
+						accountManager: replacement,
+					};
+				}
+				return {
+					ok: true,
+					accessToken: account.access!,
+					account,
+					accountManager,
+				};
+			});
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({ accountManager: previous, fetchImpl });
+		try {
+			const response = await postResponses(proxy, { model: "gpt-5-codex", input: "fixture" });
+			expect(response.status).toBe(HTTP_STATUS.OK);
+			await response.text();
+		} finally {
+			refresh.mockRestore();
+		}
+		const inference = calls.filter((call) => call.url.endsWith("/responses"));
+		expect(inference).toHaveLength(1);
+		expect(inference[0]?.headers.get("authorization")).toBe("Bearer healthy-access");
+	});
+
+	it("fails closed when a hard-pinned row disappears during refresh", async () => {
+		const now = Date.now();
+		const oldStorage = createStorage(now, 1);
+		const old = oldStorage.accounts[0];
+		if (!old) throw new Error("expected old account");
+		old.recordId = "row-pinned";
+		old.accessToken = "expired-pinned";
+		old.expiresAt = now - 60_000;
+		const previous = new AccountManager(undefined, oldStorage);
+
+		const replacementStorage = createStorage(now, 1);
+		const other = replacementStorage.accounts[0];
+		if (!other) throw new Error("expected replacement account");
+		other.recordId = "row-other";
+		other.accessToken = "other-access";
+		other.refreshToken = "other-refresh";
+		other.expiresAt = now + 3_600_000;
+		const replacement = new AccountManager(undefined, replacementStorage);
+		openManagers.push(replacement);
+
+		const refresh = vi
+			.spyOn(tokenRefreshRuntime, "ensureFreshAccessToken")
+			.mockImplementation(async ({ accountManager, account }) => {
+				if (accountManager === previous) {
+					return {
+						ok: false,
+						retryable: true,
+						selectionRestart: true,
+						accountManager: replacement,
+					};
+				}
+				return {
+					ok: true,
+					accessToken: account.access!,
+					account,
+					accountManager,
+				};
+			});
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream());
+		const proxy = await startProxy({
+			accountManager: previous,
+			fetchImpl,
+			options: { forcedAccountIndex: 0 },
+		});
+		try {
+			const response = await postResponses(proxy, { model: "gpt-5-codex", input: "fixture" });
+			expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+			const payload = await response.json() as { error: { code?: string; pinnedAccountIndex?: number | null; reason?: string | null } };
+			expect(payload.error.code).toBe("codex_pinned_account_unavailable");
+			expect(payload.error.pinnedAccountIndex).toBe(0);
+			expect(payload.error.reason).toBe("missing");
+		} finally {
+			refresh.mockRestore();
+		}
+		const inference = calls.filter((call) => call.url.endsWith("/responses"));
+		expect(inference).toHaveLength(0);
 	});
 
 	it("deduplicates pending refresh commits per account when OAuth tuples differ", async () => {
@@ -5690,9 +6052,9 @@ it("stops a stored pin after refresh disables its only workspace",async()=>{
  const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"shared"}]}):textEventStream());
  const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true,readNativeAccountStorage:async()=>structuredClone(stored)}});
  await (await getModels(proxy,"/models?refresh_capabilities=1")).text();
- const refresh=vi.spyOn(tokenRefreshRuntime,"ensureFreshAccessToken").mockImplementation(async({account})=>{
+ const refresh=vi.spyOn(tokenRefreshRuntime,"ensureFreshAccessToken").mockImplementation(async({accountManager,account})=>{
   account.workspaces![0]!.enabled=false;
-  return {ok:true,accessToken:account.access!,account};
+  return {ok:true,accessToken:account.access!,account,accountManager};
  });
  const response=await postResponses(proxy,{model:"shared",input:"hello"});
  const body=await response.json();

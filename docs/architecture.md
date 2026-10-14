@@ -56,7 +56,7 @@ Official Codex CLI ──POST /responses──>
 Runtime rotation proxy (loopback only)
  |
  | 1. authenticate client (per-launch key, timing-safe compare)
- | 2. gate method/path/body (Responses, models, images, thread-goal only)
+ | 2. gate method/path/body (Responses, models, images, transcription, thread-goal only)
  | 3. evaluateRuntimePolicy: model allow/deny, budgets, pause/drain, tags
  | 4. choose account: pin → priority → sequential|affinity → hybrid → scan
  | 5. refresh access token if inside the 60s skew window
@@ -117,7 +117,7 @@ On an interactive terminal with a populated pool, bare `codex-multi-auth login` 
 
 ### 3. Runtime rotation proxy
 
-`lib/runtime-rotation-proxy.ts`, provider id `codex-multi-auth-runtime-proxy`. It forwards only these routes: `POST /responses` (+ `/codex/`, `/v1/` aliases), `GET /models` (+ `/v1`), [image generation/edit routes](reference/image-routes.md), and `GET|POST /thread/goal/*`. Everything else is a 404. Bodies are capped at 64 MiB; gzip/deflate/br/zstd request encodings are decoded.
+`lib/runtime-rotation-proxy.ts`, provider id `codex-multi-auth-runtime-proxy`. It forwards only these routes: `POST /responses` (+ `/codex/`, `/v1/` aliases), `GET /models` (+ `/v1`), [image generation/edit routes](reference/image-routes.md), `POST /transcribe`, and `GET|POST /thread/goal/*`. Everything else is a 404. `/transcribe` forwards the multipart audio bytes and original `Content-Type` boundary unchanged while replacing local client credentials with managed ChatGPT OAuth; ambiguous transport/upstream failures are not replayed across accounts. Bodies are capped at 64 MiB — for `/transcribe` the cap applies to the encoded multipart upload. gzip/deflate/br/zstd request encodings are decoded on the JSON routes only; `/transcribe` forwards the original bytes and `Content-Encoding` untouched.
 
 Per request it applies policy before picking an account, refreshes tokens through a deduplicating queue (one in-flight refresh per token, cross-process leases so two CLIs do not double-refresh), classifies upstream responses into rotation marks (rate-limit, cooldown, circuit breaker, workspace disable, token invalidation), and streams successful bytes back with stall detection and backpressure. Runtime counters land in `runtime-observability.json` for `status`, `report`, `monitor`, `rotation status`, and `why-selected`.
 

@@ -312,6 +312,7 @@ export class AccountManager {
 	private readonly persistedWorkspaceSelections = new WeakMap<ManagedAccount, string | undefined>();
 	private readonly persistedWorkspaces = new WeakMap<ManagedAccount, Workspace[] | undefined>();
 	private hadPersistedStorage = false;
+	private readonly loadedAccountStorageSnapshot: boolean;
 	private cursorByFamily: Record<ModelFamily, number> = initFamilyState(0);
 	private currentAccountIndexByFamily: Record<ModelFamily, number> =
 		initFamilyState(-1);
@@ -379,6 +380,21 @@ export class AccountManager {
 		const manager = new AccountManager(authFallback, sourceOfTruthStorage);
 		await manager.hydrateFromCodexCli();
 		return manager;
+	}
+
+	/** @internal True when construction received a parsed/recovered storage snapshot. */
+	hasLoadedAccountStorageSnapshot(): boolean {
+		return this.loadedAccountStorageSnapshot;
+	}
+
+	/** @internal True only when this account identity was explicitly persisted, not legacy-derived in memory. */
+	hasPersistedRecordId(account: ManagedAccount): boolean {
+		const recordId = account.recordId?.trim();
+		if (!recordId || !this.persistenceBaseline) return false;
+		const baseline = this.persistenceBaseline.accounts.find(
+			(row) => resolveAccountRecordId(row) === recordId,
+		);
+		return typeof baseline?.recordId === "string" && baseline.recordId.trim().length > 0;
 	}
 
 	hasRefreshToken(refreshToken: string): boolean {
@@ -460,6 +476,7 @@ export class AccountManager {
 		stored?: AccountStorageV3 | null,
 	) {
 		this.storagePathState = { ...getStoragePathState() };
+		this.loadedAccountStorageSnapshot = stored !== undefined && stored !== null;
 		this.hadPersistedStorage = existsSync(this.resolveSelectionStoragePath());
 		const fallbackAccountId =
 			extractAccountId(authFallback?.access)?.trim() || undefined;
@@ -756,6 +773,7 @@ export class AccountManager {
 				_runtimeTrackerKey: trackerKey,
 				circuitKeyId,
 				rateLimitResetTimes: { ...account.rateLimitResetTimes },
+				workspaces: account.workspaces?.map((workspace) => ({ ...workspace })),
 			};
 		});
 	}
@@ -1799,6 +1817,16 @@ export class AccountManager {
 					return null;
 				}
 
+				const liveAccount = this.getAccountByIdentity(source, auth);
+				// Credential rotation proves auth health only. It must not erase an
+				// unrelated inference network/server/rate-limit backoff that happens
+				// to be live on the same account.
+				const preserveNonAuthCooldown =
+					liveAccount?.cooldownReason !== undefined &&
+					liveAccount.cooldownReason !== "auth-failure" &&
+					typeof liveAccount.coolingDownUntil === "number" &&
+					liveAccount.coolingDownUntil > nowMs();
+
 				storedAccount.refreshToken = auth.refresh;
 				storedAccount.accessToken = auth.access;
 				storedAccount.expiresAt = auth.expires;
@@ -1818,10 +1846,14 @@ export class AccountManager {
 				storedAccount.enabled = undefined;
 				delete storedAccount.authInvalidatedAt;
 				delete storedAccount.authInvalidationErrorCode;
-				delete storedAccount.coolingDownUntil;
-				delete storedAccount.cooldownReason;
+				if (preserveNonAuthCooldown && liveAccount) {
+					storedAccount.coolingDownUntil = liveAccount.coolingDownUntil;
+					storedAccount.cooldownReason = liveAccount.cooldownReason;
+				} else {
+					delete storedAccount.coolingDownUntil;
+					delete storedAccount.cooldownReason;
+				}
 
-				const liveAccount = this.getAccountByIdentity(source, auth);
 				if (liveAccount) {
 					const previousLiveAccountState = {
 						access: liveAccount.access,
@@ -1841,7 +1873,7 @@ export class AccountManager {
 
 					this.updateFromAuth(liveAccount, auth);
 					liveAccount.enabled = true;
-					this.clearAccountCooldown(liveAccount);
+					if (!preserveNonAuthCooldown) this.clearAccountCooldown(liveAccount);
 					this.clearAuthFailures(liveAccount);
 
 					try {

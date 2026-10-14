@@ -23,6 +23,7 @@ const VALID_OPERATIONS = new Set<UsageLedgerOperation>([
 	"images",
 	"models",
 	"thread-goal",
+	"transcribe",
 	"auth-refresh",
 	"diagnostic",
 	"unknown",

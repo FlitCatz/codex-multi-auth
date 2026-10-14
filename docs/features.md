@@ -53,7 +53,7 @@ On by default for request-bearing Codex sessions launched through `codex-multi-a
 | Reversible desktop app bind | Routes packaged-app traffic without patching app files |
 | Launcher routing | `codex-multi-auth-app-launcher` retargets user-level shortcuts or builds a macOS wrapper app |
 
-The proxy also forwards model discovery and image generation/edits. See [reference/image-routes.md](reference/image-routes.md) and [reference/imagegen-provider-compatibility.md](reference/imagegen-provider-compatibility.md) for image-specific behavior.
+The proxy also forwards model discovery, image generation/edits, and Codex dictation (`POST /transcribe`) — the multipart audio body is passed through byte-for-byte with managed OAuth credentials, and ambiguous failures are never replayed across accounts. See [reference/image-routes.md](reference/image-routes.md) and [reference/imagegen-provider-compatibility.md](reference/imagegen-provider-compatibility.md) for image-specific behavior.
 
 ---
 

@@ -92,6 +92,14 @@ codex-multi-auth rotation status
 codex-multi-auth forecast --live
 ```
 
+### Transcription Route Through Managed OAuth
+
+`POST /transcribe` on the runtime rotation proxy now forwards Codex multipart audio through the managed OAuth account pool instead of bypassing it. The multipart body and the original `Content-Type` boundary are forwarded untouched; ambiguous transport/upstream failures are not replayed across accounts.
+
+- Usage rows land in the ledger with operation `transcribe` — `codex-multi-auth usage` filters or budgets keyed by operation will start seeing them, and per-account transcription rate-limit backoff is tracked separately from the Responses cooldown path.
+- Explicit auth/workspace invalidation still applies account-wide.
+- No new npm scripts were added.
+
 ### Model Defaults
 
 - General routing default (`DEFAULT_MODEL`): `gpt-6.1-sol`. The `gpt-5` alias targets `gpt-5.6-sol`, the newest 5.x generation still served.

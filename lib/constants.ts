@@ -58,6 +58,7 @@ export const URL_PATHS = {
 	MODELS: "/models",
 	RESPONSES: "/responses",
 	CODEX_RESPONSES: "/codex/responses",
+	TRANSCRIBE: "/transcribe",
 } as const;
 
 /** JWT claim path for ChatGPT account ID */
