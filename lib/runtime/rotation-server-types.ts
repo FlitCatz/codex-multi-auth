@@ -20,6 +20,7 @@ export interface RuntimeRotationProxyServer {
 }
 
 export interface RuntimeRotationProxyStatus {
+	schedulingStrategy?: "hybrid" | "sequential";
 	streamQuotaUpdates?: number;
 	lastStreamQuotaUpdateAt?: number;
  websocketConnections?: number;

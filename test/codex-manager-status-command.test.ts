@@ -11,6 +11,7 @@ import { runCodexMultiAuthCli } from "../lib/codex-manager.js";
 import type { AccountStorageV3, StorageHealthSummary } from "../lib/storage.js";
 import type { RuntimeObservabilitySnapshot } from "../lib/runtime/runtime-observability.js";
 import { AUTH_INVALIDATION_MARKER } from "../lib/accounts.js";
+import { getAccountPolicyKey } from "../lib/account-policy.js";
 
 function createStorage(): AccountStorageV3 {
 	return {
@@ -623,6 +624,45 @@ it("shows reset-aware subscription order separately from configured tiers and ma
  logInfo.mockClear();await runStatusCommand({...deps,json:false});
  expect(logInfo.mock.calls.flat().join("\n")).toContain("automatic order: #1");
  expect(logInfo.mock.calls.flat().join("\n")).toContain("5% reserve");
+});
+
+it.each([
+ ["saved order", "sequential", [0, 0, 1], [1, 2, 3], 90, undefined],
+ ["active cursor", "sequential", [1, 1, 1], [2, 3, 1], 90, undefined],
+ ["quota order", "hybrid", [0, 0, 1], [2, 1, 3], 90, undefined],
+ ["reserve fallback", "sequential", [0, 0, 1], [3, 1, 2], 5, undefined],
+ ["running sequential order", "hybrid", [0, 0, 1], [1, 2, 3], 90, "sequential"],
+ ["running hybrid order", "sequential", [0, 0, 1], [2, 1, 3], 90, "hybrid"],
+] as const)("reports %s consistently in native status JSON and text", async (_name, strategy, priorities, expected, firstRemaining, reportedStrategy) => {
+ vi.stubEnv("CODEX_AUTH_SCHEDULING_STRATEGY", strategy);
+ try {
+  const now = 2000;
+  const accounts = Array.from({length:3}, (_,index) => ({accountId:`order-${index}`,refreshToken:`fixture-${index}`,addedAt:1,lastUsed:1}));
+  const policies = Object.fromEntries(accounts.map((account,index) => {
+   const key = getAccountPolicyKey(account,index);
+   return [key,{accountKey:key,tags:[],weight:1,priority:priorities[index] ?? 1,autoPrime:false,paused:false,drained:false,note:null,updatedAt:now}];
+  }));
+  const quota = Object.fromEntries([[firstRemaining,5],[50,1],[90,10]].map(([remaining,hours],index) => [`order-${index}`,{updatedAt:now,status:200,model:"fixture",planType:"pro",primary:{usedPercent:100-remaining!,resetAtMs:now+hours!*3600000},secondary:{}}]));
+  const logInfo = vi.fn();
+  const deps = createStatusDeps({
+   logInfo,json:true,resolveActiveIndex:()=>2,
+   loadAccounts:async()=>({version:3,activeIndex:2,activeIndexByFamily:{codex:2},accounts}),
+   loadAccountPolicies:async()=>({version:1,accounts:policies}),
+   loadQuotaCache:async()=>({byEmail:{},byAccountId:quota}),
+   loadAppBindStatus:async()=>({nativeOpenai:true,schedulingStrategy:reportedStrategy,state:"running",pid:123,baseUrl:null,totalRequests:0,lastAccountIndex:null,lastAccountLabel:null,lastAccountEmail:null,lastAccountId:null,updatedAt:now,lastError:null}),
+  });
+  await runStatusCommand(deps);
+  const result = JSON.parse(logInfo.mock.calls[0]![0]);
+  expect(result.accounts.map((account:{automaticOrder:number})=>account.automaticOrder)).toEqual(expected);
+  logInfo.mockClear();
+  await runStatusCommand({...deps,json:false});
+  const lines = logInfo.mock.calls.map(call=>String(call[0]));
+  for (let index=0;index<accounts.length;index++) {
+   const row = lines.findIndex(line=>line.includes(`${index+1}. Account ${index+1}`));
+   expect(row).toBeGreaterThanOrEqual(0);
+   expect(lines.slice(row+1).find(line=>line.includes("automatic order:"))).toContain(`#${expected[index]}`);
+  }
+ } finally {vi.unstubAllEnvs();}
 });
 
 it("shows cached reset counts for the saved workspace and distinguishes unknown",async()=>{

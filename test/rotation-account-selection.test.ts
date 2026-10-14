@@ -410,6 +410,130 @@ describe("capability-aware priority tiers",()=>{
  });
 });
 
+describe("sequential order within priority tiers", () => {
+	const quota = (remainingPercent: number, resetHours: number) => ({
+		plan: "subscription" as const,
+		remainingPercent,
+		resetAtMs: NOW + resetHours * 3_600_000,
+		urgency: null,
+		exhausted: remainingPercent === 0,
+		observedAt: NOW,
+	});
+
+	it.each([
+		["sequential", 0, 1],
+		["hybrid", 1, 0],
+	] as const)("%s respects its account ordering strategy", (schedulingStrategy, expected, preferredIndex) => {
+		const accountManager = manager();
+		const markSwitched = vi.spyOn(accountManager, "markSwitched");
+		const policy = { ...policyWith(), priorityByAccount: { 0: 0, 1: 0, 2: 1 } };
+		const selected = chooseAccount({
+			...baseParams(accountManager),
+			policy,
+			preferredIndex,
+			schedulingStrategy,
+			subscriptionQuotaByAccount: { 0: quota(100, 5), 1: quota(50, 1), 2: quota(90, 168) },
+		});
+
+		expect(selected?.index).toBe(expected);
+		expect(markSwitched).not.toHaveBeenCalled();
+	});
+
+	it.each([undefined, 1])("keeps the active cursor for default priorities with preference %s", (preferredIndex) => {
+		const storage = storageWith(3);
+		storage.activeIndexByFamily = { [FAMILY]: 1 };
+		const accountManager = new AccountManager(undefined, storage);
+		const policy = { ...policyWith(), priorityByAccount: { 0: 1, 1: 1, 2: 1 } };
+		const selected = chooseAccount({
+			...baseParams(accountManager), policy, preferredIndex, schedulingStrategy: "sequential",
+			subscriptionQuotaByAccount: { 0: quota(100, 1), 1: quota(50, 5), 2: quota(90, 168) },
+		});
+		expect(selected?.index).toBe(1);
+		expect(accountManager.getActiveIndexForFamily(FAMILY)).toBe(1);
+	});
+
+	it("returns to the earlier configured account after it recovers", () => {
+		const accountManager = manager(3, { 0: { rateLimitResetTimes: { [FAMILY]: NOW + 600_000 } } });
+		const policy = { ...policyWith(), priorityByAccount: { 0: 0, 1: 0, 2: 1 } };
+		const params = { ...baseParams(accountManager), policy, preferredIndex: 1, schedulingStrategy: "sequential" as const };
+		expect(chooseAccount(params)?.index).toBe(1);
+		const first = accountManager.getAccountByIndex(0);
+		if (!first) throw new Error("fixture account missing");
+		delete first.rateLimitResetTimes[FAMILY];
+		expect(chooseAccount({ ...params, attemptedIndexes: new Set() })?.index).toBe(0);
+	});
+
+	it.each([
+		["healthy", 50, 0, 1],
+		["exhausted", 0, 2, 2],
+		["reserved", 5, 2, 2],
+	] as const)("retries a %s default-priority account with the correct primary", (_state, remainingPercent, expected, primary) => {
+		const storage = storageWith(3);
+		storage.activeIndexByFamily = { [FAMILY]: 1 };
+		const accountManager = new AccountManager(undefined, storage);
+		const policy = { ...policyWith(), priorityByAccount: { 0: 1, 1: 1, 2: 1 } };
+		const params = {
+			...baseParams(accountManager), policy, preferredIndex: 1, schedulingStrategy: "sequential" as const,
+			subscriptionQuotaByAccount: { 0: quota(100, 1), 1: quota(remainingPercent, 5), 2: quota(90, 168) },
+		};
+		expect(chooseAccount({ ...params, attemptedIndexes: new Set([1]) })?.index).toBe(expected);
+		expect(accountManager.getAccountByIndex(expected)?.lastUsed).toBe(NOW);
+		expect(accountManager.getActiveIndexForFamily(FAMILY)).toBe(primary);
+		expect(chooseAccount(params)?.index).toBe(primary);
+	});
+
+	it("uses saved order even when quota measurements are unavailable", () => {
+		const accountManager = manager();
+		const policy = { ...policyWith(), priorityByAccount: { 0: 0, 1: 0, 2: 1 } };
+		expect(chooseAccount({ ...baseParams(accountManager), policy, preferredIndex: 1, schedulingStrategy: "sequential" })?.index).toBe(0);
+	});
+
+	it("updates saved-order activity without moving the cursor", () => {
+		const storage = storageWith(3);
+		storage.activeIndexByFamily = { [FAMILY]: 2 };
+		const accountManager = new AccountManager(undefined, storage);
+		const markSwitched = vi.spyOn(accountManager, "markSwitched");
+		const policy = { ...policyWith(), priorityByAccount: { 0: 0, 1: 0, 2: 1 } };
+		const selected = chooseAccount({ ...baseParams(accountManager), policy, preferredIndex: 2, schedulingStrategy: "sequential" });
+		expect(selected?.index).toBe(0);
+		expect(selected?.lastUsed).toBe(NOW);
+		expect(accountManager.getActiveIndexForFamily(FAMILY)).toBe(2);
+		expect(markSwitched).not.toHaveBeenCalled();
+	});
+
+	it.each(["attempted", "rate-limited", "disabled", "paused", "reserve", "exhausted"])(
+		"falls back in saved order when the first account is %s",
+		(reason) => {
+			const accountManager = manager(3, {
+				0: {
+					enabled: reason !== "disabled",
+					rateLimitResetTimes: reason === "rate-limited" ? { [FAMILY]: NOW + 600_000 } : {},
+				},
+			});
+			const policy = { ...policyWith(reason === "paused" ? [0] : []), priorityByAccount: { 0: 0, 1: 0, 2: 1 } };
+			const params = {
+				...baseParams(accountManager),
+				policy,
+				preferredIndex: 0,
+				schedulingStrategy: "sequential" as const,
+				attemptedIndexes: new Set(reason === "attempted" ? [0] : []),
+				subscriptionQuotaByAccount: { 0: quota(reason === "reserve" ? 5 : reason === "exhausted" ? 0 : 100, 1), 1: quota(50, 5), 2: quota(90, 2) },
+			};
+			expect(chooseAccount(params)?.index).toBe(1);
+			expect(chooseAccount({ ...params, attemptedIndexes: new Set([0, 1]) })?.index).toBe(2);
+			expect(chooseAccount({ ...params, attemptedIndexes: new Set([0, 1, 2]) })).toBeNull();
+			expect(policy.blockedAccountIndexes).toEqual(new Set(reason === "paused" ? [0] : []));
+		});
+
+	it("keeps priority tiers and explicit pins ahead of saved order", () => {
+		const accountManager = manager();
+		const policy = { ...policyWith(), priorityByAccount: { 0: 2, 1: 0, 2: 1 } };
+		const params = { ...baseParams(accountManager), policy, preferredIndex: 0, schedulingStrategy: "sequential" as const };
+		expect(chooseAccount(params)?.index).toBe(1);
+		expect(chooseAccount({ ...params, pinnedIndex: 2 })?.index).toBe(2);
+	});
+});
+
 describe("app-bind pin first with fallback", () => {
  it("tries an eligible pin before earlier configured tiers then falls back in tier order", () => {
   const m=manager();const policy={...policyWith(),priorityByAccount:{0:8,1:1,2:2}};
