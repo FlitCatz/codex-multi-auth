@@ -134,6 +134,19 @@ Unused Pro Max (Pro 500) subscriptions now qualify for opted-in first-use primin
 - Status reads cached observations without network calls. Observations older than 30 minutes are stale, and 0% usage can still have a running reset timer.
 - Use `check accounts` to refresh observations, or add `--prime` to allow first-use completion. Existing priming policies are preserved.
 
+### Sequential Scheduling With Customized Priorities
+
+When `schedulingStrategy` is `sequential` and any account priority differs from
+`1`, routing now follows saved account order within each eligible tier. Quota
+reset ranking and the current active account no longer override that order.
+Pools with all priorities at `1` keep the healthy active cursor. Strict pins,
+eligibility checks, exhausted-account skipping, and reserve fallback still apply.
+Hybrid scheduling keeps its quota ranking.
+
+Restart the router or session after upgrading to load the new behavior. Native
+`status` uses the running router's reported strategy; older routers without this
+metadata fall back to the current settings, which may differ until restart.
+
 No new npm scripts or manual storage migration are required.
 
 ---

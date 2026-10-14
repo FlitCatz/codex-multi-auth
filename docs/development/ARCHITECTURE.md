@@ -114,7 +114,7 @@ Per accepted request, `lib/runtime-rotation-proxy.ts` runs this pipeline. Steps 
 `lib/runtime/rotation-account-selection.ts`:
 
 1. **Soft pin** — the persisted `pinnedAccountIndex` written by `codex-multi-auth switch` (native stored switch), used once.
-2. **Policy priority tiers** — accounts with a `priority` (0–9) from `codex-multi-auth account priority`, lowest tier first.
+2. **Policy priority tiers** — accounts with a `priority` (0–9) from `codex-multi-auth account priority`, lowest tier first. Runtime policy always supplies priorities, defaulting every account to `1`. If any priority differs from `1`, sequential scheduling chooses the first eligible account in saved list order within the tier; an all-default map preserves the healthy active cursor. Sequential mode skips quota ranking in both cases. Hybrid scheduling retains quota ranking and active-account preference. Exhaustion/reserve filtering remains in force.
 3. **Hard pin** — `--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX` (ephemeral): `missing` → immediate exit, `policy-blocked`/`disabled` → exit, cooldown honored only with `allowPinnedCooldown`; never advances the rotation cursor.
 4. **Sequential** (`schedulingStrategy=sequential`, drain-first): stick to the current account while usable; advance only on true exhaustion.
 5. **Session affinity** — `SessionAffinityStore` Map, 20-minute TTL, 512-entry LRU; session key from `session_id`/`conversation_id` headers → `prompt_cache_key` → `previous_response_id` → `metadata.{session_id,conversation_id,thread_id}`; a taken slot calls `markSwitched`.
