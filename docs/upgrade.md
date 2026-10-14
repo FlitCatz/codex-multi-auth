@@ -72,9 +72,10 @@ started is reused. The next run follows persisted daily claim deadlines rather
 than waiting another day after a slow pass completes; overdue runs catch up
 without overlapping. A route that fails preparation before claiming a pass is
 retried after one minute; claimed passes retain their daily limit. Stopping the
-router cancels pending inventory saves without waiting for unrelated writers.
-Saving the same visible models in a different order does not invalidate cached
-probe results. Credential resets also remove automatic-check history.
+router cancels queued probes and pending inventory saves without waiting for
+unrelated work. Saving the same visible models in a different order neither
+invalidates cached probe results nor skips a due daily check. Credential resets
+also remove automatic-check history.
 No credential, workspace,
 subscription priming, or request-program setting is migrated.
 

@@ -404,3 +404,42 @@ it("prepares a newly observed legacy snapshot before writing its daily claim",as
  await runAutomaticApiChecks({path,loadRoutes:async()=>[canonical?prepared:legacy],prepareRoute,check});
  expect(prepareRoute).toHaveBeenCalledOnce();expect(check).toHaveBeenCalledWith(prepared,expect.any(AbortSignal),expect.any(Number));
 });
+it.each([2,3])("accepts visibility reordering at route read %s without losing the daily deadline",async reorderAt=>{
+ const path=await fixture(),original={...route("ordered"),visibleModels:["z","a"]},reordered={...original,visibleModels:["a","z"]};let reads=0;
+ const check=vi.fn(async()=>{});const before=JSON.stringify(original);
+ const options={path,loadRoutes:async()=>[++reads>=reorderAt?reordered:original],now:()=>1000,check};
+ expect(await runAutomaticApiChecks(options)).toBe(1000+AUTOMATIC_API_CHECK_INTERVAL_MS);expect(check).toHaveBeenCalledOnce();
+ await runAutomaticApiChecks(options);expect(check).toHaveBeenCalledOnce();expect(JSON.stringify(original)).toBe(before);
+});
+it("preserves the original raw-order legacy claim when observation reorders visibility",async()=>{
+ const path=await fixture(),original={...route("legacy-order"),visibleModels:["z","a"]};let reads=0;const check=vi.fn(async()=>{});
+ const oldKey=createHash("sha256").update(JSON.stringify([original.id,original.kind,original.apiKey,original.visibleModels])).digest("hex");await writeFile(path,JSON.stringify({[oldKey]:1000}));
+ expect(await runAutomaticApiChecks({path,loadRoutes:async()=>[{...original,visibleModels:++reads===1?["z","a"]:["a","z"]}],now:()=>2000,check})).toBe(1000+AUTOMATIC_API_CHECK_INTERVAL_MS);expect(check).not.toHaveBeenCalled();
+});
+it.each([2,3])("still rejects a true visibility change at route read %s",async changedAt=>{
+ const path=await fixture(),original={...route("membership"),visibleModels:["z","a"]};let reads=0;const check=vi.fn(async()=>{});
+ await runAutomaticApiChecks({path,loadRoutes:async()=>[{...original,visibleModels:++reads>=changedAt?["a"]:original.visibleModels}],now:()=>1000,check});expect(check).not.toHaveBeenCalled();await expect(fs.stat(path)).rejects.toMatchObject({code:"ENOENT"});
+});
+it.each([false,true])("revalidates production POST and inventory by visibility membership (remove=%s)",async remove=>{
+ const api=await import("../lib/api-route-store.js"),discovery=await import("../lib/runtime/model-discovery-status.js");const {createAutomaticApiCheck}=await import("../lib/runtime/automatic-api-checks.js");
+ const history=await fixture(),previous=process.env.CODEX_MULTI_AUTH_DIR;process.env.CODEX_MULTI_AUTH_DIR=join(history,"..");
+ let changed=false,posts=0;
+ const transport:typeof fetch=async(input,init)=>{
+  if(String(input).startsWith("https://developers.openai.com/")&&!changed){changed=true;const current=await api.loadApiRoutes();await api.saveApiRoutes(current.map(r=>({...r,visibleModels:remove?["gpt-a"]:[...r.visibleModels].sort()})),undefined,current);}
+  if(init?.method==="POST"){posts++;const body=JSON.parse(String(init.body));return Response.json({reasoning:body.reasoning,service_tier:body.service_tier});}
+  if(String(input).endsWith("/models"))return Response.json({data:[{id:"gpt-z"},{id:"gpt-a"}]});return new Response("missing",{status:404});
+ };
+ try{
+  await api.saveApiRoutes([{...route("post-order"),visibleModels:["gpt-z","gpt-a"],knownModels:["gpt-z","gpt-a"]}]);
+  await createAutomaticApiCheck(transport)(new AbortController().signal);
+  if(remove){expect(posts).toBe(0);expect(await discovery.loadModelInventory()).toBeNull();}
+  else{expect(posts).toBeGreaterThan(0);expect((await discovery.loadModelInventory())?.entries).toHaveLength(1);const before=posts;await createAutomaticApiCheck(transport)(new AbortController().signal);expect(posts).toBe(before);}
+ }finally{if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;}
+});
+it.each(["expired","future"])("honors the newest plausible observed legacy visibility-order claim (%s)",async stale=>{
+ const path=await fixture(),original={...route("legacy-latest"),visibleModels:["z","a"]},sorted={...original,visibleModels:["a","z"]};let reads=0;const check=vi.fn(async()=>{});
+ const hash=(r:ApiRouteCredential)=>createHash("sha256").update(JSON.stringify([r.id,r.kind,r.apiKey,r.visibleModels])).digest("hex");
+ const now=2*AUTOMATIC_API_CHECK_INTERVAL_MS;
+ await writeFile(path,JSON.stringify({[hash(sorted)]:stale==="future"?now+AUTOMATIC_API_CHECK_INTERVAL_MS:1,[hash(original)]:now-1000}));
+ expect(await runAutomaticApiChecks({path,loadRoutes:async()=>[++reads===1?original:sorted],now:()=>now,check})).toBe(now-1000+AUTOMATIC_API_CHECK_INTERVAL_MS);expect(check).not.toHaveBeenCalled();
+});

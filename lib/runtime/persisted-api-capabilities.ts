@@ -39,6 +39,10 @@ const unavailableLeaseCodes = new Set([
 	"EBUSY", "EIO", "ENOENT", "ENOTDIR", "ESTALE",
 ]);
 
+export function persistedProbeSlotsForTests(): { active: number; waiting: number } {
+	return { active: activeProbes, waiting: probeWaiters.length };
+}
+
 /** Reject resets during work so live waiters cannot lose their concurrency slots. */
 export function resetPersistedApiCapabilitiesForTests(): void {
 	if (activeEnrichments || activeProbes || probeWaiters.length) {
@@ -47,10 +51,28 @@ export function resetPersistedApiCapabilitiesForTests(): void {
 	retainedProbes.clear();
 	retainedOwners.clear();
 }
-async function withSharedProbeSlot<T>(operation: () => Promise<T>): Promise<T> {
-	if (activeProbes >= 4) await new Promise<void>((resolve) => probeWaiters.push(resolve));
+async function withSharedProbeSlot<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+	signal?.throwIfAborted();
+	if (activeProbes >= 4) await new Promise<void>((resolve, reject) => {
+		const grant = () => {
+			signal?.removeEventListener("abort", abort);
+			resolve();
+		};
+		const abort = () => {
+			const index = probeWaiters.indexOf(grant);
+			if (index < 0) return; // A granted permit is released by the finally below.
+			probeWaiters.splice(index, 1);
+			signal?.removeEventListener("abort", abort);
+			reject(signal?.reason);
+		};
+		probeWaiters.push(grant);
+		signal?.addEventListener("abort", abort, { once: true });
+		if (signal?.aborted) abort();
+	});
 	else activeProbes++;
 	try {
+		// Cancellation can happen after grant but before this continuation runs.
+		signal?.throwIfAborted();
 		return await operation();
 	} finally {
 		const next = probeWaiters.shift();
@@ -263,7 +285,7 @@ async function enrichPersistedApiCapabilitiesImpl(
 					if (init?.method?.toUpperCase() === "POST" && !await ownsRoute()) throw Error("API route ownership changed");
 					return fetcher(input, init);
 				};
-				const capabilities = new ApiModelCapabilities(guardedFetch, now, withSharedProbeSlot, metadata, options.programRefreshBefore);
+				const capabilities = new ApiModelCapabilities(guardedFetch, now, operation => withSharedProbeSlot(operation, options.signal), metadata, options.programRefreshBefore);
 				let entries: Array<[string, ProbeResult]>;
 				try {
 					entries = await loadOrRepairProbeCache(force, options.requireStoredRoute ? ownsRoute : undefined, options.signal);

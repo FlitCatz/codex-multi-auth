@@ -18,7 +18,9 @@ function key(route:ApiRouteCredential){return createHash("sha256").update(JSON.s
 const eligible=(route:ApiRouteCredential)=>route.enabled&&route.probeCapabilities===true;
 // Visibility can expand during discovery; daily spending remains credential-scoped.
 function claimKey(route:ApiRouteCredential){return createHash("sha256").update(JSON.stringify([route.id,route.kind,route.apiKey])).digest("hex");}
-function sameRoute(a:ApiRouteCredential,b:ApiRouteCredential){return JSON.stringify(Object.entries(a).sort(([x],[y])=>x.localeCompare(y)))===JSON.stringify(Object.entries(b).sort(([x],[y])=>x.localeCompare(y)));}
+// Compare visibility as a set without changing stored order or legacy claim hashes.
+function semanticRoute(route:ApiRouteCredential){return {...route,visibleModels:[...new Set(route.visibleModels)].sort()};}
+function sameRoute(a:ApiRouteCredential,b:ApiRouteCredential){return JSON.stringify(Object.entries(semanticRoute(a)).sort(([x],[y])=>x.localeCompare(y)))===JSON.stringify(Object.entries(semanticRoute(b)).sort(([x],[y])=>x.localeCompare(y)));}
 
 export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>Promise<ApiRouteCredential[]>;prepareRoute?:(route:ApiRouteCredential,signal:AbortSignal)=>Promise<ApiRouteCredential|undefined>;check:(route:ApiRouteCredential,signal:AbortSignal,programRefreshBefore:number)=>Promise<void>;now?:()=>number;signal?:AbortSignal}){
  const signal=options.signal??new AbortController().signal;
@@ -31,7 +33,7 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
  if(!routes.length)return;
  for(const route of routes){
   if(signal.aborted)return;
-  const observed=(await options.loadRoutes()).find(r=>eligible(r)&&key(r)===key(route));
+  const observed=(await options.loadRoutes()).find(r=>eligible(r)&&key(semanticRoute(r))===key(semanticRoute(route)));
   if(!observed)continue;
   // Complete store-owned migrations before capturing the exact claim snapshot.
   let current:ApiRouteCredential|undefined;
@@ -51,7 +53,8 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
    // Unknown prior attempts must not trigger another billable pass on repair.
    // Seed every eligible route so a restart can resume normally the next day.
    if(repairHistory)attempts=Object.fromEntries((await options.loadRoutes()).filter(eligible).map(route=>[claimKey(route),now]));
-   const last=attempts[id] ?? attempts[key(current)];
+   const legacyClaims=[attempts[key(current)],attempts[key(observed)],attempts[key(route)]].filter((at):at is number=>at!==undefined&&Number.isFinite(at)&&at<=now+300_000);
+   const last=attempts[id] ?? (legacyClaims.length?Math.max(...legacyClaims):undefined);
    if(signal.aborted)return false;
    if(!repairHistory&&last!==undefined&&last<=now+300_000&&now-last<AUTOMATIC_API_CHECK_INTERVAL_MS){includeDeadline(last);return false;}
    // Keep other processes' claims; prune only the oldest history at a fixed bound.
