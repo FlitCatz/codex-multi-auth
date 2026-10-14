@@ -2,7 +2,7 @@ import {createHash} from "node:crypto";
 import {promises as fs} from "node:fs";
 import {dirname,join} from "node:path";
 import {z} from "zod";
-import {loadApiRoutes,updateApiModelDiscovery,type ApiRouteCredential} from "../api-route-store.js";
+import {loadApiRoutes,updateApiModelDiscovery,ensureApiRouteCapabilityEpoch,type ApiRouteCredential} from "../api-route-store.js";
 import {getCodexMultiAuthDir} from "../runtime-paths.js";
 import {withFileTransactionLock} from "../storage/file-lock.js";
 import {tempPathFor} from "../temp-path.js";
@@ -19,7 +19,7 @@ const eligible=(route:ApiRouteCredential)=>route.enabled&&route.probeCapabilitie
 function claimKey(route:ApiRouteCredential){return createHash("sha256").update(JSON.stringify([route.id,route.kind,route.apiKey])).digest("hex");}
 function sameRoute(a:ApiRouteCredential,b:ApiRouteCredential){return JSON.stringify(Object.entries(a).sort(([x],[y])=>x.localeCompare(y)))===JSON.stringify(Object.entries(b).sort(([x],[y])=>x.localeCompare(y)));}
 
-export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>Promise<ApiRouteCredential[]>;check:(route:ApiRouteCredential,signal:AbortSignal,programRefreshBefore:number)=>Promise<void>;now?:()=>number;signal?:AbortSignal}){
+export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>Promise<ApiRouteCredential[]>;prepareRoute?:(route:ApiRouteCredential,signal:AbortSignal)=>Promise<ApiRouteCredential|undefined>;check:(route:ApiRouteCredential,signal:AbortSignal,programRefreshBefore:number)=>Promise<void>;now?:()=>number;signal?:AbortSignal}){
  const signal=options.signal??new AbortController().signal;
  // Claims name the scheduled pass, so I/O and later routes cannot move its horizon.
  const startedAt=options.now?.()??Date.now();
@@ -30,8 +30,11 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
  if(!routes.length)return;
  for(const route of routes){
   if(signal.aborted)return;
-  const current=(await options.loadRoutes()).find(r=>eligible(r)&&key(r)===key(route));
-  if(!current)continue;
+  const observed=(await options.loadRoutes()).find(r=>eligible(r)&&key(r)===key(route));
+  if(!observed)continue;
+  // Complete store-owned migrations before capturing the exact claim snapshot.
+  const current=options.prepareRoute?await options.prepareRoute(observed,signal):observed;
+  if(!current||!eligible(current)||signal.aborted)continue;
   // Commit the claim before network I/O. Concurrent routers and restarts share it.
   let programRefreshBefore=startedAt+AUTOMATIC_API_CHECK_INTERVAL_MS;
   const claimed=await withFileTransactionLock(options.path,async()=>{
@@ -65,7 +68,7 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
 }
 export function createAutomaticApiCheck(){return async(signal:AbortSignal)=>{
  return runAutomaticApiChecks({
- path:join(getCodexMultiAuthDir(),"automatic-api-checks.json"),loadRoutes:loadApiRoutes,signal,
+ path:join(getCodexMultiAuthDir(),"automatic-api-checks.json"),loadRoutes:loadApiRoutes,signal,prepareRoute:ensureApiRouteCapabilityEpoch,
  check:async(route,stop,programRefreshBefore)=>{
   let acceptedRoute=route, discoveryAccepted=true;
   const updateDiscovery:typeof updateApiModelDiscovery=async(original,models)=>{

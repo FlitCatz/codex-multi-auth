@@ -50,6 +50,7 @@ it("revalidates opt-in immediately before each POST and keeps shutdown linked to
  const {createAutomaticApiCheck}=await import("../lib/runtime/automatic-api-checks.js");
  let enabled=true;const credential=route("before-post");const controller=new AbortController();let observed:AbortSignal|null|undefined;
  const load=vi.spyOn(api,"loadApiRoutes").mockImplementation(async()=>[{...credential,enabled}]);
+ const prepare=vi.spyOn(api,"ensureApiRouteCapabilityEpoch").mockResolvedValue(credential);
  const network=vi.spyOn(globalThis,"fetch").mockImplementation(async(_input,init)=>{observed=init?.signal;return new Response("ok");});
  const save=vi.spyOn(discovery,"saveModelInventory").mockResolvedValue();
  const discover=vi.spyOn(discovery,"discoverModelInventory").mockImplementation(async(storage,routes,options)=>{
@@ -60,7 +61,7 @@ it("revalidates opt-in immediately before each POST and keeps shutdown linked to
   controller.abort();expect(observed?.aborted).toBe(true);
   return {version:1,checkedAt:1000,entries:[]};
  });
- try{await createAutomaticApiCheck()(controller.signal);expect(network).toHaveBeenCalledTimes(1);expect(save).not.toHaveBeenCalled();}finally{load.mockRestore();network.mockRestore();save.mockRestore();discover.mockRestore();}
+ try{await createAutomaticApiCheck()(controller.signal);expect(network).toHaveBeenCalledTimes(1);expect(save).not.toHaveBeenCalled();}finally{prepare.mockRestore();load.mockRestore();network.mockRestore();save.mockRestore();discover.mockRestore();}
 });
 
 
@@ -356,4 +357,50 @@ it("drains an overdue run before one immediate catch-up without overlap", async 
   await vi.advanceTimersByTimeAsync(1);
   expect(run).toHaveBeenCalledTimes(3);
  } finally { release(); await scheduler.stop(); }
+});
+
+it.each([false,true])("migrates legacy ownership before claiming the daily check (discovery writes=%s)",async(discoveryWrites)=>{
+ const api=await import("../lib/api-route-store.js"),discovery=await import("../lib/runtime/model-discovery-status.js");
+ const {createAutomaticApiCheck}=await import("../lib/runtime/automatic-api-checks.js");
+ const root=await fixture();const previous=process.env.CODEX_MULTI_AUTH_DIR;process.env.CODEX_MULTI_AUTH_DIR=join(root,"..");
+ let posts=0;const models:string[]=[];
+ const network=vi.spyOn(globalThis,"fetch").mockImplementation(async(input,init)=>{
+  if(init?.method==="POST"){posts++;models.push(JSON.parse(String(init.body)).model);return Response.json({output:[],service_tier:"default"});}
+  if(String(input).endsWith("/models"))return Response.json({data:[{id:"gpt-test-old"},...(discoveryWrites?[{id:"gpt-test-new"}]:[])]});
+  return new Response("",{status:404});
+ });
+ try{
+  await writeFile(api.getApiRoutesPath(),JSON.stringify({version:1,routes:[{...route("discover"),visibleModels:["gpt-test-old"],knownModels:["gpt-test-old"]}]}));
+  await createAutomaticApiCheck()(new AbortController().signal);
+  expect(posts).toBeGreaterThan(0);expect(models).toContain(discoveryWrites?"gpt-test-new":"gpt-test-old");
+  expect((await api.loadApiRoutes())[0]?.visibleModels).toContain(discoveryWrites?"gpt-test-new":"gpt-test-old");
+  expect((await discovery.loadModelInventory())?.entries[0]?.visibleModels).toContain(discoveryWrites?"gpt-test-new":"gpt-test-old");
+  expect((await api.loadApiRoutes())[0]?.capabilityEpoch).toEqual(expect.any(String));
+  const before=posts;await createAutomaticApiCheck()(new AbortController().signal);expect(posts).toBe(before);
+ }finally{network.mockRestore();if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;}
+});
+it.each(["readonly","abort"])("does not claim or probe a legacy route when migration %s prevents completion",async failure=>{
+ const api=await import("../lib/api-route-store.js"),locks=await import("../lib/storage/file-lock.js");
+ const {createAutomaticApiCheck}=await import("../lib/runtime/automatic-api-checks.js");
+ const history=await fixture(),previous=process.env.CODEX_MULTI_AUTH_DIR;process.env.CODEX_MULTI_AUTH_DIR=join(history,"..");
+ const controller=new AbortController(),original=locks.withFileTransactionLock;
+ const network=vi.spyOn(globalThis,"fetch").mockRejectedValue(Error("No network expected"));
+ try{
+  await writeFile(api.getApiRoutesPath(),JSON.stringify({version:1,routes:[route("legacy")]}));
+  vi.spyOn(locks,"withFileTransactionLock").mockImplementation(async(...args)=>{
+   if(args[0]===api.getApiRoutesPath()){if(failure==="abort"){controller.abort();controller.signal.throwIfAborted();}throw Object.assign(Error("readonly"),{code:"EROFS"});}
+   return original(...args);
+  });
+  await expect(createAutomaticApiCheck()(controller.signal)).rejects.toThrow();
+  expect(network).not.toHaveBeenCalled();
+  for(const name of ["automatic-api-checks.json","api-capability-probes.json","model-discovery.json"])await expect(fs.stat(join(history,"..",name))).rejects.toMatchObject({code:"ENOENT"});
+ }finally{if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;}
+});
+it("prepares a newly observed legacy snapshot before writing its daily claim",async()=>{
+ const path=await fixture(),legacy=route("late"),prepared={...legacy,capabilityEpoch:"00000000-0000-4000-8000-000000000001"};
+ let canonical=false;
+ const prepareRoute=vi.fn(async()=>{await expect(fs.stat(path)).rejects.toMatchObject({code:"ENOENT"});canonical=true;return prepared;});
+ const check=vi.fn(async()=>{});
+ await runAutomaticApiChecks({path,loadRoutes:async()=>[canonical?prepared:legacy],prepareRoute,check});
+ expect(prepareRoute).toHaveBeenCalledOnce();expect(check).toHaveBeenCalledWith(prepared,expect.any(AbortSignal),expect.any(Number));
 });

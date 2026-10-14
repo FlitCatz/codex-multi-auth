@@ -204,3 +204,25 @@ it.each(["EBUSY","EPERM","EACCES"])("retries a transient %s opening the API rout
  });
  try{expect(await loadApiRoutes(path)).toEqual([]);expect(calls).toBe(2);}finally{open.mockRestore();}
 });
+
+it("returns its own canonical save snapshot and still rejects a later writer's edits",async()=>{
+ const {saveApiRoutesSnapshot}=await import("../lib/api-route-store.js");
+ const transactions=await import("../lib/storage/transactions.js");
+ const file=join(await tempDir(),"routes.json");
+ const route={id:"fixture",label:"Fixture",kind:"api" as const,apiKey:"fixture",priority:9,enabled:true,visibleModels:[]};
+ const initial=await saveApiRoutesSnapshot([route],file,[]);
+ expect(initial).toEqual(await loadApiRoutes(file));
+ const original=transactions.withStorageLock;let armed=true;
+ const spy=vi.spyOn(transactions,"withStorageLock").mockImplementation(async action=>{
+  const result=await original(action);
+  if(armed){armed=false;const current=await loadApiRoutes(file);await saveApiRoutes(current.map(value=>({...value,enabled:false})),file,current);}
+  return result;
+ });
+ try{
+  const saved=await saveApiRoutesSnapshot(initial.map(value=>({...value,priority:2})),file,initial);
+  expect(saved[0]).toMatchObject({priority:2,enabled:true,capabilityEpoch:initial[0].capabilityEpoch});
+  expect((await loadApiRoutes(file))[0].enabled).toBe(false);
+  await expect(saveApiRoutesSnapshot(saved.map(value=>({...value,priority:3})),file,saved)).rejects.toThrow("changed");
+  expect((await loadApiRoutes(file))[0]).toMatchObject({priority:2,enabled:false});
+ }finally{spy.mockRestore();}
+});

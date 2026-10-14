@@ -89,6 +89,12 @@ export async function loadApiRoutes(
 export function saveApiRoutes(routes: ApiRouteCredential[], path = getApiRoutesPath(), expected?: ApiRouteCredential[]): Promise<void> {
 	return saveApiRoutesInternal(routes, path, expected);
 }
+/** Return our committed snapshot, never a later writer's configuration. */
+export async function saveApiRoutesSnapshot(routes: ApiRouteCredential[], path = getApiRoutesPath(), expected?: ApiRouteCredential[]): Promise<ApiRouteCredential[]> {
+	let saved: ApiRouteCredential[] = [];
+	await saveApiRoutesInternal(routes, path, expected, false, undefined, value => { saved = value; });
+	return saved;
+}
 async function saveApiRoutesInternal(
 	routes: ApiRouteCredential[],
 	path = getApiRoutesPath(),

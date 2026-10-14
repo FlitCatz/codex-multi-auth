@@ -16,6 +16,7 @@ describe("API credential setup", () => {
 			load: async () => [],
 			save: async (r) => {
 				saved.push(structuredClone(r));
+				return r;
 			},
 			select: async (items) => {
 				labels.push(...items.map((i) => i.label));
@@ -37,7 +38,7 @@ describe("API credential setup", () => {
 	});
 	it("does not save a partial credential when model selection is cancelled", async () => {
 		const choices = ["add", "api", "9", null, "back"];
-		const save = vi.fn();
+		const save = vi.fn(async (routes:ApiRouteCredential[]) => routes);
 		await runApiLoginMenu({
 			load: async () => [],
 			save,
@@ -62,7 +63,7 @@ it("lets the operator opt into billable capability probes per credential", async
 		visibleModels: ["fixture"],
 	};
 	const choices = ["fixture", "probes", "back"];
-	const save = vi.fn();
+	const save = vi.fn(async (routes:ApiRouteCredential[]) => routes);
 	await runApiLoginMenu({
 		load: async () => [route],
 		save,
@@ -75,7 +76,7 @@ it("lets the operator opt into billable capability probes per credential", async
 it("offers a late API priority by default and reserves zero for subscription routing", async () => {
  const choices=["add","api",null,"back"];
  let priorities: {label:string;value?:string}[]=[];
- await runApiLoginMenu({load:async()=>[],save:vi.fn(),text:async()=>"Fixture",secret:async()=>"fixture-secret",log:vi.fn(),select:async(items,message)=>{
+ await runApiLoginMenu({load:async()=>[],save:vi.fn(async (routes:ApiRouteCredential[]) => routes),text:async()=>"Fixture",secret:async()=>"fixture-secret",log:vi.fn(),select:async(items,message)=>{
   if(message==="Failover priority")priorities=items;
   return choices.shift()??null;
  }});
@@ -86,7 +87,7 @@ it("offers a late API priority by default and reserves zero for subscription rou
 
 it("requires operator-declared ZDR classification instead of inferring it from discovery", async () => {
  const choices = ["add", "api", "9", "save", "back"];
- const save = vi.fn();
+ const save = vi.fn(async (routes:ApiRouteCredential[]) => routes);
  const prompts: string[] = [];
  const choicesOffered: string[] = [];
  await runApiLoginMenu({
@@ -117,7 +118,7 @@ it.each([false,true])("reports a concurrent edit and tolerates recovery reload f
 });
 
 it("rejects an over-long label before asking for the key instead of blaming the key later",async()=>{
- const choices=["add","back"];const log=vi.fn();const save=vi.fn();const secret=vi.fn(async()=>"fixture-secret");
+ const choices=["add","back"];const log=vi.fn();const save=vi.fn(async (routes:ApiRouteCredential[]) => routes);const secret=vi.fn(async()=>"fixture-secret");
  await runApiLoginMenu({load:async()=>[],save,secret,log,text:async()=>"x".repeat(81),discover:async()=>["model"],select:async()=>choices.shift()??null});
  expect(secret).not.toHaveBeenCalled();expect(save).not.toHaveBeenCalled();
  const output=log.mock.calls.flat().join(" ");
@@ -126,7 +127,7 @@ it("rejects an over-long label before asking for the key instead of blaming the 
 
 it("keeps a route in place when its visible models are edited",async()=>{
  const route=(id:string):ApiRouteCredential=>({id,label:id,kind:"api",apiKey:"fixture",priority:9,enabled:true,visibleModels:[]});
- const choices=["first","models","toggle:model","save","back"];const save=vi.fn();
+ const choices=["first","models","toggle:model","save","back"];const save=vi.fn(async (routes:ApiRouteCredential[]) => routes);
  await runApiLoginMenu({load:async()=>[route("first"),route("second")],save,log:vi.fn(),discover:async()=>["model"],select:async()=>choices.shift()??null});
  expect(save.mock.calls[0]?.[0]?.map((r:ApiRouteCredential)=>r.id)).toEqual(["first","second"]);
  expect(save.mock.calls[0]?.[0]?.[0]?.visibleModels).toEqual(["model"]);
@@ -134,8 +135,41 @@ it("keeps a route in place when its visible models are edited",async()=>{
 
 it("rejects a selection the menu did not offer instead of saving it", async () => {
  const route:ApiRouteCredential={id:"fixture",label:"Fixture",kind:"api",apiKey:"fixture",priority:9,enabled:true,visibleModels:[]};
- const choices=["fixture","priority","0","back"];const save=vi.fn();
+ const choices=["fixture","priority","0","back"];const save=vi.fn(async (routes:ApiRouteCredential[]) => routes);
  await runApiLoginMenu({load:async()=>[route],save,log:vi.fn(),select:async()=>choices.shift()??null});
  // Tier 0 is reserved for subscriptions and never offered to API credentials.
  expect(save).not.toHaveBeenCalled();
+});
+
+it.each(["add", "toggle", "probes", "models", "legacy-priority"])("keeps the canonical store snapshot for consecutive %s edits", async first => {
+ const {promises:fs}=await import("node:fs");const {tmpdir}=await import("node:os");const {join}=await import("node:path");
+ const {saveApiRoutes,loadApiRoutes}=await import("../lib/api-route-store.js");
+ const {removeWithRetry}=await import("./helpers/remove-with-retry.js");
+ const root=await fs.mkdtemp(join(tmpdir(),"api-menu-snapshot-"));const previous=process.env.CODEX_MULTI_AUTH_DIR;
+ process.env.CODEX_MULTI_AUTH_DIR=root;
+ try {
+  const route:ApiRouteCredential={id:"fixture",label:"Fixture",kind:"api",apiKey:"fixture-key",priority:9,enabled:true,visibleModels:[],knownModels:["model"]};
+  if(first==="legacy-priority")await fs.writeFile(join(root,"api-routes.json"),JSON.stringify({version:1,routes:[route]}));
+  else await saveApiRoutes(first==="add"?[]:[route]);
+  const initial=first==="add"?["add","api","9","toggle:model","save"]:
+   first==="models"?["fixture","models","toggle:model","save"]:
+   first==="legacy-priority"?["fixture","priority","8"]:["fixture",first];
+  const choices=[...initial,"saved-route","priority","2","back"];
+  const log=vi.fn();
+  await runApiLoginMenu({
+   select:async items=>{
+    const choice=choices.shift();
+    return offered(items,choice==="saved-route"?items.find(i=>i.value!=="add"&&i.value!=="back")?.value:choice);
+   },text:async()=>"Fixture",secret:async()=>"fixture-key",discover:async()=>["model"],log,
+  });
+  const [saved]=await loadApiRoutes();
+  expect(saved.priority).toBe(2);expect(saved.capabilityEpoch).toEqual(expect.any(String));
+  if(first==="toggle")expect(saved.enabled).toBe(false);
+  if(first==="probes")expect(saved.probeCapabilities).toBe(true);
+  if(first==="add"||first==="models")expect(saved.visibleModels).toEqual(["model"]);
+  expect(log.mock.calls.flat().join(" ")).not.toMatch(/changed in another process|did not complete/);
+ } finally {
+  if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;
+  await removeWithRetry(root,{recursive:true,force:true});
+ }
 });
