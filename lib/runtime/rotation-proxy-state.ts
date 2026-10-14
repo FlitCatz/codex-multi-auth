@@ -105,6 +105,56 @@ export interface RotationProxyState extends RotationProxyStateInit {
 
 const STALE_RUNTIME_RELOAD_DEDUPE_MS = 1_000;
 
+/**
+ * Copy credentials that rotated on `previousManager` since `authBeforeLoad`
+ * into the matching rows of `reloaded`. A replacement snapshot read before a
+ * refresh commit persisted still holds the spent single-use refresh token;
+ * without this carry the swap reintroduces it and the next refresh fails with
+ * token reuse. Matching is deliberately conservative — persisted record id,
+ * then the refresh token on either side of the rotation, then accountId+email —
+ * so a credential never lands on a different account.
+ */
+function carryRotatedCredentials(
+	previousManager: AccountManager,
+	authBeforeLoad: ReturnType<AccountManager["getAccountsSnapshot"]>,
+	reloaded: AccountManager,
+): void {
+	const candidates = reloaded.getAccountsSnapshot();
+	for (const previous of previousManager.getAccountsSnapshot()) {
+		const baseline = authBeforeLoad.find(
+			(account) =>
+				(account.recordId && account.recordId === previous.recordId) ||
+				account.index === previous.index,
+		);
+		if (
+			!baseline ||
+			(baseline.access === previous.access &&
+				baseline.refreshToken === previous.refreshToken &&
+				baseline.expires === previous.expires)
+		) {
+			continue;
+		}
+		const rotatedTokens = new Set([previous.refreshToken, baseline.refreshToken]);
+		const sourceEmail = sanitizeEmail(previous.email);
+		const matches = candidates.filter(
+			(candidate) =>
+				(previousManager.hasPersistedRecordId(previous) &&
+					candidate.recordId === previous.recordId) ||
+				rotatedTokens.has(candidate.refreshToken) ||
+				(previous.accountId !== undefined &&
+					candidate.accountId === previous.accountId &&
+					sanitizeEmail(candidate.email) === sourceEmail),
+		);
+		const [matched] = matches;
+		if (matches.length !== 1 || !matched) continue;
+		const live = reloaded.getAccountByIndex(matched.index);
+		if (!live) continue;
+		live.access = previous.access;
+		live.refreshToken = previous.refreshToken;
+		live.expires = previous.expires;
+	}
+}
+
 /** @internal */
 export function createRotationProxyState(
 	init: RotationProxyStateInit,
@@ -180,6 +230,12 @@ export async function reloadRuntimeCredentials(
 		// on disk by another login. Only the former is carried into the replacement.
 		const authBeforeLoad = previousManager.getAccountsSnapshot();
 		const reloaded = await AccountManager.loadFromDisk();
+		if (state.activeAccountManager !== previousManager) {
+			// Another path (native storage sync, stale recovery) already swapped
+			// the manager while disk I/O was pending; never clobber its redirect.
+			state.lastCredentialReloadAt = Date.now();
+			return state.activeAccountManager;
+		}
 		reloaded.setRoutingMutexMode(state.routingMutexMode);
 		const freshAccounts = reloaded.getAccountsSnapshot();
 		// loadFromDisk intentionally converts an unreadable/corrupt source with no
@@ -198,6 +254,10 @@ export async function reloadRuntimeCredentials(
 		// its auth commit against the resident manager. Let every commit already
 		// targeting that manager settle before taking the final live snapshot.
 		await waitForRuntimeRefreshCommits(previousManager);
+		if (state.activeAccountManager !== previousManager) {
+			state.lastCredentialReloadAt = Date.now();
+			return state.activeAccountManager;
+		}
 		const previousAccounts = previousManager.getAccountsSnapshot();
 		const credentialInventoryFingerprint = (
 			accounts: ReturnType<AccountManager["getAccountsSnapshot"]>,
@@ -381,6 +441,34 @@ export async function reloadRuntimeCredentials(
 					live.cooldownReason = previous.cooldownReason;
 				}
 			}
+			const sameCredential =
+				live.access === previous.access && live.refreshToken === previous.refreshToken;
+			// Auth-invalidation and workspace-disable markers are written in memory
+			// first and only reach disk through the debounced save. Carry them while
+			// the credential is unchanged so a mid-window reload cannot re-admit the
+			// account; a re-login (rotated credential) legitimately clears them.
+			if (
+				sameCredential &&
+				previousManager.isAccountAuthInvalidated(previous) &&
+				!reloaded.isAccountAuthInvalidated(live)
+			) {
+				live.authInvalidatedAt = previous.authInvalidatedAt;
+				live.authInvalidationErrorCode = previous.authInvalidationErrorCode;
+			}
+			if (sameCredential) {
+				for (const workspace of previous.workspaces ?? []) {
+					const target = live.workspaces?.find((item) => item.id === workspace.id);
+					if (
+						target &&
+						workspace.enabled === false &&
+						workspace.disabledAt !== undefined &&
+						target.enabled !== false
+					) {
+						target.enabled = false;
+						target.disabledAt = workspace.disabledAt;
+					}
+				}
+			}
 		}
 		// Requests that captured the resident manager before this swap may finish
 		// refreshing afterward. Redirect those late auth commits to the replacement
@@ -417,10 +505,27 @@ export async function recoverStaleRuntimeState(
 	}
 	state.staleRuntimeReloadPromise = (async () => {
 		const previousManager = state.activeAccountManager;
+		const authBeforeLoad = previousManager.getAccountsSnapshot();
 		AccountManager.resetVolatileRuntimeState();
 		recordRuntimeReset("pool-exhausted-no-account");
 		const reloaded = await AccountManager.loadFromDisk();
+		if (state.activeAccountManager !== previousManager) {
+			// A concurrent swap (native storage sync, credential reload) already
+			// published a newer manager; discarding this result keeps its redirect
+			// chain intact instead of clobbering previous → live with stale.
+			state.lastStaleRuntimeReloadAt = Date.now();
+			return state.activeAccountManager;
+		}
 		reloaded.setRoutingMutexMode(state.routingMutexMode);
+		// Drain refresh commits that queued against the resident manager while
+		// disk I/O was pending, then carry the rotated credentials: the loaded
+		// snapshot predates their persist and still holds the spent token.
+		await waitForRuntimeRefreshCommits(previousManager);
+		if (state.activeAccountManager !== previousManager) {
+			state.lastStaleRuntimeReloadAt = Date.now();
+			return state.activeAccountManager;
+		}
+		carryRotatedCredentials(previousManager, authBeforeLoad, reloaded);
 		// Wipe per-account cooldowns and rate-limit windows on the freshly
 		// reloaded pool. `resetVolatileRuntimeState` above only cleared global
 		// singletons (trackers, circuit breakers); the per-account transient
@@ -445,6 +550,15 @@ export async function recoverStaleRuntimeState(
 		// durable across a restart, not just best-effort. Recovery is rare
 		// (full-pool exhaustion), so the extra synchronous write is cheap.
 		await reloaded.flushPendingSave();
+		// The flush opened another window in which a late commit could queue on
+		// the superseded manager. Drain it, then carry + redirect + swap in one
+		// synchronous block so no commit can slip between the drain and the swap.
+		await waitForRuntimeRefreshCommits(previousManager);
+		if (state.activeAccountManager !== previousManager) {
+			state.lastStaleRuntimeReloadAt = Date.now();
+			return state.activeAccountManager;
+		}
+		carryRotatedCredentials(previousManager, authBeforeLoad, reloaded);
 		// Keep refresh ownership chains current across destructive recovery too.
 		// Requests that captured the previous manager before this swap must never
 		// persist a late refresh/cooldown into an object that is no longer active.

@@ -1883,10 +1883,13 @@ async function handleRequestInner(
 			candidates.length === 1 ? candidates[0] ?? null : null;
 		const matchReplacementAccount = (
 			previous: ManagedAccount,
+			previousManager: AccountManager,
 			replacementManager: AccountManager,
 		): ManagedAccount | null => {
 			const replacementAccounts = replacementManager.getAccountsSnapshot();
-			if (previous.recordId) {
+			// Only a persisted record id is stable across re-login; a derived
+			// in-memory id hashes the refresh token and changes on rotation.
+			if (previous.recordId && previousManager.hasPersistedRecordId(previous)) {
 				return uniqueAccount(replacementAccounts.filter((candidate) => candidate.recordId === previous.recordId));
 			}
 			const sourceIds = workspaceIds(previous);
@@ -1928,7 +1931,7 @@ async function handleRequestInner(
 			for (const [previousIndex, scopes] of oldCandidates) {
 				const previous = previousAccounts.find((account) => account.index === previousIndex);
 				if (!previous) continue;
-				const replacement = matchReplacementAccount(previous, replacementManager);
+				const replacement = matchReplacementAccount(previous, previousManager, replacementManager);
 				if (!replacement) continue;
 				const live = replacementManager.getAccountByIndex(replacement.index);
 				if (!live) continue;

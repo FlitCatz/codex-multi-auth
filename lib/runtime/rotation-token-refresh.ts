@@ -111,7 +111,9 @@ export function resolveRuntimeRefreshTarget(
 	// A persisted record id is the strongest row identity we have. If that row
 	// vanished in the replacement manager, never fall through to a same-email
 	// sibling workspace: the in-flight refresh belongs to the removed row.
-	if (account.recordId) {
+	// Derived in-memory ids hash the refresh token, so they are only strict
+	// when the row actually persisted one — otherwise rotation retires the id.
+	if (account.recordId && accountManager.hasPersistedRecordId(account)) {
 		const exact = uniqueMatch(accounts, (candidate) => candidate.recordId === account.recordId);
 		if (!exact) return null;
 		const live = targetManager.getAccountByIndex(exact.index);

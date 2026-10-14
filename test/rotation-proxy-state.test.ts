@@ -32,6 +32,9 @@ const { createRotationProxyState, recoverStaleRuntimeState, reloadRuntimeCredent
 const { ensureFreshAccessToken, resetRuntimeRefreshStateForTests } = await import(
 	"../lib/runtime/rotation-token-refresh.js"
 );
+const { redirectRuntimeRefreshCommits, resolveRuntimeRefreshTarget } = await import(
+	"../lib/runtime/rotation-token-refresh.js"
+);
 
 const NOW = Date.now();
 
@@ -396,6 +399,92 @@ describe("reloadRuntimeCredentials", () => {
 		expect(active?.accountIdSource).toBe("manual");
 		expect(active?.workspaces).toEqual([{ id: "workspace-manual", enabled: true }]);
 	});
+
+	it("abandons the reloaded manager when a concurrent swap wins mid-load", async () => {
+		const state = createRotationProxyState(stateInit());
+		const previousManager = state.activeAccountManager;
+		const previous = previousManager.getAccountByIndex(0);
+		if (!previous) throw new Error("missing resident account");
+		const reloaded = new AccountManager(undefined, storageWith(2));
+		const nativeSwap = new AccountManager(undefined, storageWith(2));
+		let signalLoadStarted!: () => void;
+		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
+		let releaseLoad!: () => void;
+		const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+		loadFromDisk.mockImplementationOnce(async () => {
+			signalLoadStarted();
+			await loadGate;
+			return reloaded;
+		});
+
+		const pending = reloadRuntimeCredentials(state);
+		await loadStarted;
+		// The native storage-sync path swaps the active manager while this reload
+		// is suspended on disk I/O, including its own commit redirect.
+		redirectRuntimeRefreshCommits(previousManager, nativeSwap);
+		state.activeAccountManager = nativeSwap;
+		state.knownAccountManagers.add(nativeSwap);
+		releaseLoad();
+
+		const result = await pending;
+
+		expect(result).toBe(nativeSwap);
+		expect(state.activeAccountManager).toBe(nativeSwap);
+		expect(state.knownAccountManagers.has(reloaded)).toBe(false);
+		// The earlier redirect must survive: a late refresh commit on the
+		// superseded manager still resolves to the live swap, not the load this
+		// function discarded.
+		expect(resolveRuntimeRefreshTarget(previousManager, previous)?.accountManager).toBe(
+			nativeSwap,
+		);
+	});
+
+	it("carries auth invalidation and disabled workspaces on a same-credential swap", async () => {
+		const initialStorage = storageWith(1);
+		initialStorage.accounts[0]!.workspaces = [{ id: "w-1", enabled: true }];
+		const resident = new AccountManager(undefined, initialStorage);
+		const state = createRotationProxyState({ ...stateInit(), activeAccountManager: resident });
+		const previous = resident.getAccountByIndex(0);
+		if (!previous?.workspaces?.[0]) throw new Error("missing resident account");
+
+		const diskStorage = storageWith(2);
+		diskStorage.accounts[0]!.workspaces = [{ id: "w-1", enabled: true }];
+		const reloaded = new AccountManager(undefined, diskStorage);
+		let signalLoadStarted!: () => void;
+		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
+		let releaseLoad!: () => void;
+		const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+		loadFromDisk.mockImplementationOnce(async () => {
+			signalLoadStarted();
+			await loadGate;
+			return reloaded;
+		});
+
+		const pending = reloadRuntimeCredentials(state);
+		await loadStarted;
+		// An auth-failure mark and a workspace disable land inside the debounced
+		// save window: visible on the resident row but not yet on disk.
+		previous.authInvalidatedAt = NOW;
+		previous.authInvalidationErrorCode = "invalid_token";
+		previous.workspaces[0].enabled = false;
+		previous.workspaces[0].disabledAt = NOW;
+		releaseLoad();
+
+		const result = await pending;
+		const active = result?.getAccountByIndex(0);
+		if (!active) throw new Error("missing reloaded account");
+
+		expect(result).toBe(reloaded);
+		expect(state.activeAccountManager).toBe(reloaded);
+		expect(reloaded.isAccountAuthInvalidated(active)).toBe(true);
+		expect(active.authInvalidatedAt).toBe(NOW);
+		expect(active.authInvalidationErrorCode).toBe("invalid_token");
+		expect(active.workspaces?.[0]).toMatchObject({
+			id: "w-1",
+			enabled: false,
+			disabledAt: NOW,
+		});
+	});
 });
 
 describe("recoverStaleRuntimeState", () => {
@@ -533,5 +622,140 @@ describe("recoverStaleRuntimeState", () => {
 		loadFromDisk.mockResolvedValue(reloaded);
 		await expect(recoverStaleRuntimeState(state)).resolves.toBe(reloaded);
 		expect(loadFromDisk).toHaveBeenCalledTimes(2);
+	});
+
+	it("drains a queued refresh commit and carries the rotated credential", async () => {
+		const state = createRotationProxyState(stateInit());
+		const resident = state.activeAccountManager;
+		const previous = resident.getAccountByIndex(0);
+		if (!previous) throw new Error("missing resident account");
+		previous.expires = NOW + 10_000;
+
+		const reloaded = new AccountManager(undefined, storageWith(1));
+		let signalLoadStarted!: () => void;
+		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
+		let releaseLoad!: () => void;
+		const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+		loadFromDisk.mockImplementationOnce(async () => {
+			signalLoadStarted();
+			await loadGate;
+			return reloaded;
+		});
+
+		let releaseCommit!: () => void;
+		const commitGate = new Promise<void>((resolve) => { releaseCommit = resolve; });
+		vi.spyOn(resident, "commitRefreshedAuth").mockImplementationOnce(async (_source, auth) => {
+			await commitGate;
+			previous.access = auth.access;
+			previous.refreshToken = auth.refresh;
+			previous.expires = auth.expires;
+			return previous;
+		});
+		queuedRefreshMock.mockResolvedValueOnce({
+			type: "success",
+			access: "access-rotated-during-recovery",
+			refresh: "refresh-rotated-during-recovery",
+			expires: NOW + 7_200_000,
+		});
+
+		const recoveryPending = recoverStaleRuntimeState(state);
+		await loadStarted;
+		const refreshPending = ensureFreshAccessToken({
+			accountManager: resident,
+			account: previous,
+			family: "gpt-5-codex",
+			model: null,
+			now: NOW,
+			tokenRefreshSkewMs: 30_000,
+			tokenInvalidationCooldownMs: 300_000,
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		releaseLoad();
+		let recoveryResolved = false;
+		void recoveryPending.then(() => { recoveryResolved = true; });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		// The swap must not publish while the queued commit is still in flight:
+		// otherwise the reloaded row keeps the spent single-use refresh token.
+		expect(recoveryResolved).toBe(false);
+
+		releaseCommit();
+		await refreshPending;
+		const result = await recoveryPending;
+		const active = result?.getAccountByIndex(0);
+
+		expect(state.activeAccountManager).toBe(reloaded);
+		expect(active?.access).toBe("access-rotated-during-recovery");
+		expect(active?.refreshToken).toBe("refresh-rotated-during-recovery");
+		expect(active?.expires).toBe(NOW + 7_200_000);
+	});
+
+	it("abandons the recovered snapshot when a concurrent swap wins mid-load", async () => {
+		const state = createRotationProxyState(stateInit());
+		const previousManager = state.activeAccountManager;
+		const reloaded = new AccountManager(undefined, storageWith(2));
+		const nativeSwap = new AccountManager(undefined, storageWith(2));
+		let signalLoadStarted!: () => void;
+		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
+		let releaseLoad!: () => void;
+		const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+		loadFromDisk.mockImplementationOnce(async () => {
+			signalLoadStarted();
+			await loadGate;
+			return reloaded;
+		});
+
+		const pending = recoverStaleRuntimeState(state);
+		await loadStarted;
+		// The native storage-sync path wins the race while recovery is suspended.
+		redirectRuntimeRefreshCommits(previousManager, nativeSwap);
+		state.activeAccountManager = nativeSwap;
+		state.knownAccountManagers.add(nativeSwap);
+		releaseLoad();
+
+		const result = await pending;
+
+		expect(result).toBe(nativeSwap);
+		expect(state.activeAccountManager).toBe(nativeSwap);
+		expect(state.knownAccountManagers.has(reloaded)).toBe(false);
+	});
+});
+
+describe("resolveRuntimeRefreshTarget", () => {
+	it("treats a derived recordId as weak identity across manager swaps", () => {
+		const previousManager = new AccountManager(undefined, storageWith(1));
+		const previous = previousManager.getAccountByIndex(0);
+		if (!previous) throw new Error("missing resident account");
+		// The storage row carried no explicit recordId, so the managed id is
+		// derived from the credential and must not strict-match after rotation.
+		expect(previous.recordId).toBeTruthy();
+		expect(previousManager.hasPersistedRecordId(previous)).toBe(false);
+
+		const replacementStorage = storageWith(1);
+		replacementStorage.accounts[0]!.recordId = "row-persisted-1";
+		const replacement = new AccountManager(undefined, replacementStorage);
+		redirectRuntimeRefreshCommits(previousManager, replacement);
+
+		const target = resolveRuntimeRefreshTarget(previousManager, previous);
+
+		expect(target?.accountManager).toBe(replacement);
+		expect(target?.account.index).toBe(0);
+	});
+
+	it("keeps strict recordId matching when the row persisted one", () => {
+		const initialStorage = storageWith(1);
+		initialStorage.accounts[0]!.recordId = "row-persisted-1";
+		const previousManager = new AccountManager(undefined, initialStorage);
+		const previous = previousManager.getAccountByIndex(0);
+		if (!previous) throw new Error("missing resident account");
+		expect(previousManager.hasPersistedRecordId(previous)).toBe(true);
+
+		// The persisted row was removed from the replacement pool; a same-email
+		// sibling must not absorb the in-flight refresh.
+		const replacementStorage = storageWith(1);
+		replacementStorage.accounts[0]!.recordId = "row-persisted-2";
+		const replacement = new AccountManager(undefined, replacementStorage);
+		redirectRuntimeRefreshCommits(previousManager, replacement);
+
+		expect(resolveRuntimeRefreshTarget(previousManager, previous)).toBeNull();
 	});
 });
