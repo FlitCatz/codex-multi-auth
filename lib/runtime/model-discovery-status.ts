@@ -204,19 +204,34 @@ export async function resetModelInventoryWritesForTests(): Promise<void> {
 		}
 	}
 }
-export function saveModelInventory(value: ModelInventory, options: { mergeEntries?: boolean } = {}): Promise<void> {
-	const path = inventoryPath();
-	const pending = inventoryWrites.then(() =>
-		withFileTransactionLock(path, () => saveModelInventorySerial(value, path, options.mergeEntries === true)),
-	);
+export function saveModelInventory(value: ModelInventory, options: { mergeEntries?: boolean; signal?: AbortSignal } = {}): Promise<void> {
+	const path = inventoryPath(), signal = options.signal;
+	if (signal?.aborted) return Promise.reject(signal.reason);
+	let stopWaiting: (() => void) | undefined;
+	const pending = inventoryWrites.then(() => {
+		// Once started, drain our own cancellable lock/write and cleanup.
+		stopWaiting?.();
+		signal?.throwIfAborted();
+		return withFileTransactionLock(path, () => saveModelInventorySerial(value, path, options.mergeEntries === true, signal), { signal });
+	});
+	// Keep the underlying queue intact even if a waiting caller cancels.
 	inventoryWrites = pending.catch(() => undefined);
-	return pending;
+	if (!signal) return pending;
+	return new Promise<void>((resolve, reject) => {
+		const abort = () => { stopWaiting?.(); reject(signal.reason); };
+		stopWaiting = () => signal.removeEventListener("abort", abort);
+		signal.addEventListener("abort", abort, { once: true });
+		if (signal.aborted) abort();
+		void pending.then(resolve, reject).finally(() => stopWaiting?.());
+	});
 }
 async function saveModelInventorySerial(
 	value: ModelInventory,
 	path: string,
 	mergeEntries = false,
+	signal?: AbortSignal,
 ): Promise<void> {
+	signal?.throwIfAborted();
 	const previous = await loadModelInventory();
 	if (mergeEntries && previous) {
 		// Clock rollback must not make old observations permanently newer.
@@ -234,18 +249,20 @@ async function saveModelInventorySerial(
 	const serialized = JSON.stringify(data) + "\n";
 	if (Buffer.byteLength(serialized) > 4 * 1024 * 1024)
 		throw Error("Model discovery status exceeds size limit");
-	await writeFileAtomic(path, serialized);
+	await writeFileAtomic(path, serialized, signal);
 }
-async function writeFileAtomic(path: string, serialized: string): Promise<void> {
+async function writeFileAtomic(path: string, serialized: string, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
 	const temp = tempPathFor(path);
 	await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	const retry = { maxAttempts: 6, backoffMs: 25 };
 	try {
+		signal?.throwIfAborted();
 		await fs.writeFile(temp, serialized, {
 			mode: 0o600,
 			flag: "wx",
 		});
-		await withRetry(() => fs.rename(temp, path), retry);
+		await withRetry(() => { signal?.throwIfAborted(); return fs.rename(temp, path); }, retry);
 	} finally {
 		await withRetry(() => fs.unlink(temp), retry).catch((e) => {
 			if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;

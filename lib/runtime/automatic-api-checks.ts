@@ -11,6 +11,7 @@ import {combineSignals} from "../utils.js";
 import {logWarn} from "../logger.js";
 import {discoverModelInventory,saveModelInventory} from "./model-discovery-status.js";
 export const AUTOMATIC_API_CHECK_INTERVAL_MS=24*60*60_000;
+const PREPARATION_RETRY_MS=60_000;
 const schema=z.record(z.string().regex(/^[a-f0-9]{64}$/),z.number().finite().nonnegative());
 const retry={maxAttempts:6,backoffMs:25};
 function key(route:ApiRouteCredential){return createHash("sha256").update(JSON.stringify([route.id,route.kind,route.apiKey,route.visibleModels])).digest("hex");}
@@ -35,7 +36,7 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
   // Complete store-owned migrations before capturing the exact claim snapshot.
   let current:ApiRouteCredential|undefined;
   try{current=options.prepareRoute?await options.prepareRoute(observed,signal):observed;}
-  catch{if(signal.aborted)return;logWarn("Automatic API route preparation failed; skipping this route.");continue;}
+  catch{if(signal.aborted)return;nextRunAt=Math.min(nextRunAt??Infinity,(options.now?.()??Date.now())+PREPARATION_RETRY_MS);logWarn("Automatic API route preparation failed; retrying shortly.");continue;}
   if(!current||!eligible(current)||signal.aborted)continue;
   // Commit the claim before network I/O. Concurrent routers and restarts share it.
   let programRefreshBefore=startedAt+AUTOMATIC_API_CHECK_INTERVAL_MS;
@@ -94,7 +95,7 @@ export function createAutomaticApiCheck(upstreamFetch:typeof fetch=fetch){return
   const inventory=await discoverModelInventory(null,[route],{fetchImpl:fetcher,signal:stop,persistProbes:true,programRefreshBefore,updateApiDiscovery:updateDiscovery});
   if(stop.aborted||!discoveryAccepted)return;
   const current=(await loadApiRoutes()).find(r=>eligible(r)&&sameRoute(r,acceptedRoute));
-  if(current)await saveModelInventory(inventory,{mergeEntries:true});
+  if(current)await saveModelInventory(inventory,{mergeEntries:true,signal:stop});
  },
 });};}
 /** Daily checks follow persisted claim deadlines, never overlap, and drain on shutdown. */

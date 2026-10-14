@@ -267,3 +267,24 @@ it.each(["oversized","EACCES","EIO"])("does not repair an unreadable store (%s)"
  const spy=vi.spyOn(fs,"open").mockImplementation(async(...args)=>{if(args[0]===file&&failure!=="oversized")throw Object.assign(Error("unreadable"),{code:failure});return open(...args);});
  try{await expect(saveApiRoutes([],file)).rejects.toThrow("Unable to read API route configuration");expect(await readFile(file,"utf8")).toBe(raw);}finally{spy.mockRestore();}
 });
+
+it("keeps ownership when a menu sorts discovered visibility without changing the selected set", async () => {
+ const {saveApiRoutesSnapshot,updateApiModelDiscovery}=await import("../lib/api-route-store.js");
+ const file=join(await tempDir(),"routes.json");
+ const initial={id:"order",label:"Order",kind:"api" as const,apiKey:"fixture",enabled:true,probeCapabilities:true,priority:0,visibleModels:["gpt-z"],knownModels:["gpt-z"]};
+ await saveApiRoutes([initial],file);
+ const discovered=await updateApiModelDiscovery(initial,["gpt-z","gpt-a"],file);
+ expect(discovered.visibleModels).toEqual(["gpt-z","gpt-a"]);
+ const before=JSON.stringify(discovered);
+ const selection={...discovered,visibleModels:[...discovered.visibleModels].sort()};
+ const selectionBefore=JSON.stringify(selection);
+ const [saved]=await saveApiRoutesSnapshot([selection],file,[discovered]);
+ expect(saved.capabilityEpoch).toBe(discovered.capabilityEpoch);
+ expect(saved.visibleModels).toEqual(["gpt-a","gpt-z"]);
+ expect(JSON.stringify(discovered)).toBe(before);
+ expect(JSON.stringify(selection)).toBe(selectionBefore);
+ const [added]=await saveApiRoutesSnapshot([{...saved,visibleModels:[...saved.visibleModels,"gpt-new"]}],file,[saved]);
+ expect(added.capabilityEpoch).not.toBe(saved.capabilityEpoch);
+ const [removed]=await saveApiRoutesSnapshot([{...added,visibleModels:["gpt-a"]}],file,[added]);
+ expect(removed.capabilityEpoch).not.toBe(added.capabilityEpoch);
+});

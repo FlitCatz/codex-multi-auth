@@ -149,7 +149,8 @@ async function saveApiRoutesLocked(
 			const policy = (value: ApiRouteCredential) => JSON.stringify([
 				value.kind, value.apiKey, value.enabled, value.probeCapabilities,
 				value.accessPrograms, value.modelAccessPrograms,
-				...(discoveryExpansion ? [] : [value.visibleModels]),
+				// Visibility is a selection set; menu ordering is not a policy edit.
+				...(discoveryExpansion ? [] : [[...new Set(value.visibleModels)].sort()]),
 			]);
 			const sameLifetime = old && policy(old) === policy(route);
 			const withoutLegacy = { ...route };
