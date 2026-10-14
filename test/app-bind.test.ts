@@ -3,7 +3,7 @@ import { closeSync, existsSync, openSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -2228,7 +2228,7 @@ it.each([
  const root=await createTempRoot("app-bind-ws-diagnostic-");
  const options={platform:"linux" as const,home:root,env:{CODEX_HOME:join(root,"codex"),CODEX_MULTI_AUTH_DIR:join(root,"multi-auth")}};
  const paths=resolveAppBindPaths(options);
- expect(paths.bindDir.startsWith(root + "/")).toBe(true);
+ expect(paths.bindDir.startsWith(root + sep)).toBe(true);
  await mkdir(paths.bindDir,{recursive:true});
  await writeFile(paths.statusPath,JSON.stringify({state:"stopped",lastWebsocketDisconnect:stored}));
  expect((await getAppBindStatus(options)).router?.lastWebsocketDisconnect).toEqual(expected);
