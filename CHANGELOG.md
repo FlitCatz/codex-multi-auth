@@ -5,6 +5,13 @@ Dates use ISO format (`YYYY-MM-DD`).
 
 This repository's current stable release line is `2.x`. Full release notes live in [`docs/releases/`](docs/releases/) — this file is the short version. Pre-`0.1.0` iteration history is archived in [`docs/releases/legacy-pre-0.1-history.md`](docs/releases/legacy-pre-0.1-history.md). Conventions: entry headings are `## [x.y.z] - YYYY-MM-DD`; section headings come from `Added`, `Changed`, `Fixed`, `Removed`, `Security`, `Internal`, `Notes`; issue and pull-request references link as `[#N](https://github.com/ndycode/codex-multi-auth/pull/N)`.
 
+## [2.22.0] - 2026-10-14
+
+Native Codex dictation rides the managed OAuth pool, sequential
+scheduling honors saved account order within priority tiers, and API/ZDR
+routes get daily capability checks plus WebSocket disconnect diagnostics.
+[Full notes](docs/releases/v2.22.0.md).
+
 ## [2.21.0] - 2026-10-11
 
 Tracking release: merges the community-submitted `client_version` fix
