@@ -127,7 +127,8 @@ vi.mock("../lib/runtime/runtime-observability.js", async (importOriginal) => ({
 		loadPersistedRuntimeObservabilitySnapshotMock,
 }));
 
-vi.mock("../lib/runtime/app-bind.js", () => ({
+vi.mock("../lib/runtime/app-bind.js", async (importOriginal) => ({
+	formatWebsocketDisconnect: (await importOriginal<typeof import("../lib/runtime/app-bind.js")>()).formatWebsocketDisconnect,
 	bindCodexAppRuntimeRotation: bindCodexAppRuntimeRotationMock,
 	getAppBindStatus: getAppBindStatusMock,
 	unbindCodexAppRuntimeRotation: unbindCodexAppRuntimeRotationMock,
@@ -304,7 +305,8 @@ describe("cli output contracts", () => {
 
 			expect(result.exitCode).toBe(0);
 			const payload = parseSingleJsonObject(result);
-			expect(sortedKeys(payload)).toEqual(["accountCount", "accounts", "activeIndex", "apiAccounts", "lastRequestedWorkspace", "modelInventory", "pinnedAccountIndex", "recommendationReason", "recommendedIndex", "runtimeInUseIndex", "selectionMode", "storageHealth", "storagePath", "totalAccountCount"]);
+			expect(sortedKeys(payload)).toEqual(["accountCount", "accounts", "activeIndex", "apiAccounts", "lastRequestedWorkspace", "lastWebsocketDisconnect", "modelInventory", "pinnedAccountIndex", "recommendationReason", "recommendedIndex", "runtimeInUseIndex", "selectionMode", "storageHealth", "storagePath", "totalAccountCount"]);
+			expect(payload.lastWebsocketDisconnect).toBeNull();
 
 			expect(payload.storagePath).toBe(MOCK_STORAGE_PATH);
 			expect(payload.storageHealth).toBe("healthy");

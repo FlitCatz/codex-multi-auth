@@ -26,7 +26,7 @@ import {
 	isQuotaCacheEntryExhausted,
 } from "../../quota-readiness.js";
 import type { QuotaCacheData, QuotaCacheWindow } from "../../quota-cache.js";
-import type { AppBindRouterStatus } from "../../runtime/app-bind.js";
+import { formatWebsocketDisconnect, type AppBindRouterStatus } from "../../runtime/app-bind.js";
 import {
 	resolveAccountCurrentMarkers,
 	resolveRuntimeCurrentAccount,
@@ -161,6 +161,9 @@ export async function runStatusCommand(
     if (apiConfigurationUnavailable && !deps.json) logInfo("API configuration unavailable; subscription status remains available.");
 
 	const modelInventory = await deps.loadModelInventory?.();
+	const appBindStatus = await deps.loadAppBindStatus?.() ?? null;
+	const disconnectLine = formatWebsocketDisconnect(appBindStatus?.lastWebsocketDisconnect);
+	if (!deps.json && disconnectLine) logInfo(paint(disconnectLine, "warning"));
  const resetCredits = await deps.loadResetCreditState?.().catch(()=>null);
  const resetSnapshot = (account: AccountStorageV3["accounts"][number]) => {const target=resetTargetForStoredAccount(account);return target?resetCredits?.snapshots[target.key]:undefined;};
 	let policiesUnavailable = false;
@@ -187,6 +190,7 @@ export async function runStatusCommand(
 						totalAccountCount: 0,
 						apiAccounts: [],
 						modelInventory: modelInventory ?? null,
+					lastWebsocketDisconnect: appBindStatus?.lastWebsocketDisconnect ?? null,
 						// Emit the same keys the populated branch does (as null) so a
 						// --json consumer sees one stable shape regardless of account count.
 						activeIndex: null,
@@ -257,10 +261,7 @@ export async function runStatusCommand(
 		}
 	}
 	const appHelperStatus = deps.loadAppHelperStatus?.() ?? null;
-	const [runtimeSnapshot, appBindStatus] = await Promise.all([
-		deps.loadRuntimeObservabilitySnapshot?.() ?? Promise.resolve(null),
-		deps.loadAppBindStatus?.() ?? Promise.resolve(null),
-	]);
+	const runtimeSnapshot = await deps.loadRuntimeObservabilitySnapshot?.() ?? null;
  const quotaPreferences = forecastQuotas.map(quota=>subscriptionQuotaPreference(quota,now));
  const automaticOrder = new Map<number,number>();
  if (appBindStatus?.nativeOpenai) {
@@ -371,6 +372,7 @@ export async function runStatusCommand(
 					recommendationReason: recommendation.reason,
 					runtimeInUseIndex: runtimeCurrent ? runtimeCurrent.index : null,
 					modelInventory: modelInventory ?? null,
+					lastWebsocketDisconnect: appBindStatus?.lastWebsocketDisconnect ?? null,
 					accounts,
 					lastRequestedWorkspace: runtimeSnapshot?.lastRequestedWorkspaceId ? {
 						id: runtimeSnapshot.lastRequestedWorkspaceId,

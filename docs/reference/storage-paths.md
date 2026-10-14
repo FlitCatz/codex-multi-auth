@@ -40,6 +40,8 @@ for existing pools.
 | Local bridge client tokens | `~/.codex/multi-auth/local-client-tokens.json` |
 | API routes / credentials | `~/.codex/multi-auth/api-routes.json` (mode 0600) |
 | API capability probe results | `~/.codex/multi-auth/api-capability-probes.json` |
+| API capability probe leases (hashed credential/model keys) | `~/.codex/multi-auth/api-probe-locks/*.write-lock/` |
+| Automatic API capability check claims | `~/.codex/multi-auth/automatic-api-checks.json` |
 | Reset credits | `~/.codex/multi-auth/reset-credits.json` |
 | Inference activity | `~/.codex/multi-auth/inference-activity/` |
 | Cross-process refresh leases | `~/.codex/multi-auth/refresh-leases/` |

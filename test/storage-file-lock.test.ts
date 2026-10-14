@@ -11,6 +11,7 @@ import { withRetry } from "../lib/fs-retry.js";
 import { withFileTransactionLock } from "../lib/storage/file-lock.js";
 const dirs: string[] = [], children: ChildProcess[] = [];
 afterEach(async () => {
+    vi.useRealTimers(); vi.restoreAllMocks();
     for (const child of children.splice(0))
         if (child.exitCode === null && child.signalCode === null) {
             const exited = once(child, "exit");
@@ -240,4 +241,58 @@ it("retries cleanup of an unpublished candidate after a failed acquisition",asyn
  finally {unlink.mockRestore();}
  await vi.waitFor(async()=>expect((await readdir(dir)).filter(p=>p.includes(".candidate-"))).toEqual([]),{timeout:5000});
  a.child.send("go");await a.wait("saved");
+});
+
+it.each([undefined, "EBUSY", "EPERM"])("cancels a contended lease and drains owner cleanup with %s", async (cleanupCode) => {
+    const dir = await mkdtemp(join(tmpdir(), "lock-cancel-")); dirs.push(dir);
+    const path = join(dir, "state");
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const owner = withFileTransactionLock(path, async () => { entered(); await gate; });
+    await started;
+    let cleanupFailures = 0;
+    const unlink = fs.unlink.bind(fs);
+    const unlinkSpy = vi.spyOn(fs, "unlink").mockImplementation(async target => {
+        if (cleanupCode && !cleanupFailures && String(target).replace(/\\/g, "/").includes("state.write-lock/")) {
+            cleanupFailures++;
+            throw Object.assign(Error("busy cleanup"), {code: cleanupCode});
+        }
+        return unlink(target);
+    });
+    const controller = new AbortController();
+    const action = vi.fn(async () => undefined);
+    vi.useFakeTimers();
+    let contended!: () => void;
+    const contention = new Promise<void>(resolve => { contended = resolve; });
+    const rename = fs.rename.bind(fs);
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+        try { return await rename(from, to); }
+        catch (error) { if (String(to).endsWith("state.write-lock")) contended(); throw error; }
+    });
+    const waiting = withFileTransactionLock(path, action, {waitMs: 60_000, signal: controller.signal});
+    let outcome: string | undefined;
+    const settled = waiting.then(() => { outcome = "completed"; }, () => { outcome = "aborted"; });
+    try {
+        await contention;
+        controller.abort();
+        // waitFor advances fake retry timers while real filesystem cleanup drains.
+        await vi.waitFor(() => expect(outcome).toBe("aborted"), {timeout: 1000, interval: 50});
+        expect(action).not.toHaveBeenCalled();
+        expect((await readdir(dir)).filter(name => name.includes("candidate"))).toEqual([]);
+        expect((await readdir(dir)).some(name => name.endsWith("write-lock"))).toBe(true);
+    } finally {
+        release();
+        let ownerDrained = false;
+        const drainOwner = owner.finally(() => { ownerDrained = true; });
+        try {
+            await vi.waitFor(() => expect(ownerDrained).toBe(true), {timeout: 1000, interval: 50});
+            await drainOwner;
+            await vi.waitFor(() => expect(outcome).toBeDefined(), {timeout: 1000, interval: 50}); await settled;
+        }
+        finally { unlinkSpy.mockRestore(); renameSpy.mockRestore(); vi.useRealTimers(); }
+    }
+    expect(action).not.toHaveBeenCalled();
+    expect(cleanupFailures).toBe(cleanupCode ? 1 : 0);
+    expect((await readdir(dir)).filter(name => name.includes("write-lock"))).toEqual([]);
 });

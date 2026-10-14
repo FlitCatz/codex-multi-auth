@@ -22,11 +22,14 @@ export function parseApiReasoningDocumentation(
 	id: string,
 	text: string,
 ): string[] {
-	if (text.match(/^Model ID:\s*`([^`]+)`/m)?.[1] !== id) return [];
+	return parseReasoningStatement(id, text) ?? [];
+}
+function parseReasoningStatement(id: string, text: string): string[] | undefined {
+	if (text.match(/^Model ID:\s*`([^`]+)`/m)?.[1] !== id) return undefined;
 	const statement = text.match(
 		/`?reasoning\.effort`?\s+supports\s*:?\s*([^\n.]+)\./i,
 	)?.[1];
-	if (!statement) return [];
+	if (statement === undefined) return undefined;
 	const values = statement
 		.replace(/`|\(default\)/g, " ")
 		.split(/,|\band\b/)
@@ -42,16 +45,35 @@ export function parseApiReasoningDocumentation(
 				v === "persistent",
 		)
 	)
-		return [];
+		return undefined;
 	return [...new Set(values)];
 }
 export type ProbeResult = {
+	ownerEpoch?: string;
+	programCheckedAt?: number;
+	programRetry?: boolean;
 	at: number;
 	levels: string[];
 	tiers: string[];
 	status: Record<string, string>;
 };
-type DocumentedCapabilities = { levels: string[]; inputModalities?: string[] };
+/** Candidates describe checks, never request defaults or granted entitlements. */
+function programCandidates(route: ApiRouteCredential, id: string): string[] {
+ const configured = (route.modelAccessPrograms?.[id] ?? route.accessPrograms)?.cyber;
+ const candidates = [...(configured ?? []), ...(/(?:^|-)cyber(?:-|$)|daybreak-red/.test(id)
+  ? ["daybreak_red"] : /^gpt-[56](?:[.-]|$)/.test(id) ? ["standard", "daybreak_blue"] : [])];
+ return [...new Set(candidates)].filter(value => ["standard", "daybreak_blue", "daybreak_red"].includes(value));
+}
+function programsFresh(result: ProbeResult, programs: string[], now: number): boolean {
+ return result.programRetry !== true && result.programCheckedAt !== undefined &&
+  Number.isFinite(result.programCheckedAt) && result.programCheckedAt >= 0 && result.programCheckedAt <= 8.64e15 &&
+  result.programCheckedAt <= now && result.programCheckedAt + 86400_000 > now &&
+  programs.every(program => ["verified", "unsupported"].includes(result.status[`program:cyber:${program}`] ?? ""));
+}
+type DocumentedCapabilities = { levels: string[]; reasoningAvailable?: boolean; inputModalities?: string[] };
+function probeKey(route: ApiRouteCredential, id: string): string {
+	return createHash("sha256").update(route.id).update("\0").update(route.apiKey).update("\0").update(id).digest("hex");
+}
 
 /** Only the exact model's input declaration can enable native image attachments. */
 function parseInputModalities(id: string, text: string): string[] | undefined {
@@ -94,6 +116,7 @@ export class ApiModelCapabilities {
 	private activeProbes = 0;
 	private readonly probeWaiters: Array<() => void> = [];
 	private async withProbeSlot<T>(operation: () => Promise<T>): Promise<T> {
+		if (this.probeSlot) return this.probeSlot(operation);
 		if (this.activeProbes >= 4)
 			await new Promise<void>((resolve) => this.probeWaiters.push(resolve));
 		else this.activeProbes++;
@@ -106,19 +129,16 @@ export class ApiModelCapabilities {
 		}
 	}
 	private readonly inFlight = new Map<string, Promise<ProbeResult>>();
-	private readonly probes = new Map<
-		string,
-		{
-			at: number;
-			levels: string[];
-			tiers: string[];
-			status: Record<string, string>;
-		}
-	>();
+	private readonly probes = new Map<string, ProbeResult>();
 	private readonly cache = new Map<string, DocumentedCapabilities & { at: number }>();
 	constructor(
 		private readonly fetchImpl: typeof fetch = fetch,
 		private readonly now: () => number = Date.now,
+		private readonly probeSlot?: <T>(operation: () => Promise<T>) => Promise<T>,
+		// Keep public documentation across short-lived credential/model leases.
+		private readonly documentationSource?: ApiModelCapabilities,
+		// Scheduled checks need program evidence to last until their next run.
+		private readonly programRefreshBefore?: number,
 	) {}
 	/** Probe results keyed by an opaque hash, for a fresh CLI process to honour the 15-minute cache. */
 	exportProbes(): Array<[string, ProbeResult]> {
@@ -134,6 +154,7 @@ export class ApiModelCapabilities {
 		return (await this.documentation(id, refresh)).levels;
 	}
 	private async documentation(id: string, refresh = false): Promise<DocumentedCapabilities> {
+		if (this.documentationSource) return this.documentationSource.documentation(id, refresh);
 		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(id)) return { levels: [] };
 		const cached = this.cache.get(id);
 		if (!refresh && cached && cached.at + 60000 > this.now())
@@ -164,39 +185,58 @@ export class ApiModelCapabilities {
 				await reader.cancel();
 			}
 			const text = Buffer.concat(chunks).toString("utf8");
+			const reasoning = parseReasoningStatement(id, text);
 			metadata = {
-				levels: parseApiReasoningDocumentation(id, text),
+				levels: reasoning ?? [],
+				reasoningAvailable: reasoning !== undefined,
 				inputModalities: parseInputModalities(id, text),
 			};
 		} catch {
 			// An outage is not a capability revocation. Keep last successful evidence.
-			metadata = cached ?? metadata;
+			metadata = { ...(cached ?? metadata), reasoningAvailable: false };
 		}
 		if (this.cache.size >= 1000)
 			this.cache.delete(this.cache.keys().next().value ?? "");
 		this.cache.set(id, { ...metadata, at: this.now() });
 		return metadata;
 	}
+	private programsCoverCheck(result: ProbeResult, programs: string[]): boolean {
+		return programsFresh(result, programs, this.now()) &&
+			(this.programRefreshBefore === undefined || (result.programCheckedAt ?? -Infinity) + 86400_000 >= this.programRefreshBefore);
+	}
+	private freshProbe(route: ApiRouteCredential, id: string, old: ProbeResult | undefined): ProbeResult | undefined {
+		// A probe cut short by 401/403/429 is retried after a minute, not trusted for 15.
+		const freshFor = old?.status.retry === "transient" ? 60_000 : 900_000;
+		const programs = programCandidates(route, id);
+		const oldPrograms = old ? Object.keys(old.status).filter(name => name.startsWith("program:cyber:")) : [];
+		const samePrograms = oldPrograms.length === programs.length && programs.every(program => oldPrograms.includes(`program:cyber:${program}`));
+		const programCacheFresh = old && samePrograms && (programs.length
+			? this.programsCoverCheck(old, programs) || ((old.programRetry === true || old.status.retry === "transient") && old.at + 60_000 > this.now())
+			: old.programCheckedAt === undefined);
+		if (old && old.at <= this.now() && old.at + freshFor > this.now() && programCacheFresh) return old;
+		return undefined;
+	}
+	private reconcileReasoning(probe: ProbeResult, documented: string[], available: boolean): ProbeResult {
+		if (!available) return probe;
+		return { ...probe, levels: probe.levels.filter(effort => documented.includes(effort) || probe.status[`effort:${effort}`] === "verified") };
+	}
 	private async probe(
 		route: ApiRouteCredential,
 		id: string,
 		documented: string[],
 		force = false,
+		reasoningAvailable = false,
 	) {
-		const key = createHash("sha256")
-			.update(route.id)
-			.update("\0")
-			.update(route.apiKey)
-			.update("\0")
-			.update(id)
-			.digest("hex");
-		const old = this.probes.get(key);
-		// A probe cut short by 401/403/429 is retried after a minute, not trusted for 15.
-		const freshFor = old?.status.retry === "transient" ? 60_000 : 900_000;
-		if (!force && old && old.at + freshFor > this.now()) return old;
+		const key = probeKey(route, id);
+		const fresh = this.freshProbe(route, id, this.probes.get(key));
+		if (!force && fresh) {
+			const reconciled = this.reconcileReasoning(fresh, documented, reasoningAvailable);
+			this.probes.set(key, reconciled);
+			return reconciled;
+		}
 		const running = this.inFlight.get(key);
 		if (running) return running;
-		const pending = this.runProbe(route, id, documented, key).finally(() =>
+		const pending = this.runProbe(route, id, documented, key, force, reasoningAvailable).finally(() =>
 			this.inFlight.delete(key),
 		);
 		this.inFlight.set(key, pending);
@@ -207,8 +247,10 @@ export class ApiModelCapabilities {
 		id: string,
 		documented: string[],
 		key: string,
+		force: boolean,
+		reasoningAvailable: boolean,
 	): Promise<ProbeResult> {
-		const result = {
+		const result: ProbeResult = {
 			at: this.now(),
 			levels: [...documented],
 			tiers: [] as string[],
@@ -220,6 +262,7 @@ export class ApiModelCapabilities {
 		// inconclusive and keeps what an earlier probe verified. Only
 		// "unsupported" or "downgraded" removes a setting otherwise.
 		let lostAccess = false;
+		let programAuthFailure = false;
 		// A model-level denial hides the model on this credential: no efforts, no tiers.
 		let modelDenied = false;
 		const previous = this.probes.get(key);
@@ -229,6 +272,7 @@ export class ApiModelCapabilities {
 			effort?: string;
 			tier?: string;
 			compatibility?: boolean;
+			program?: string;
 		}): Promise<string> => {
 			// Lost access drops everything this credential verified; a model-level
 			// denial hides the model; a 403 naming the probed setting removes only it.
@@ -239,6 +283,7 @@ export class ApiModelCapabilities {
 				if (kind === "model") { modelDenied = true; return "unsupported"; }
 				if (kind === "setting") return "unsupported";
 				credentialUnavailable = true;
+				programAuthFailure = Boolean(setting.program);
 				return "unverified";
 			};
 			return this.withProbeSlot(async () => {
@@ -284,6 +329,7 @@ export class ApiModelCapabilities {
 									? { reasoning: { effort: setting.effort } }
 									: {}),
 								...(setting.tier ? { service_tier: setting.tier } : {}),
+								...(setting.program ? { access_programs: {cyber: setting.program} } : {}),
 							}),
 						},
 					);
@@ -311,6 +357,16 @@ export class ApiModelCapabilities {
 						data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 					} catch {
 						return response.status === 403 ? denied403(null) : "unverified";
+					}
+					if (setting.program) {
+						const error = isRecord(data) && isRecord(data.error) ? data.error : null;
+						if ([400, 403].includes(response.status) && error &&
+							(["invalid_access_program", "unsupported_access_program", "access_program_not_enabled"].includes(String(error.code)) ||
+							["access_programs", "access_programs.cyber"].includes(String(error.param)))) return "unsupported";
+						if (response.status === 403) { programAuthFailure = true; return denied403(data); }
+						if (!response.ok) return "unverified";
+						return isRecord(data) && ["completed", "incomplete"].includes(String(data.status)) && isRecord(data.access_programs) && data.access_programs.cyber === setting.program
+							? "verified" : "unverified";
 					}
 					if (response.status === 403) return denied403(data);
 					if (!response.ok) {
@@ -379,7 +435,10 @@ export class ApiModelCapabilities {
 			for (const { effort, status } of checked) {
 				const effective = keep(`effort:${effort}`, status);
 				result.status[`effort:${effort}`] = effective;
-				if (effective === "verified") result.levels.push(effort);
+				// Persisted levels can originate in public documentation, without a
+				// verified effort probe. Keep that scoped evidence through an
+				// inconclusive retry only while current documentation is unavailable.
+				if (effective === "verified" || (status === "unverified" && !reasoningAvailable && !lostAccess && !modelDenied && previous?.levels.includes(effort))) result.levels.push(effort);
 			}
 		}
 		const effort = result.levels.includes("low") ? "low" : result.levels[0];
@@ -395,11 +454,44 @@ export class ApiModelCapabilities {
 			result.status[tier] = effective;
 			if (effective === "verified") result.tiers.push(tier);
 		}
+		const programs = programCandidates(route, id);
+		const reusable = !force && previous && this.programsCoverCheck(previous, programs);
+		if (programs.length && reusable && !lostAccess && !modelDenied && !programAuthFailure) {
+			for (const program of programs) result.status[`program:cyber:${program}`] = previous.status[`program:cyber:${program}`] ?? "unverified";
+			result.programCheckedAt = previous.programCheckedAt;
+		} else if (programs.length) {
+			let inconclusive = false;
+			for (const program of programs) {
+				const name = `program:cyber:${program}`;
+				const status = await attempt({ program, effort });
+				if (status === "unverified") inconclusive = true;
+				result.status[name] = !force && !programAuthFailure ? keep(name, status) : status;
+			}
+			// Never renew old evidence after throttling, transport failure or a missing echo.
+			result.programCheckedAt = inconclusive ? previous?.programCheckedAt : this.now();
+			if (inconclusive) { result.status.retry = "transient"; result.programRetry = true; }
+			if (programAuthFailure) {
+				for (const program of programs) result.status[`program:cyber:${program}`] = "unverified";
+			}
+		}
 		if (modelDenied) {
 			result.levels = [];
 			result.tiers = [];
 			for (const name of Object.keys(result.status)) result.status[name] = "unsupported";
 			result.status.responses = "unsupported";
+			if (!lostAccess) {
+				// A structured model denial conclusively denies every candidate,
+				// including checks skipped after the denial. Do not retry it as a
+				// transport failure merely because those POSTs were unnecessary.
+				delete result.status.retry;
+				delete result.programRetry;
+				if (programs.length) result.programCheckedAt = this.now();
+			}
+		}
+		if (lostAccess) {
+			result.levels = [];
+			result.tiers = [];
+			for (const name of Object.keys(result.status)) result.status[name] = "unverified";
 		}
 		if (credentialUnavailable && !modelDenied) result.status.retry = "transient";
 		result.at = this.now();
@@ -413,20 +505,25 @@ export class ApiModelCapabilities {
 		refresh = false,
 		route?: ApiRouteCredential,
 		forceProbes = false,
+		// Supplying evidence limits this call to cache reads, even when forced.
+		cachedProbesOnly?: Array<[string, ProbeResult]>,
 	): Promise<RouteModel[]> {
+		const cached = cachedProbesOnly === undefined ? undefined : new Map(cachedProbesOnly);
 		return mapWithConcurrency(models, 3, async (model) => {
 						const documented = await this.documentation(model.slug, refresh);
 						let levels = documented.levels;
 						let extra: Record<string, unknown> = {};
 						if (route?.enabled && route.probeCapabilities) {
-							const probed = await this.probe(
+							let probed = cached ? this.freshProbe(route, model.slug, cached.get(probeKey(route, model.slug))) : await this.probe(
 								route,
 								model.slug,
 								levels,
 								forceProbes,
+								documented.reasoningAvailable === true,
 							);
-							levels = probed.levels;
-							extra = {
+							if (probed && cached) probed = this.reconcileReasoning(probed, levels, documented.reasoningAvailable === true);
+							if (probed) levels = probed.levels;
+							extra = probed ? {
 								service_tiers: probed.tiers.map((id) => ({
 									id: id === "fast" ? "priority" : id,
 									name: id === "fast" ? "Fast" : "Ultrafast",
@@ -437,6 +534,16 @@ export class ApiModelCapabilities {
 								additional_speed_tiers: probed.tiers,
 								capability_probe_status: probed.status,
 								capability_checked_at: probed.at,
+								program_checked_at: probed.programCheckedAt,
+							} : {
+								// A previously enriched model must not smuggle expired or
+								// differently scoped evidence through a cache-only miss.
+								service_tiers: [],
+								default_service_tier: "default",
+								additional_speed_tiers: [],
+								capability_probe_status: undefined,
+								capability_checked_at: undefined,
+								program_checked_at: undefined,
 							};
 						}
 						// Ultra is a native orchestration mode. Codex resolves it to this

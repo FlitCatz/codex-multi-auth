@@ -3,7 +3,7 @@ import { closeSync, existsSync, openSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -2229,4 +2229,66 @@ describe("reviewed provider transitions",()=>{
    expect((await getAppBindStatus(options)).state?.nativeOpenai).toBe(true);
   });
  });
+});
+
+it.each([
+ {stored:{at:123,cause:"close",stage:"streaming",routeKind:"zdr",connectionAgeMs:42,eventCount:3},expected:{at:123,cause:"close",stage:"streaming",routeKind:"zdr",connectionAgeMs:42,eventCount:3}},
+ {stored:{at:123,cause:"close",stage:"streaming",routeKind:"secret"},expected:null},
+ {stored:{at:123,cause:"close",stage:"streaming",eventCount:-1},expected:null},
+ {stored:{at:123,cause:"close",stage:"streaming",closeCode:1011,reason:"secret"},expected:{at:123,cause:"close",stage:"streaming",closeCode:1011}},
+ {stored:{at:123,cause:"secret",stage:"streaming"},expected:null},
+ {stored:{at:"123",cause:"close",stage:"streaming"},expected:null},
+])("validates persisted WebSocket diagnostics without retaining arbitrary fields: $stored",async ({stored,expected})=>{
+ const root=await createTempRoot("app-bind-ws-diagnostic-");
+ const options={platform:"linux" as const,home:root,env:{CODEX_HOME:join(root,"codex"),CODEX_MULTI_AUTH_DIR:join(root,"multi-auth")}};
+ const paths=resolveAppBindPaths(options);
+ expect(paths.bindDir.startsWith(root + sep)).toBe(true);
+ await mkdir(paths.bindDir,{recursive:true});
+ await writeFile(paths.statusPath,JSON.stringify({state:"stopped",lastWebsocketDisconnect:stored}));
+ expect((await getAppBindStatus(options)).router?.lastWebsocketDisconnect).toEqual(expected);
+});
+
+
+it.each([true,false])("shows safe WebSocket disconnect details for native=%s", (nativeOpenai) => {
+ const configPath="fixture/config.toml";
+ const status: Parameters<typeof formatAppBindStatus>[0] = {
+		bound: true,
+		running: true,
+		state: {
+			version: 1,
+			platform: "win32",
+			host: "127.0.0.1",
+			port: 4567,
+			baseUrl: "http://127.0.0.1:4567",
+			configPath,
+			statePath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\state.json",
+			backupPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\backup.json",
+			statusPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\status.json",
+			logPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\router.log",
+			nodePath: process.execPath,
+			routerScriptPath: "C:\\repo\\scripts\\codex-app-router.js",
+			clientApiKey: "redacted",
+			startupPath: null,
+			launchAgentPath: null,
+			boundConfigHash: "hash",
+			updatedAt: 1,
+		},
+		router: null,
+		paths: {
+			codexHome: "C:\\Users\\neil\\DevTools\\config\\codex",
+			configPath,
+			bindDir: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind",
+			statePath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\state.json",
+			backupPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\backup.json",
+			statusPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\status.json",
+			logPath: "C:\\Users\\neil\\DevTools\\config\\codex\\multi-auth\\app-bind\\router.log",
+			routerScriptPath: "C:\\repo\\scripts\\codex-app-router.js",
+			startupPath: null,
+			launchAgentPath: null,
+		},
+	};
+ status.state!.nativeOpenai=nativeOpenai;
+ const withDiagnostic = {...status,router:{lastWebsocketDisconnect:{at:1000,cause:"transport_error" as const,stage:"streaming" as const,closeCode:1006,routeKind:"api" as const,connectionAgeMs:42,eventCount:7}}};
+ expect(formatAppBindStatus(withDiagnostic)).toContain("Last WebSocket disconnect: 1970-01-01T00:00:01.000Z; cause=transport_error; stage=streaming; closeCode=1006; route=api; connectionAgeMs=42; events=7");
+ expect(formatAppBindStatus(status)).not.toContain("Last WebSocket disconnect:");
 });

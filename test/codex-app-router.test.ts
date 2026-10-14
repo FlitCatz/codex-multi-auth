@@ -53,6 +53,7 @@ function createRouterFixture(root: string, options: { withProxyModule?: boolean 
 				"      upstreamRequests: 1,",
 				"      websocketConnections: 3,",
 				"      websocketUpstreamRequests: 7,",
+				'      lastWebsocketDisconnect: process.env.CODEX_APP_ROUTER_TEST_DISCONNECT === undefined ? { at: 123, cause: "close", stage: "streaming", closeCode: 1011 } : JSON.parse(process.env.CODEX_APP_ROUTER_TEST_DISCONNECT),',
 				"      retries: 0,",
 				"      rotations: 1,",
 				"      lastAccountIndex: 1,",
@@ -141,6 +142,7 @@ describe("codex app router daemon", () => {
 			expect(running.lastAccountLabel).toBe("Account 2");
 			expect(running.websocketConnections).toBe(3);
 			expect(running.websocketUpstreamRequests).toBe(7);
+			expect(running.lastWebsocketDisconnect).toEqual({at:123,cause:"close",stage:"streaming",closeCode:1011});
 			expect(running).not.toHaveProperty("clientApiKey");
 			if (process.platform !== "win32") {
 				expect(statSync(statusPath).mode & 0o777).toBe(0o600);
@@ -257,4 +259,46 @@ describe("codex app router daemon", () => {
 		expect(status.state).toBe("error");
 		expect(status.lastError).toContain("runtime-rotation-proxy.js");
 	});
+});
+
+
+it("preserves sanitized disconnect history across daemon restarts and replaces it with current-process evidence after clock rollback", { timeout: 20_000 }, async () => {
+	const root = await createTempRoot("router-history-");
+	const scriptPath = createRouterFixture(root);
+	const statePath = join(root, "state.json");
+	const statusPath = join(root, "status.json");
+	await writeState(statePath, { clientApiKey: "fixture-token", host: "127.0.0.1", port: 0, statusPath });
+	const prior = { at: 123, cause: "close", stage: "streaming", closeCode: 1011, routeKind: "zdr", eventCount: 4, connectionAgeMs: 100 };
+	writeFileSync(statusPath, JSON.stringify({
+		state: "stopped",
+		lastWebsocketDisconnect: { ...prior, reason: "private-reason", authorization: "private-token" },
+	}));
+	for (const [live, expected] of [
+		[null, prior],
+		[{ ...prior, at: 100 }, { ...prior, at: 100 }],
+		[{ ...prior, at: 456 }, { ...prior, at: 456 }],
+	] as const) {
+		const child = spawn(process.execPath, [scriptPath, "--status", statusPath, "--state", statePath], {
+			env: { ...process.env, CODEX_APP_ROUTER_TEST_DISCONNECT: JSON.stringify(live) },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		try {
+			const running = await readJsonWhen(statusPath, status => status.state === "running" && status.pid === child.pid);
+			expect(running.lastWebsocketDisconnect).toEqual(expected);
+			expect(JSON.stringify(running)).not.toMatch(/private-reason|private-token/);
+		} finally {
+			await stopChild(child);
+		}
+	}
+	writeFileSync(statusPath, JSON.stringify({ lastWebsocketDisconnect: { ...prior, cause: "private-cause" } }));
+	const child = spawn(process.execPath, [scriptPath, "--status", statusPath, "--state", statePath], {
+		env: { ...process.env, CODEX_APP_ROUTER_TEST_DISCONNECT: "null" },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	try {
+		const status = await readJsonWhen(statusPath, value => value.state === "running" && value.pid === child.pid);
+		expect(status.lastWebsocketDisconnect).toBeNull();
+	} finally {
+		await stopChild(child);
+	}
 });

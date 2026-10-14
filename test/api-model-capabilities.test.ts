@@ -559,3 +559,332 @@ describe("403 probe outcomes", () => {
 		expect(result.reprobedSoon).toBe(true);
 	});
 });
+
+it("periodically verifies configured programs without advertising or selecting them", async () => {
+ let now = 1000;
+ const programs: string[] = [];
+ const route = { id: "program-fixture", kind: "api" as const, label: "fixture", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["fixture"], probeCapabilities: true, modelAccessPrograms: {fixture:{cyber:["standard","daybreak_blue"]}} };
+ const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
+  if (init?.method !== "POST") return new Response("missing", {status:404});
+  const body = JSON.parse(String(init.body));
+  if (body.access_programs) {
+   programs.push(body.access_programs.cyber);
+   expect(body.store).toBe(false);
+   expect(body.max_output_tokens).toBe(16);
+   return Response.json({status:"completed",access_programs:body.access_programs});
+  }
+  return Response.json({reasoning:body.reasoning, service_tier:body.service_tier, output:[{type:"function_call",name:"capability_probe"}]});
+ });
+ const service = new ApiModelCapabilities(fetcher,()=>now);
+ const [model] = await service.enrich([{slug:"fixture"}],false,route);
+ expect(programs).toEqual(["standard","daybreak_blue"]);
+ expect(model.capability_probe_status).toMatchObject({"program:cyber:standard":"verified","program:cyber:daybreak_blue":"verified"});
+ expect(model.available_access_programs).toBeUndefined();
+ now += 900001;
+ const restored = new ApiModelCapabilities(fetcher,()=>now);
+ restored.importProbes(service.exportProbes());
+ await restored.enrich([{slug:"fixture"}],false,route);
+ expect(programs).toHaveLength(2);
+ now += 86400000;
+ await restored.enrich([{slug:"fixture"}],false,route);
+ expect(programs).toHaveLength(4);
+ await restored.enrich([{slug:"fixture"}],false,{...route,apiKey:"different-key"});
+ expect(programs).toHaveLength(6);
+ await restored.enrich([{slug:"fixture"}],false,{...route,enabled:false},true);
+ expect(programs).toHaveLength(6);
+});
+
+it.each([
+ [400,{error:{code:"invalid_access_program"}},"unsupported"],
+ [400,{error:{code:"unsupported_access_program"}},"unsupported"],
+ [403,{error:{code:"access_program_not_enabled",param:"access_programs.cyber"}},"unsupported"],
+ [403,{error:{code:"forbidden"}},"unverified"],
+ [429,{error:{code:"rate_limit_exceeded"}},"unverified"],
+ [503,{error:{code:"server_error"}},"unverified"],
+ [200,{status:"failed",access_programs:{cyber:"daybreak_blue"}},"unverified"],
+ [200,{status:"error",access_programs:{cyber:"daybreak_blue"}},"unverified"],
+ [200,{},"unverified"],
+ [200,{access_programs:{cyber:"standard"}},"unverified"],
+] as const)("classifies program evidence conservatively (%s)",async(status,data,expected)=>{
+ const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)return Response.json(data,{status});
+  return Response.json({reasoning:body.reasoning,service_tier:body.service_tier,output:[]});
+ });
+ const [model]=await new ApiModelCapabilities(fetcher).enrich([{slug:"fixture"}],false,{id:"fixture",kind:"api",label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,modelAccessPrograms:{fixture:{cyber:["daybreak_blue"]}}});
+ expect(model.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":expected});
+});
+
+it.each([
+ ["gpt-6.1-sol",["standard","daybreak_blue"]],
+ ["gpt-5.6-cyber",["daybreak_red"]],
+ ["unrelated",[]],
+] as const)("uses bounded program candidates for %s",async(id,expected)=>{
+ const programs:string[]=[];
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)programs.push(body.access_programs.cyber);
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const service=new ApiModelCapabilities(fetcher);
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:[id],probeCapabilities:false};
+ await service.enrich([{slug:id}],false,route);
+ expect(programs).toEqual([]);
+ await service.enrich([{slug:id}],false,{...route,probeCapabilities:true});
+ expect(programs).toEqual(expected);
+});
+
+it("does not present a previous program success as a new verification after transport failure",async()=>{
+ let fail=false;
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs && fail)throw Error("network");
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const service=new ApiModelCapabilities(fetcher);
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ await service.enrich([{slug:"fixture"}],false,route);
+ fail=true;
+ const [model]=await service.enrich([{slug:"fixture"}],false,route,true);
+ expect(model.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"unverified"});
+});
+
+
+it("discovers family program candidates beyond configured defaults",async()=>{
+ const programs:string[]=[];
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)programs.push(body.access_programs.cyber);
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ await new ApiModelCapabilities(fetcher).enrich([{slug:"gpt-6.1-sol"}],false,{id:"fixture",kind:"api",label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["gpt-6.1-sol"],probeCapabilities:true,modelAccessPrograms:{"gpt-6.1-sol":{cyber:["standard"]}}});
+ expect(programs).toEqual(["standard","daybreak_blue"]);
+});
+
+it.each([401,403])("clears earlier capability evidence when a program probe loses credential access (%s)",async(status)=>{
+ const programs:string[]=[];
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs){
+   programs.push(body.access_programs.cyber);
+   return Response.json({error:{code:"invalid_api_key"}},{status});
+  }
+  return Response.json({reasoning:body.reasoning,service_tier:body.service_tier,output:[{type:"function_call",name:"capability_probe"}]});
+ });
+ const [model]=await new ApiModelCapabilities(fetcher).enrich([{slug:"fixture"}],false,{id:"fixture",kind:"api",label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["standard","daybreak_blue"]}});
+ expect(programs).toEqual(["standard"]);
+ expect(model.supported_reasoning_levels).toEqual([]);
+ expect(model.additional_speed_tiers).toEqual([]);
+ expect(model.capability_probe_status).toMatchObject({responses:"unverified",fast:"unverified",retry:"transient","program:cyber:standard":"unverified","program:cyber:daybreak_blue":"unverified"});
+});
+
+it.each([429,503,"network"] as const)("retries inconclusive program probes after 60 seconds (%s)",async(failure)=>{
+ let now=1000, failing=true, attempts=0;
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs){
+   attempts++;
+   if(failing){if(failure==="network")throw Error("network");return Response.json({error:{code:"temporary"}},{status:failure});}
+  }
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const service=new ApiModelCapabilities(fetcher,()=>now);
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ const [first]=await service.enrich([{slug:"fixture"}],false,route);
+ expect(first.program_checked_at).toBeUndefined();
+ expect(first.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"unverified",retry:"transient"});
+ failing=false;now+=60001;
+ const [second]=await service.enrich([{slug:"fixture"}],false,route);
+ expect(attempts).toBe(2);
+ expect(second.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"verified"});
+ expect(second.program_checked_at).toBe(now);
+});
+
+it("keeps old successful program evidence without renewing it after a nonforced transient failure",async()=>{
+ let now=1000,failing=false;
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs&&failing)return Response.json({error:{code:"rate_limit_exceeded"}},{status:429});
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const service=new ApiModelCapabilities(fetcher,()=>now);
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ await service.enrich([{slug:"fixture"}],false,route);
+ now+=86400001;failing=true;
+ const [model]=await service.enrich([{slug:"fixture"}],false,route);
+ expect(model.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"verified",retry:"transient"});
+ expect(model.program_checked_at).toBe(1000);
+});
+
+it("retries inconclusive legacy program cache entries without the separate retry flag",async()=>{
+ let now=1000,programRequests=0;
+ const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)programRequests++;
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ const original=new ApiModelCapabilities(fetcher,()=>now);
+ await original.enrich([{slug:"fixture"}],false,route);
+ const entries=original.exportProbes();
+ entries[0]![1].status["program:cyber:daybreak_blue"]="unverified";
+ entries[0]![1].status.retry="transient";
+ delete entries[0]![1].programRetry;
+ now+=60001;
+ const restored=new ApiModelCapabilities(fetcher,()=>now);
+ restored.importProbes(entries);
+ const [model]=await restored.enrich([{slug:"fixture"}],false,route);
+ expect(programRequests).toBe(2);
+ expect(model.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"verified"});
+ expect(model.program_checked_at).toBe(now);
+});
+
+describe("program cache invalidation",()=>{
+ function fixture(){
+  let now=1000;
+  const programs:string[]=[];
+  const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+   if(init?.method!=="POST")return new Response("missing",{status:404});
+   const body=JSON.parse(String(init.body));
+   if(body.access_programs)programs.push(body.access_programs.cyber);
+   return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+  });
+  const service=new ApiModelCapabilities(fetcher,()=>now);
+  const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["standard"]}};
+  return {service,route,programs,setNow:(value:number)=>{now=value;}};
+ }
+ it("checks expired program evidence despite a fresh general capability result",async()=>{
+  const f=fixture();await f.service.enrich([{slug:"fixture"}],false,f.route);
+  f.setNow(86400000);await f.service.enrich([{slug:"fixture"}],false,f.route);
+  expect(f.programs).toEqual(["standard"]);
+  f.setNow(86401001);const [model]=await f.service.enrich([{slug:"fixture"}],false,f.route);
+  expect(f.programs).toEqual(["standard","standard"]);
+  expect(model.program_checked_at).toBe(86401001);
+ });
+ it("invalidates added and removed candidates on the same credential",async()=>{
+  const f=fixture();await f.service.enrich([{slug:"fixture"}],false,f.route);
+  f.route.accessPrograms.cyber.push("daybreak_blue");
+  const [added]=await f.service.enrich([{slug:"fixture"}],false,f.route);
+  expect(f.programs).toContain("daybreak_blue");
+  expect(added.capability_probe_status).toMatchObject({"program:cyber:daybreak_blue":"verified"});
+  f.route.accessPrograms.cyber=["daybreak_blue"];
+  const [removed]=await f.service.enrich([{slug:"fixture"}],false,f.route);
+  expect(removed.capability_probe_status).not.toHaveProperty("program:cyber:standard");
+  f.route.accessPrograms.cyber=[];
+  const [empty]=await f.service.enrich([{slug:"fixture"}],false,f.route);
+  expect(empty.program_checked_at).toBeUndefined();
+  expect(empty.capability_probe_status).not.toHaveProperty("program:cyber:daybreak_blue");
+ });
+ it("uses the whole model override instead of falling back to route cyber values",async()=>{
+  const f=fixture();
+  await f.service.enrich([{slug:"fixture"}],false,{...f.route,modelAccessPrograms:{fixture:{}}});
+  expect(f.programs).toEqual([]);
+ });
+});
+
+it.each(["effort", "program"])("caches conclusive model denial during %s probes beyond the transient retry window", async (phase) => {
+	let now = 1000;
+	let posts = 0;
+	const service = new ApiModelCapabilities(async (_url, init) => {
+		if (init?.method !== "POST") return new Response("missing", { status: 404 });
+		posts++;
+		const body = JSON.parse(String(init.body));
+		if (phase === "effort" || body.access_programs) {
+			return Response.json({ error: { code: "model_access_denied" } }, { status: 403 });
+		}
+		return Response.json({ reasoning: body.reasoning, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+	}, () => now);
+	const route = { id: "fixture", kind: "api" as const, label: "fixture", apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, accessPrograms: { cyber: ["standard", "daybreak_blue"] } };
+	const [first] = await service.enrich([{ slug: "fixture" }], false, route);
+	expect(first.capability_probe_status).toMatchObject({ responses: "unsupported", "program:cyber:standard": "unsupported", "program:cyber:daybreak_blue": "unsupported" });
+	expect(first.program_checked_at).toBe(now);
+	expect(service.exportProbes()[0][1].programRetry).not.toBe(true);
+	expect(service.exportProbes()[0][1].status.retry).toBeUndefined();
+	const count = posts;
+	now += 60_001;
+	// Exercise persisted-cache import too: separate consumers must honour the denial.
+	const restarted = new ApiModelCapabilities(async (_url, init) => { if (init?.method === "POST") posts++; return new Response("missing", { status: 404 }); }, () => now);
+	restarted.importProbes(service.exportProbes());
+	const [cached] = await restarted.enrich([{ slug: "fixture" }], false, route);
+	// Public documentation may be read, but no authenticated capability request is needed.
+	expect(cached.capability_probe_status).toEqual(first.capability_probe_status);
+	expect(posts).toBe(count);
+});
+
+it.each(["low", "blank", "unavailable", "malformed", "verified"])("uses reasoning documentation provenance during an inconclusive refresh: %s", async (scenario) => {
+	let refreshed = false, now = 1000;
+	const fetcher: typeof fetch = async (_url, init) => {
+		if (init?.method !== "POST") {
+			if (refreshed && scenario === "unavailable") return new Response("offline", { status: 503 });
+			if (refreshed && scenario === "malformed") return new Response("Model ID: `fixture`\nReasoning.effort might support high.");
+			return new Response(`Model ID: \`fixture\`\nReasoning.effort supports: ${refreshed ? (scenario === "blank" ? "" : "low") : (scenario === "verified" ? "low" : "low, high")}.`);
+		}
+		if (refreshed) return Response.json({ error: { code: "rate_limit_exceeded" } }, { status: 429 });
+		const body = JSON.parse(String(init.body));
+		return Response.json({ reasoning: body.reasoning, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+	};
+	const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true };
+	const first = new ApiModelCapabilities(fetcher, () => now);
+	await first.enrich([{ slug: "fixture" }], false, route);
+	const restarted = new ApiModelCapabilities(fetcher, () => now);
+	restarted.importProbes(first.exportProbes());
+	now += 900_001;
+	refreshed = true;
+	const [model] = await restarted.enrich([{ slug: "fixture" }], true, route);
+	const levels = (model.supported_reasoning_levels as Array<{ effort: string }>).map(value => value.effort);
+	if (scenario === "low") expect(levels).not.toContain("high");
+	else expect(levels).toContain("high");
+});
+
+it.each([false, true])("reconciles cached doc-only levels without refreshing evidence (cache-only=%s)", async (cacheOnly) => {
+	let now = 1000, narrowed = false, outage = false, posts = 0;
+	const fetcher: typeof fetch = async (_url, init) => {
+		if (init?.method !== "POST") return outage ? new Response("offline", { status: 503 }) : new Response(`Model ID: \`fixture\`\nReasoning.effort supports: ${narrowed ? "low" : "low, high"}.`);
+		posts++;
+		if (outage) return new Response("throttled", { status: 429 });
+		const body = JSON.parse(String(init.body));
+		return Response.json({ reasoning: body.reasoning, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+	};
+	const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true };
+	const service = new ApiModelCapabilities(fetcher, () => now);
+	await service.enrich([{ slug: "fixture" }], false, route);
+	const prior = service.exportProbes();
+	const count = posts;
+	now++;
+	narrowed = true;
+	const [model] = await service.enrich([{ slug: "fixture" }], true, route, false, cacheOnly ? prior : undefined);
+	expect(model.supported_reasoning_levels).not.toContainEqual(expect.objectContaining({ effort: "high" }));
+	expect(model.supported_reasoning_levels).toContainEqual(expect.objectContaining({ effort: "max" }));
+	expect(model.capability_checked_at).toBe(1000);
+	expect(posts).toBe(count);
+	if (!cacheOnly) {
+		expect(service.exportProbes()[0][1].levels).not.toContain("high");
+		const restarted = new ApiModelCapabilities(fetcher, () => now);
+		restarted.importProbes(service.exportProbes());
+		outage = true;
+		now += 900_001;
+		const [afterRestart] = await restarted.enrich([{ slug: "fixture" }], true, route);
+		expect(afterRestart.supported_reasoning_levels).not.toContainEqual(expect.objectContaining({ effort: "high" }));
+	}
+});
+
+it("does not use an unavailable cached document to remove newer persisted doc-only efforts", async () => {
+	let outage = false;
+	const service = new ApiModelCapabilities(async () => outage ? new Response("offline", { status: 503 }) : new Response("Model ID: `fixture`\nReasoning.effort supports: low."), () => 2000);
+	await service.reasoning("fixture");
+	const { createHash } = await import("node:crypto");
+	const key = createHash("sha256").update("fixture\0fixture-key\0fixture").digest("hex");
+	service.importProbes([[key, { at: 2000, levels: ["low", "high"], tiers: [], status: { responses: "verified" } }]]);
+	outage = true;
+	const [model] = await service.enrich([{ slug: "fixture" }], true, { id: "fixture", label: "fixture", kind: "api", apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true });
+	expect(model.supported_reasoning_levels).toContainEqual(expect.objectContaining({ effort: "high" }));
+	expect(service.exportProbes()[0][1].levels).toEqual(["low", "high"]);
+});

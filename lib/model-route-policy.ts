@@ -175,6 +175,7 @@ export function modelEntitlements(model: RouteModel) {
 		typeof v === "string" && /^[A-Za-z0-9._-]{1,80}$/.test(v);
 	return {
 		model: model.slug,
+		...(typeof model.program_checked_at === "number" && Number.isFinite(model.program_checked_at) && model.program_checked_at >= 0 && model.program_checked_at <= 8.64e15 ? {programCheckedAt:model.program_checked_at} : {}),
 		...(typeof model.capability_checked_at === "number"
 			? { checkedAt: model.capability_checked_at }
 			: {}),
@@ -188,7 +189,7 @@ export function modelEntitlements(model: RouteModel) {
 								string,
 								"verified" | "unsupported" | "unverified" | "downgraded",
 							] =>
-								/^(responses|fast|ultrafast|effort:(none|minimal|low|medium|high|xhigh|max|ultra))$/.test(
+								/^(responses|fast|ultrafast|effort:(none|minimal|low|medium|high|xhigh|max|ultra)|program:cyber:(standard|daybreak_blue|daybreak_red))$/.test(
 									entry[0],
 								) &&
 								[

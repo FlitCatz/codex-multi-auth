@@ -3,7 +3,7 @@ import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
 import {
 	loadApiRoutes,
-	saveApiRoutes,
+	saveApiRoutesSnapshot,
 	type ApiRouteCredential,
 } from "../api-route-store.js";
 import { ApiModelRuntime } from "../runtime/api-model-runtime.js";
@@ -14,7 +14,7 @@ interface MenuDeps {
 	save: (
 		routes: ApiRouteCredential[],
 		expected: ApiRouteCredential[],
-	) => Promise<void>;
+	) => Promise<ApiRouteCredential[]>;
 	select: (
 		items: MenuItem<string>[],
 		message: string,
@@ -52,7 +52,7 @@ async function ask(message: string, secret = false): Promise<string> {
 }
 const defaults: MenuDeps = {
 	load: loadApiRoutes,
-	save: (routes, expected) => saveApiRoutes(routes, undefined, expected),
+	save: (routes, expected) => saveApiRoutesSnapshot(routes, undefined, expected),
 	select: (items, message) => select(items, { message, allowEscape: true }),
 	text: (message) => ask(message),
 	secret: () => ask("API key (hidden): ", true),
@@ -215,8 +215,7 @@ export async function runApiLoginMenu(
 				}
 				if (action !== "models") {
 					const next = routes.map((r) => (r.id === route?.id ? route : r));
-					await d.save(next, routes);
-					routes = next;
+					routes = await d.save(next, routes);
 					continue;
 				}
 			}
@@ -227,8 +226,7 @@ export async function runApiLoginMenu(
 			const next = routes.some((r) => r.id === edited.id)
 				? routes.map((r) => (r.id === edited.id ? edited : r))
 				: [...routes, edited];
-			await d.save(next, routes);
-			routes = next;
+			routes = await d.save(next, routes);
 			d.log(
 				"Saved. Choose an API or ZDR model explicitly in Codex. Desktop login is unchanged.",
 			);

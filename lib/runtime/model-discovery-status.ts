@@ -1,8 +1,9 @@
+import { enrichPersistedApiCapabilities } from "./persisted-api-capabilities.js";
 import { withFileTransactionLock } from "../storage/file-lock.js";
 import { styleReportText as paint } from "../ui/format.js";
 import { withCheckProgress } from "../ui/check-progress.js";
 import { mapWithConcurrency } from "../concurrency.js";
-import { ApiModelCapabilities, type ProbeResult } from "./api-model-capabilities.js";
+import { ApiModelCapabilities } from "./api-model-capabilities.js";
 import { getAppBindStatus } from "./app-bind.js";
 import { isRecord } from "../utils.js";
 import { promises as fs } from "node:fs";
@@ -33,7 +34,7 @@ const printable = z
 	.max(256)
 	.regex(/^[^\x00-\x1f\x7f]*$/);
 const entitlementSchema = z.object({
- model: printable, checkedAt: z.number().optional(),
+ model: printable, checkedAt: z.number().optional(), programCheckedAt: z.number().finite().nonnegative().max(8.64e15).optional(),
  probes: z.record(printable,z.enum(["verified","unsupported","unverified","downgraded"])).optional(),
  serviceTiers: z.array(z.object({id:printable,name:printable})).max(100),
  reasoningLevels:z.array(printable).max(100),accessPrograms:z.array(printable).max(100),
@@ -63,28 +64,12 @@ const schema = z.object({
 	entries: z.array(entrySchema).max(3000),
 });
 export type ModelInventory = z.infer<typeof schema>;
-const probeCacheSchema = z.object({
-	version: z.literal(1),
-	entries: z.array(z.tuple([
-		z.string().regex(/^[0-9a-f]{64}$/),
-		z.object({ at: z.number(), levels: z.array(printable).max(100), tiers: z.array(printable).max(100), status: z.record(printable, printable) }),
-	])).max(1000),
-});
-function probeCachePath(): string {
-	return join(getCodexMultiAuthDir(), "api-capability-probes.json");
-}
-async function loadProbeCache(): Promise<Array<[string, ProbeResult]>> {
-	try {
-		return probeCacheSchema.parse(JSON.parse(await fs.readFile(probeCachePath(), "utf8"))).entries;
-	} catch {
-		return [];
-	}
-}
 export async function discoverModelInventory(
 	storage: AccountStorageV3 | null,
 	routes: ApiRouteCredential[],
 	options: {
 		fetchImpl?: typeof fetch;
+		signal?: AbortSignal;
 		now?: () => number;
 		clientVersion?: string;
 		updateApiDiscovery?: typeof updateApiModelDiscovery;
@@ -92,6 +77,8 @@ export async function discoverModelInventory(
 		forceProbes?: boolean;
 		/** Share probe results with later CLI processes through the multi-auth directory. */
 		persistProbes?: boolean;
+		/** Refresh program evidence that expires before the next scheduled check. */
+		programRefreshBefore?: number;
 	} = {},
 ): Promise<ModelInventory> {
 	const fetcher = options.fetchImpl ?? fetch,
@@ -151,32 +138,20 @@ export async function discoverModelInventory(
 	} finally {
 		await manager.flushPendingSave();
 	}
-	const capabilities = new ApiModelCapabilities(fetcher, now);
-	if (options.persistProbes) capabilities.importProbes(await loadProbeCache());
+	const capabilities = new ApiModelCapabilities(fetcher, now, undefined, undefined, options.programRefreshBefore);
 	const api = new ApiModelRuntime(
 		fetcher,
 		now,
 		options.updateApiDiscovery,
 		options.updateApiDiscovery
 			? (models, refresh, route, forceProbes) =>
-					capabilities.enrich(models, refresh, route, forceProbes)
+					options.persistProbes
+                        ? enrichPersistedApiCapabilities(models,refresh,route,forceProbes,{fetchImpl:fetcher,now,requireStoredRoute:true,signal:options.signal,programRefreshBefore:options.programRefreshBefore})
+                        : capabilities.enrich(models, refresh, route, forceProbes)
 			: undefined,
 	);
 	await api.catalogs(routes, true, options.forceProbes === true);
-	if (options.persistProbes) {
-		const path = probeCachePath();
-		await withFileTransactionLock(path, async () => {
-			// Merge with the latest file: a concurrent check may have probed other
-			// credentials since this one loaded. The newer result wins per key.
-			const merged = new Map(await loadProbeCache());
-			for (const [key, value] of capabilities.exportProbes()) {
-				const disk = merged.get(key);
-				if (!disk || disk.at <= value.at) merged.set(key, value);
-			}
-			const entries = [...merged].sort((x, y) => x[1].at - y[1].at).slice(-1000);
-			await writeFileAtomic(path, JSON.stringify(probeCacheSchema.parse({ version: 1, entries })) + "\n");
-		}).catch(() => undefined);
-	}
+
 	entries.push(
 		...api.statuses(routes).map((s, i) => ({
 			id: modelScopeId(s.kind,s.id),
@@ -218,34 +193,76 @@ export async function loadModelInventory(): Promise<ModelInventory | null> {
 	}
 }
 let inventoryWrites: Promise<void> = Promise.resolve();
-export function saveModelInventory(value: ModelInventory): Promise<void> {
-	const path = inventoryPath();
-	const pending = inventoryWrites.then(() =>
-		withFileTransactionLock(path, () => saveModelInventorySerial(value, path)),
-	);
+/** Drain queued writes before resetting process-local test state. */
+export async function resetModelInventoryWritesForTests(): Promise<void> {
+	for (;;) {
+		const pending = inventoryWrites;
+		await pending;
+		if (inventoryWrites === pending) {
+			inventoryWrites = Promise.resolve();
+			return;
+		}
+	}
+}
+export function saveModelInventory(value: ModelInventory, options: { mergeEntries?: boolean; signal?: AbortSignal } = {}): Promise<void> {
+	const path = inventoryPath(), signal = options.signal;
+	if (signal?.aborted) return Promise.reject(signal.reason);
+	let stopWaiting: (() => void) | undefined;
+	const pending = inventoryWrites.then(() => {
+		// Once started, drain our own cancellable lock/write and cleanup.
+		stopWaiting?.();
+		signal?.throwIfAborted();
+		return withFileTransactionLock(path, () => saveModelInventorySerial(value, path, options.mergeEntries === true, signal), { signal });
+	});
+	// Keep the underlying queue intact even if a waiting caller cancels.
 	inventoryWrites = pending.catch(() => undefined);
-	return pending;
+	if (!signal) return pending;
+	return new Promise<void>((resolve, reject) => {
+		const abort = () => { stopWaiting?.(); reject(signal.reason); };
+		stopWaiting = () => signal.removeEventListener("abort", abort);
+		signal.addEventListener("abort", abort, { once: true });
+		if (signal.aborted) abort();
+		void pending.then(resolve, reject).finally(() => stopWaiting?.());
+	});
 }
 async function saveModelInventorySerial(
 	value: ModelInventory,
 	path: string,
+	mergeEntries = false,
+	signal?: AbortSignal,
 ): Promise<void> {
-	const data = schema.parse(withInventoryChanges(value, await loadModelInventory()));
+	signal?.throwIfAborted();
+	const previous = await loadModelInventory();
+	if (mergeEntries && previous) {
+		// Clock rollback must not make old observations permanently newer.
+		const now = Date.now();
+		const entries = [...previous.entries];
+		for (const entry of value.entries) {
+			const index = entries.findIndex(old => old.id === entry.id && old.kind === entry.kind);
+			if (index < 0) entries.push(entry);
+			else if ((entries[index]?.checkedAt ?? -Infinity) > now || (entries[index]?.checkedAt ?? -Infinity) <= entry.checkedAt) entries[index] = entry;
+		}
+		value = { ...previous, ...value, clientVersion: value.clientVersion ?? previous.clientVersion,
+			checkedAt: previous.checkedAt > now ? value.checkedAt : Math.max(previous.checkedAt, value.checkedAt), entries };
+	}
+	const data = schema.parse(withInventoryChanges(value, previous));
 	const serialized = JSON.stringify(data) + "\n";
 	if (Buffer.byteLength(serialized) > 4 * 1024 * 1024)
 		throw Error("Model discovery status exceeds size limit");
-	await writeFileAtomic(path, serialized);
+	await writeFileAtomic(path, serialized, signal);
 }
-async function writeFileAtomic(path: string, serialized: string): Promise<void> {
+async function writeFileAtomic(path: string, serialized: string, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
 	const temp = tempPathFor(path);
 	await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	const retry = { maxAttempts: 6, backoffMs: 25 };
 	try {
+		signal?.throwIfAborted();
 		await fs.writeFile(temp, serialized, {
 			mode: 0o600,
 			flag: "wx",
 		});
-		await withRetry(() => fs.rename(temp, path), retry);
+		await withRetry(() => { signal?.throwIfAborted(); return fs.rename(temp, path); }, retry);
 	} finally {
 		await withRetry(() => fs.unlink(temp), retry).catch((e) => {
 			if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
@@ -265,11 +282,11 @@ export function formatModelInventory(
 			`    ${paint("Available:", "muted")} ${e.models.join(", ") || "none"}`,
 			...(e.entitlements ?? []).map(
 				(m) =>
-					`    ${paint(m.model, "accent")}: speeds=${m.serviceTiers.map((t) => `${t.name} (${t.id})`).join(", ") || "not advertised"}; reasoning=${m.reasoningLevels.join(", ") || "not advertised"}; programs=${m.accessPrograms.join(", ") || "not advertised"}${
+					`    ${paint(m.model, "accent")}: speeds=${m.serviceTiers.map((t) => `${t.name} (${t.id})`).join(", ") || "not advertised"}; reasoning=${m.reasoningLevels.join(", ") || "not advertised"}; ${e.kind === "oauth" ? "programs" : "configured programs"}=${m.accessPrograms.join(", ") || (e.kind === "oauth" ? "not advertised" : "none")}${
 						m.probes
 							? `; probes: ${Object.entries(m.probes)
 									.map(([k, v]) => `${k}=${paint(v, v === "verified" ? "success" : v === "unsupported" || v === "downgraded" ? "warning" : "muted")}`)
-									.join(", ")} (${new Date(m.checkedAt ?? 0).toISOString()})`
+									.join(", ")} (${new Date(m.checkedAt ?? 0).toISOString()})${m.programCheckedAt !== undefined ? `; programs checked ${new Date(m.programCheckedAt).toISOString()}` : ""}`
 							: ""
 					}`,
 			),

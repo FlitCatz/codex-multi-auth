@@ -139,6 +139,27 @@ function writeStatus(statusPath, payload) {
 	}
 }
 
+// Status history is untrusted local JSON; retain only safe operational fields.
+function readDisconnect(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const { at, cause, stage, closeCode, routeKind, connectionAgeMs, eventCount } = value;
+	if (typeof at !== "number" || !Number.isFinite(at) || at < 0 || at > 8.64e15) return null;
+	if (!["close", "transport_error", "invalid_event", "buffer_limit", "send_error"].includes(cause)) return null;
+	if (!["awaiting_first_event", "streaming"].includes(stage)) return null;
+	if (routeKind !== undefined && !["oauth", "api", "zdr"].includes(routeKind)) return null;
+	if (closeCode !== undefined && (!Number.isInteger(closeCode) || closeCode < 1000 || closeCode > 4999)) return null;
+	for (const count of [connectionAgeMs, eventCount]) {
+		if (count !== undefined && (!Number.isSafeInteger(count) || count < 0)) return null;
+	}
+	return {
+		at, cause, stage,
+		...(closeCode !== undefined ? { closeCode } : {}),
+		...(routeKind !== undefined ? { routeKind } : {}),
+		...(connectionAgeMs !== undefined ? { connectionAgeMs } : {}),
+		...(eventCount !== undefined ? { eventCount } : {}),
+	};
+}
+
 function createStatusPayload({
 	state,
 	proxyServer,
@@ -148,9 +169,13 @@ function createStatusPayload({
 	statusPath,
 	routerScriptPath,
 	identityToken,
+	previousDisconnect = null,
 }) {
 	const proxyStatus =
 		typeof proxyServer?.getStatus === "function" ? proxyServer.getStatus() : {};
+	const currentDisconnect = readDisconnect(proxyStatus.lastWebsocketDisconnect);
+	// A current-process event is newer history even after wall-clock rollback.
+	const lastDisconnect = currentDisconnect ?? previousDisconnect;
 	const lastAccountIndex = proxyStatus.lastAccountIndex ?? null;
 	const lastAccountLabel =
 		typeof proxyStatus.lastAccountLabel === "string" &&
@@ -180,6 +205,7 @@ function createStatusPayload({
 		upstreamRequests: proxyStatus.upstreamRequests ?? 0,
 		websocketConnections: proxyStatus.websocketConnections ?? 0,
 		websocketUpstreamRequests: proxyStatus.websocketUpstreamRequests ?? 0,
+		lastWebsocketDisconnect: lastDisconnect,
 		streamQuotaUpdates: proxyStatus.streamQuotaUpdates ?? 0,
 		lastStreamQuotaUpdateAt: proxyStatus.lastStreamQuotaUpdateAt ?? null,
 		retries: proxyStatus.retries ?? 0,
@@ -267,6 +293,7 @@ async function main() {
 	const args = parseArgs(process.argv.slice(2));
 	installLogBounds(args.maxLogBytes, args.logPath).unref?.();
 	const stateRecord = readState(args.statePath);
+	let previousDisconnect = readDisconnect(readState(args.statusPath || stateRecord?.statusPath || "")?.lastWebsocketDisconnect);
 	if (args.statePath && stateRecord === null) {
 		const error = new Error(
 			"Codex app runtime router state is unreadable; refusing to bind an ephemeral port.",
@@ -274,6 +301,7 @@ async function main() {
 		writeStatus(
 			args.statusPath,
 			createStatusPayload({
+				previousDisconnect,
 				state: "error",
 				proxyServer: null,
 				error,
@@ -311,20 +339,19 @@ async function main() {
 
 	let proxyServer = null;
 	const writeCurrentStatus = (state, error) => {
-		writeStatus(
-			args.statusPath || stateRecord?.statusPath || "",
-			createStatusPayload({
-				state,
-				proxyServer,
-				error,
-				stateRecord,
-				startedAt: routerStartedAt,
-				statusPath: args.statusPath || stateRecord?.statusPath || "",
-				routerScriptPath: stateRecord?.routerScriptPath || process.argv[1],
-				identityToken:
-					args.identityToken || stateRecord?.identityToken || "",
-			}),
-		);
+		const payload = createStatusPayload({
+			previousDisconnect,
+			state,
+			proxyServer,
+			error,
+			stateRecord,
+			startedAt: routerStartedAt,
+			statusPath: args.statusPath || stateRecord?.statusPath || "",
+			routerScriptPath: stateRecord?.routerScriptPath || process.argv[1],
+			identityToken: args.identityToken || stateRecord?.identityToken || "",
+		});
+		previousDisconnect = payload.lastWebsocketDisconnect;
+		writeStatus(args.statusPath || stateRecord?.statusPath || "", payload);
 	};
 
 	try {

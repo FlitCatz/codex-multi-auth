@@ -9,6 +9,22 @@ import { parseModelRoute } from "../model-route-policy.js";
 import { isRecord } from "../utils.js";
 import { ResponseOutputHistory, hasOrphanToolResult } from "./response-output-history.js";
 
+/** Safe operational evidence only: never persist upstream reason text or payloads. */
+export interface WebSocketDisconnectDiagnostic {
+ at: number;
+ cause: "close" | "transport_error" | "invalid_event" | "buffer_limit" | "send_error";
+ stage: "awaiting_first_event" | "streaming";
+ closeCode?: number;
+ routeKind?: "oauth" | "api" | "zdr";
+ connectionAgeMs?: number;
+ eventCount?: number;
+}
+interface WebSocketStats {
+ connections: number;
+ upstreamConnections: number;
+ upstreamRequests: number;
+ lastDisconnect?: WebSocketDisconnectDiagnostic;
+}
 const CONTEXT_HEADER = "x-local-responses-transport";
 const terminal = new Set([
 	"response.completed",
@@ -19,7 +35,7 @@ const terminal = new Set([
 ]);
 type Json = Record<string, unknown>;
 type Chain = { body: Json; output: unknown[]; pool: string; bytes: number };
-type Context = { signal: AbortSignal; session: SocketSession; previousId?: string; delta?: unknown; clientBeta?: string };
+type Context = { routeKind: "oauth" | "api" | "zdr"; signal: AbortSignal; session: SocketSession; previousId?: string; delta?: unknown; clientBeta?: string };
 /** Headers that describe the synthetic body or the upgrade itself, never the upstream decision. */
 const LOCAL_ONLY_HEADERS = /^(connection|upgrade|keep-alive|sec-websocket-.*|content-length|content-encoding|content-type|transfer-encoding|set-cookie)$/i;
 function upstreamHeaders(source: unknown): Record<string, string> {
@@ -66,6 +82,7 @@ function bodyJson(body: RequestInit["body"]): Json {
 /** Per-client memory only; credentials never leave the existing routing boundary. */
 class SocketSession {
 	readonly channels = new Map<string, WebSocket>();
+	private readonly openedAt = new WeakMap<WebSocket, number>();
 	readonly owners = new Map<string, WebSocket>();
 	readonly chains = new Map<string, Chain>();
 	/** Credentials whose WebSocket handshake was refused; they use HTTP for the session. */
@@ -75,11 +92,7 @@ class SocketSession {
 	closed = false;
 	constructor(
 		readonly maxBytes: number,
-		readonly stats: {
-			connections: number;
-			upstreamConnections: number;
-			upstreamRequests: number;
-		},
+		readonly stats: WebSocketStats,
 		private readonly httpFetch: typeof fetch = fetch,
 	) {}
 	close() {
@@ -231,12 +244,15 @@ class SocketSession {
 				this.httpOnly.add(key);
 				return this.httpFetch(input, init);
 			}
+			this.openedAt.set(socket, Date.now());
 			this.channels.set(key, socket);
 		}
 		const active = socket;
 		return new Promise<Response>((resolve, reject) => {
 			let accepted = false,
 				finished = false;
+			let bodyCancelled = false;
+			let eventCount = 0;
 			let streamController: ReadableStreamDefaultController<Uint8Array>;
 			const stream = new ReadableStream<Uint8Array>(
 				{
@@ -244,6 +260,7 @@ class SocketSession {
 						streamController = controller;
 					},
 					cancel() {
+						bodyCancelled = true;
 						active.terminate();
 					},
 				},
@@ -251,17 +268,26 @@ class SocketSession {
 			);
 			const cleanup = () => {
 				active.off("message", onMessage);
-				active.off("close", onClose);
-				active.off("error", onClose);
+				active.off("close", onSocketClose);
+				active.off("error", onError);
 				init.signal?.removeEventListener("abort", abort);
                 context.signal.removeEventListener("abort", abort);
 			};
-			const onClose = () => {
+			const onClose = (closeCode?: number, cause: WebSocketDisconnectDiagnostic["cause"] = "close") => {
 				if (finished) return;
 				finished = true;
 				cleanup();
 				this.channels.delete(key);
-                const cancelled = context.signal.aborted || this.closed;
+                const cancelled = bodyCancelled || init.signal?.aborted || context.signal.aborted || this.closed;
+                if (!cancelled) {
+                    const at = Date.now();
+                    this.stats.lastDisconnect = {
+                        at, cause, routeKind: context.routeKind,
+                        connectionAgeMs: Math.max(0, at - (this.openedAt.get(active) ?? at)), eventCount,
+                        stage: accepted ? "streaming" : "awaiting_first_event",
+                        ...(typeof closeCode === "number" ? {closeCode} : {}),
+                    };
+                }
                 // Once create has been sent, a disconnect cannot prove generation
                 // did not start. Never replay it, even before the first event.
                 const error = cancelled
@@ -277,14 +303,18 @@ class SocketSession {
                     }));
                 }
 			};
+			const onSocketClose = (code: number) => onClose(code);
+			const onError = () => onClose(undefined, "transport_error");
 			const abort = () => active.terminate();
 			const onMessage = (raw: WebSocket.RawData, isBinary: boolean) => {
+				let failureCause: WebSocketDisconnectDiagnostic["cause"] = "invalid_event";
 				try {
 					if (isBinary) throw Error("Unexpected binary response");
 					const text = raw.toString();
 					const event: unknown = JSON.parse(text);
 					if (!isRecord(event) || typeof event.type !== "string")
 						throw Error("Invalid response event");
+					eventCount++;
 					if (event.type === "error" && !accepted) {
 						finished = true;
 						cleanup();
@@ -307,8 +337,10 @@ class SocketSession {
 							}),
 						);
 					}
-					if ((streamController.desiredSize ?? 0) < -this.maxBytes)
+					if ((streamController.desiredSize ?? 0) < -this.maxBytes) {
+						failureCause = "buffer_limit";
 						throw Error("Upstream buffer exceeded");
+					}
 					streamController.enqueue(Buffer.from(`data: ${text}\n\n`));
 					if (
 						isRecord(event.response) &&
@@ -326,13 +358,13 @@ class SocketSession {
 						streamController.close();
 					}
 				} catch {
+					onClose(undefined, failureCause);
 					active.terminate();
-					onClose();
 				}
 			};
 			active.on("message", onMessage);
-			active.once("close", onClose);
-			active.once("error", onClose);
+			active.once("close", onSocketClose);
+			active.once("error", onError);
 			init.signal?.addEventListener("abort", abort, { once: true });
 			context.signal.addEventListener("abort", abort, {once:true});
             if (init.signal?.aborted || context.signal.aborted) {
@@ -341,7 +373,10 @@ class SocketSession {
 			}
 			this.stats.upstreamRequests++;
 			active.send(JSON.stringify(body), (error) => {
-				if (error) onClose();
+				if (error) {
+					onClose(undefined, "send_error");
+					active.terminate();
+				}
 			});
 		});
 	}
@@ -349,7 +384,7 @@ class SocketSession {
 
 /** Adapts only the transport; authenticated HTTP routing remains the policy authority. */
 export class ResponsesWebSocketGateway {
-	readonly stats = {
+	readonly stats: WebSocketStats = {
 		connections: 0,
 		upstreamConnections: 0,
 		upstreamRequests: 0,
@@ -564,7 +599,7 @@ export class ResponsesWebSocketGateway {
 						const controller = new AbortController();
                         session.controller = controller;
                         const clientBeta = req.headers["openai-beta"];
-                        this.contexts.set(id, { session, previousId, delta: event.input, signal: controller.signal, clientBeta: typeof clientBeta === "string" ? clientBeta : undefined });
+                        this.contexts.set(id, { routeKind: pool, session, previousId, delta: event.input, signal: controller.signal, clientBeta: typeof clientBeta === "string" ? clientBeta : undefined });
 						const headers = new Headers();
 						for (const [key, value] of Object.entries(req.headers)) {
 							if (

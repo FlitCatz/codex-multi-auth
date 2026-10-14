@@ -170,7 +170,33 @@ Run `check` for the full check, or select one portion:
 Plain `check` refreshes model discovery but reuses API capability probe results
 younger than 15 minutes, including results from an earlier `check` process
 (stored as hashes in `api-capability-probes.json`). Only `check capabilities`
-sends the billable probes regardless of age. No check sends the first-use
+sends the billable probes regardless of age. Access-program results have a separate
+24-hour cache and appear as `program:cyber:<program>` probe results with their
+check time; `configured programs` remains local policy, not an API advertisement.
+Program expiry and changes to configured candidates invalidate the relevant
+cached result even inside the 15-minute general cache. A per-model program map
+replaces the entire route default map; omitted families do not inherit defaults.
+
+While a CLI/app router is running, enabled API/ZDR routes with
+`probeCapabilities: true` also receive a daily capability check of their visible
+models. These checks consume API usage, include small explicit access-program
+requests, and preserve request defaults and configured entitlements. A persisted
+claim prevents multiple routers or restarts from repeating the same daily pass.
+Live catalog enrichment and daily checks share persisted probe results under
+credential/model locks, preventing concurrent refreshes from duplicating probes.
+Explicit `check capabilities` still forces a new pass.
+If the probe cache contains malformed JSON or an invalid schema, that explicit
+check repairs it atomically before probing. Ordinary and automatic checks leave
+corrupt caches untouched. Filesystem access errors never trigger cache repair or
+paid probes.
+Disable capability probing or the route to stop future automatic probes.
+Malformed check history is repaired with a fresh daily delay, avoiding an
+immediate duplicate billable pass. Filesystem access errors stop the check
+until access is restored. Inconclusive program probes keep the last evidence
+time and can be retried by a subsequent capability refresh after 60 seconds;
+they do not renew the 24-hour evidence cache or accelerate the daily scheduler.
+
+No check sends the first-use
 request without `--prime`; the dashboard's Quick and Deep Check do not prime.
 `account auto-prime <index> on` instead authorizes periodic priming by a running
 CLI/app router.
@@ -958,6 +984,14 @@ completed), and health/model checks do not update it. `status --json` preserves
 `accounts[].lastUsed` and adds `accounts[].lastInferenceRequestAt`,
 `apiAccounts`, `totalAccountCount`, `selectionMode`, `modelInventory`, and
 per-account priority/forecast/reset-credit fields.
+
+`status` and `rotation status` show the last recorded WebSocket interruption,
+when present: timestamp, cause, response stage, and optional close code.
+New records also include the route kind (`oauth`, `api`, or `zdr`), upstream
+connection age in milliseconds, and the number of valid events received for
+the interrupted request. Older records remain readable without these fields.
+`status --json` exposes it as `lastWebsocketDisconnect`. Local cancellation and
+request timeouts are excluded; raw upstream messages and payloads are not stored.
 
 API model entries require explicit selection and never serve as automatic paid
 fallbacks; see [model route pools](../design/model-route-pools.md) for setup

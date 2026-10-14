@@ -59,6 +59,30 @@ The account pool under `~/.codex/multi-auth` carries over.
 
 ## Changes To Know About
 
+### Automatic API Checks And Disconnect Diagnostics
+
+Enabled API/ZDR routes already configured with `probeCapabilities: true` receive
+small billable checks daily while a CLI/app router runs. Disable capability
+probing or the route to stop automatic probes. Live model discovery and scheduled
+checks share persisted results; program evidence expires after 24 hours even
+when other capabilities were checked recently. Each claimed daily pass refreshes
+program evidence that would expire before its next run, so it can repeat a full
+capability pass even after a recently completed live check. An overlapping probe completed after the daily pass
+started is reused. The next run follows persisted daily claim deadlines rather
+than waiting another day after a slow pass completes; overdue runs catch up
+without overlapping. A route that fails preparation before claiming a pass is
+retried after one minute; claimed passes retain their daily limit. Stopping the
+router cancels queued probes and pending inventory saves without waiting for
+unrelated work. Saving the same visible models in a different order neither
+invalidates cached probe results nor skips a due daily check. Credential resets
+also remove automatic-check history.
+No credential, workspace,
+subscription priming, or request-program setting is migrated.
+
+`status`, `status --json`, and `rotation status` expose sanitized historical
+WebSocket disconnect details. This helps investigate interruptions without
+replaying a generation that may already have started upstream.
+
 ### `codex` Is No Longer Ours (v2.1.2)
 
 The package stopped publishing a global `codex` binary — that name belongs to the official Codex install path (npm, Homebrew, or a release binary). Use `codex-multi-auth …` for account management, and `codex-multi-auth-codex`/`mcodex` when you intentionally want the forwarding wrapper. If a stale shim still answers to `codex`, reinstall the official CLI.

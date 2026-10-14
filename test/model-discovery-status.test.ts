@@ -1,3 +1,4 @@
+import { saveApiRoutes } from "../lib/api-route-store.js";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
 	discoverModelInventory,
@@ -6,21 +7,79 @@ import {
 import { promises as isolationFs } from "node:fs";
 import { tmpdir as isolationTmpdir } from "node:os";
 import { join as isolationJoin } from "node:path";
+import { removeWithRetry } from "./helpers/remove-with-retry.js";
 // Inventory writes merge with whatever is already on disk, so every test gets
 // its own multi-auth directory instead of the worker's shared one.
 let previousMultiAuthDir: string | undefined;
 let multiAuthDir: string;
+it("drains inventory writes before resetting their test queue", async () => {
+	const inventory = await import("../lib/runtime/model-discovery-status.js");
+	const locks = await import("../lib/storage/file-lock.js");
+	let release!: () => void;
+	let entered!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const started = new Promise<void>(resolve => { entered = resolve; });
+	const original = locks.withFileTransactionLock;
+	const lock = vi.spyOn(locks, "withFileTransactionLock").mockImplementationOnce(async (...args) => {
+		entered();
+		await gate;
+		return original(...args);
+	});
+	let first: Promise<void> | undefined;
+	let second: Promise<void> | undefined;
+	try {
+		first = inventory.saveModelInventory({ version: 1, checkedAt: 1, entries: [] });
+		await started;
+		let resetFinished = false;
+		const reset = inventory.resetModelInventoryWritesForTests().then(() => { resetFinished = true; });
+		second = inventory.saveModelInventory({ version: 1, checkedAt: 2, entries: [] });
+		await Promise.resolve();
+		expect(resetFinished).toBe(false);
+		release();
+		await Promise.all([first, second, reset]);
+		expect((await inventory.loadModelInventory())?.checkedAt).toBe(2);
+		await inventory.resetModelInventoryWritesForTests();
+	} finally {
+		release();
+		await Promise.allSettled([first, second]);
+		lock.mockRestore();
+	}
+});
 beforeEach(async () => {
 	previousMultiAuthDir = process.env.CODEX_MULTI_AUTH_DIR;
 	multiAuthDir = await isolationFs.mkdtemp(isolationJoin(isolationTmpdir(), "model-discovery-"));
 	process.env.CODEX_MULTI_AUTH_DIR = multiAuthDir;
 });
 afterEach(async () => {
+	const { resetModelInventoryWritesForTests } = await import("../lib/runtime/model-discovery-status.js");
+	await resetModelInventoryWritesForTests();
 	if (previousMultiAuthDir === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
 	else process.env.CODEX_MULTI_AUTH_DIR = previousMultiAuthDir;
-	await isolationFs.rm(multiAuthDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+	await removeWithRetry(multiAuthDir, { recursive: true, force: true });
 });
 describe("model discovery reporting", () => {
+	it.each(["api", "zdr"] as const)("labels %s programs as local configuration", async (kind) => {
+		const inventory = await discoverModelInventory(null, [{
+			id: "fixture", label: "API fixture", kind, apiKey: "fixture-secret",
+			enabled: true, priority: 0, visibleModels: ["configured", "unconfigured"],
+			modelAccessPrograms: { configured: { cyber: ["standard", "daybreak_blue"] } },
+		}], { fetchImpl: vi.fn(async () => Response.json({ data: [
+			{ id: "configured" }, { id: "unconfigured" },
+		] })), now: () => 1234 });
+		const output = formatModelInventory(inventory, 1234).join("\n");
+		expect(output).toContain("configured programs=cyber:standard, cyber:daybreak_blue");
+		expect(output).toContain("configured programs=none");
+		expect(output).not.toContain("programs=not advertised");
+	});
+	it("preserves upstream program wording for OAuth catalogs", () => {
+		const output = formatModelInventory({ version: 1, checkedAt: 1234, entries: [{
+			id: "fixture", label: "OAuth fixture", kind: "oauth", enabled: true,
+			error: false, checkedAt: 1234, models: ["fixture"], visibleModels: ["fixture"],
+			entitlements: [{ model: "fixture", serviceTiers: [], reasoningLevels: [], accessPrograms: [] }],
+		}] }, 1234).join("\n");
+		expect(output).toContain("programs=not advertised");
+		expect(output).not.toContain("configured programs=");
+	});
 	it("reports each credential independently including API-only and hidden IDs", async () => {
 		const fetcher = vi.fn(async () =>
 			Response.json({ data: [{ id: "exclusive" }, { id: "hidden" }] }),
@@ -346,6 +405,7 @@ it("honours the persisted 15-minute probe cache across fresh CLI processes unles
    return new Response("missing", { status: 404 });
   });
   const route = { id: "fixture", label: "API fixture", kind: "api" as const, apiKey: "fixture-secret", enabled: true, priority: 0, visibleModels: ["fixture-model"], probeCapabilities: true };
+  await saveApiRoutes([route]);
   let clock = 1_000_000;
   const run = async (forceProbes?: boolean) => {
    vi.resetModules();
@@ -533,6 +593,7 @@ it("merges concurrent checks' probe results instead of replacing the shared cach
    return new Response("missing", { status: 404 });
   });
   const route = (id: string) => ({ id, label: id, kind: "api" as const, apiKey: `key-${id}`, enabled: true, priority: 0, visibleModels: ["fixture-model"], probeCapabilities: true });
+  await saveApiRoutes([route("one"), route("two")]);
   vi.resetModules();
   const a = await import("../lib/runtime/model-discovery-status.js");
   vi.resetModules();
@@ -551,4 +612,121 @@ it("merges concurrent checks' probe results instead of replacing the shared cach
   vi.unstubAllEnvs();
   await fs.rm(dir, { recursive: true, force: true });
  }
+});
+
+it("persists daily program evidence separately from the shorter capability cache",async()=>{
+ let now=1000;
+ let programRequests=0;
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ const fetcher=vi.fn(async(url:unknown,init?:RequestInit)=>{
+  if(String(url).endsWith("/models"))return Response.json({data:[{id:"fixture"}]});
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)programRequests++;
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ await saveApiRoutes([route]);
+ const options={fetchImpl:fetcher,now:()=>now,persistProbes:true,updateApiDiscovery:async()=>route};
+ await discoverModelInventory(null,[route],options);
+ expect(programRequests).toBe(1);
+ now+=900001;
+ const inventory=await discoverModelInventory(null,[route],options);
+ expect(programRequests).toBe(1);
+ expect(formatModelInventory(inventory,now).join("\n")).toContain("program:cyber:daybreak_blue=verified");
+});
+
+it("atomically merges partial inventories without losing OAuth or other API rows",async()=>{
+ const {saveModelInventory,loadModelInventory}=await import("../lib/runtime/model-discovery-status.js");
+ const entry=(id:string,kind:"api"|"oauth",checkedAt:number)=>({id,label:id,kind,checkedAt,enabled:true,error:false,models:[id],visibleModels:[id]});
+ await saveModelInventory({version:1,checkedAt:100,clientVersion:"1.2.3",entries:[entry("oauth","oauth",100),entry("a","api",100),entry("b","api",100)]});
+ await Promise.all([
+ saveModelInventory({version:1,checkedAt:200,entries:[entry("a","api",200)]},{mergeEntries:true}),
+ saveModelInventory({version:1,checkedAt:300,entries:[entry("b","api",300)]},{mergeEntries:true}),
+ ]);
+ const result=await loadModelInventory();
+ expect(result?.entries.map(e=>[e.id,e.checkedAt]).sort()).toEqual([["a",200],["b",300],["oauth",100]]);
+ expect(result?.clientVersion).toBe("1.2.3");
+ await saveModelInventory({version:1,checkedAt:150,entries:[entry("a","api",150)]},{mergeEntries:true});
+ expect((await loadModelInventory())?.entries.find(e=>e.id==="a")?.checkedAt).toBe(200);
+});
+
+it.each([429,403])("preserves the daily program cache through unrelated capability failures (%s)",async(status)=>{
+ let now=1000,programRequests=0,failed=false;
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ const fetcher=vi.fn(async(url:unknown,init?:RequestInit)=>{
+  if(String(url).endsWith("/models"))return Response.json({data:[{id:"fixture"}]});
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs)programRequests++;
+  if(failed && body.tools)return Response.json({error:{code:"temporary"}},{status});
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ await saveApiRoutes([route]);
+ const options={fetchImpl:fetcher,now:()=>now,persistProbes:true,updateApiDiscovery:async()=>route};
+ await discoverModelInventory(null,[route],options);
+ now+=900001;failed=true;
+ await discoverModelInventory(null,[route],options);
+ now+=60001;failed=false;
+ const inventory=await discoverModelInventory(null,[route],options);
+ expect(programRequests).toBe(1);
+ expect(inventory.entries[0].entitlements?.[0]).toMatchObject({programCheckedAt:1000,probes:{"program:cyber:daybreak_blue":"verified"}});
+});
+
+it("does not claim a program check when a model has no whitelisted candidates",async()=>{
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["unknown_program"]}};
+ const fetcher=vi.fn(async(url:unknown,init?:RequestInit)=>{
+  if(String(url).endsWith("/models"))return Response.json({data:[{id:"fixture"}]});
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  expect(body.access_programs).toBeUndefined();
+  return Response.json({status:"completed",reasoning:body.reasoning});
+ });
+ await saveApiRoutes([route]);
+ const inventory=await discoverModelInventory(null,[route],{fetchImpl:fetcher,now:()=>1000,persistProbes:true,updateApiDiscovery:async()=>route});
+ expect(inventory.entries[0].entitlements?.[0]).not.toHaveProperty("programCheckedAt");
+ expect(formatModelInventory(inventory,1000).join("\n")).not.toContain("programs checked");
+});
+
+it("persists program-specific transient retries without renewing old evidence",async()=>{
+ let now=1000,programRequests=0,failed=false;
+ const route={id:"fixture",kind:"api" as const,label:"fixture",apiKey:"fixture-key",enabled:true,priority:0,visibleModels:["fixture"],probeCapabilities:true,accessPrograms:{cyber:["daybreak_blue"]}};
+ const fetcher=vi.fn(async(url:unknown,init?:RequestInit)=>{
+  if(String(url).endsWith("/models"))return Response.json({data:[{id:"fixture"}]});
+  if(init?.method!=="POST")return new Response("missing",{status:404});
+  const body=JSON.parse(String(init.body));
+  if(body.access_programs){programRequests++;if(failed)return Response.json({error:{code:"temporary"}},{status:429});}
+  return Response.json({status:"completed",reasoning:body.reasoning,access_programs:body.access_programs});
+ });
+ await saveApiRoutes([route]);
+ const options={fetchImpl:fetcher,now:()=>now,persistProbes:true,updateApiDiscovery:async()=>route};
+ await discoverModelInventory(null,[route],options);
+ now+=1000;failed=true;
+ await discoverModelInventory(null,[route],{...options,forceProbes:true});
+ now+=60001;failed=false;
+ const inventory=await discoverModelInventory(null,[route],options);
+ expect(programRequests).toBe(3);
+ expect(inventory.entries[0].entitlements?.[0]).toMatchObject({programCheckedAt:now,probes:{"program:cyber:daybreak_blue":"verified"}});
+});
+
+it("replaces future inventory evidence after clock rollback while preserving valid newer and unrelated rows", async () => {
+	const { saveModelInventory, loadModelInventory } = await import("../lib/runtime/model-discovery-status.js");
+	const clock = vi.spyOn(Date, "now").mockReturnValue(2000);
+	const entry = (id: string, checkedAt: number, model: string) => ({ id, label: id, kind: "api" as const, checkedAt, enabled: true, error: false, models: [model], visibleModels: [model] });
+	try {
+		await saveModelInventory({ version: 1, checkedAt: 2000, entries: [entry("rollback", 2000, "old"), entry("valid", 900, "newer"), entry("unrelated", 800, "keep")] });
+		const unrelated = (await loadModelInventory())!.entries.find(row => row.id === "unrelated");
+		clock.mockReturnValue(1000);
+		await saveModelInventory({ version: 1, checkedAt: 1000, entries: [entry("rollback", 1000, "fresh"), entry("valid", 850, "stale")] }, { mergeEntries: true });
+		const saved = (await loadModelInventory())!;
+		expect(saved.checkedAt).toBe(1000);
+		expect(saved.entries.find(row => row.id === "rollback")).toMatchObject({ checkedAt: 1000, models: ["fresh"] });
+		expect(saved.entries.find(row => row.id === "valid")).toMatchObject({ checkedAt: 900, models: ["newer"] });
+		expect(saved.entries.find(row => row.id === "unrelated")).toEqual(unrelated);
+		// A delayed partial result must still leave a genuinely newer global timestamp alone.
+		clock.mockReturnValue(1100);
+		await saveModelInventory({ version: 1, checkedAt: 950, entries: [] }, { mergeEntries: true });
+		expect((await loadModelInventory())!.checkedAt).toBe(1000);
+	} finally {
+		clock.mockRestore();
+	}
 });

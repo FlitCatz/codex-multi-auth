@@ -1,3 +1,4 @@
+import { createAutomaticApiCheck, startAutomaticApiChecks } from "./runtime/automatic-api-checks.js";
 import { startAutomaticAccountChecks } from "./runtime/automatic-account-checks.js";
 import { createAutomaticSubscriptionCheck } from "./runtime/automatic-subscription-checks.js";
 import { ClientCancellationError } from "./request/client-cancellation.js";
@@ -14,6 +15,7 @@ import { modelScopeId, workspaceModelScopes } from "./runtime/workspace-model-sc
 import { RuntimeCapabilityFailures, classifyCapabilityFailure } from "./runtime/runtime-capability-failures.js";
 import { ResponseOutcome } from "./request/response-outcome.js";
 import { ResponsesWebSocketGateway } from "./runtime/responses-websocket.js";
+import { enrichPersistedApiCapabilities } from "./runtime/persisted-api-capabilities.js";
 import { ApiModelCapabilities } from "./runtime/api-model-capabilities.js";
 import { saveModelInventory } from "./runtime/model-discovery-status.js";
 import { loadApiRoutes, updateApiModelDiscovery } from "./api-route-store.js";
@@ -457,9 +459,10 @@ const MODEL_CAPACITY_RETRY_ENV = "CODEX_MULTI_AUTH_MODEL_CAPACITY_RETRY_MS";
 
 function getApiModelRuntime(state:RotationProxyState):ApiModelRuntime {
  if(state.apiModelRuntime)return state.apiModelRuntime;
- const capabilities=state.apiModelCapabilities??=new ApiModelCapabilities();
  const production=state.readApiRoutes===loadApiRoutes;
- state.apiModelRuntime=new ApiModelRuntime(state.fetchImpl,state.now,production?updateApiModelDiscovery:undefined,production?(models,refresh,route,force)=>capabilities.enrich(models,refresh,route,force):undefined,()=>{
+ // Public documentation survives refresh outages without retaining paid probe state.
+ if(production)state.apiModelCapabilities??=new ApiModelCapabilities(state.upstreamFetchImpl,state.now);
+ state.apiModelRuntime=new ApiModelRuntime(state.fetchImpl,state.now,production?updateApiModelDiscovery:undefined,production?(models,refresh,route,force)=>enrichPersistedApiCapabilities(models,refresh,route,force,{fetchImpl:state.upstreamFetchImpl,now:state.now,metadata:state.apiModelCapabilities,requireStoredRoute:true}):undefined,()=>{
   const runtime=state.apiModelRuntime;
   if(!runtime)return;
   const models=[...(state.catalogOAuthModels??[]),...buildVisibleModelUnion(runtime.cachedCatalogs())];
@@ -1271,6 +1274,7 @@ export async function startRuntimeRotationProxy(
 		routingMutexMode,
 		schedulingStrategy,
 		fetchImpl,
+		upstreamFetchImpl: fetchImpl,
 		upstreamBaseUrl,
 		clientApiKey,
 		now,
@@ -1331,12 +1335,13 @@ export async function startRuntimeRotationProxy(
 	if (state.nativeOpenai) websocketGateway.attach(server, `http://${urlHost}:${resolvedPort}`);
 	// Embedded managers own their own lifecycle; ordinary CLI/app routers check opted-in accounts periodically.
 	const automaticChecks = options.accountManager ? undefined : startAutomaticAccountChecks(createAutomaticSubscriptionCheck());
+	const automaticApiChecks = options.accountManager || options.readApiRoutes ? undefined : startAutomaticApiChecks(createAutomaticApiCheck(fetchImpl));
 	return {
 		host: bindHost,
 		port: resolvedPort,
 		baseUrl: `http://${urlHost}:${resolvedPort}`,
 		close: async () => {
-			await automaticChecks?.stop();
+			await Promise.all([automaticChecks?.stop(), automaticApiChecks?.stop()]);
 			websocketGateway.close();
 			await closeServer(server, sockets);
 			await flushRuntimeInferenceActivity();
@@ -1351,6 +1356,7 @@ export async function startRuntimeRotationProxy(
 			schedulingStrategy: state.schedulingStrategy,
  websocketConnections: websocketGateway.stats.connections,
  websocketUpstreamRequests: websocketGateway.stats.upstreamRequests,
+ lastWebsocketDisconnect: websocketGateway.stats.lastDisconnect,
 			// Redact any email/token material that leaked into a raw upstream or
 			// refresh error string before exposing it to status/report consumers
 			// (errors-logging-08). maskString is a no-op for clean diagnostic text.

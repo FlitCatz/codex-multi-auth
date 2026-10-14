@@ -61,7 +61,7 @@ describe("runCodexMultiAuthCli uninstall dispatch", () => {
 		const dir = await fs.mkdtemp(join(tmpdir(), "clear-sidecars-"));
 		vi.stubEnv("CODEX_MULTI_AUTH_DIR", dir);
 		try {
-			const files = ["api-routes.json", "reset-credits.json", "api-capability-probes.json", join("inference-activity", "a.json")];
+			const files = ["api-routes.json", "reset-credits.json", "api-capability-probes.json", "automatic-api-checks.json", join("inference-activity", "a.json")];
 			await fs.mkdir(join(dir, "inference-activity"));
 			for (const file of files) await fs.writeFile(join(dir, file), '{"apiKey":"sk-fixture"}');
 			const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");

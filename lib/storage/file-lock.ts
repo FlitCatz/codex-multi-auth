@@ -138,24 +138,34 @@ async function recoverDeadCandidates(lock: string): Promise<void> {
  */
 export async function withFileTransactionLock<T>(path: string, action: () => Promise<T>, options: {
     waitMs?: number;
+    signal?: AbortSignal;
+    // Protect only filesystem acquisition; callers must not hold the guard during retries/action.
+    guardAcquisition?: <R>(action: () => Promise<R>) => Promise<R>;
 } = {}): Promise<T> {
-    const absolute = resolve(path);
-    await fs.mkdir(dirname(absolute), { recursive: true, mode: 0o700 });
-    // Canonicalize the existing parent so /tmp and its symlink aliases share a lock.
-    const key = join(await fs.realpath(dirname(absolute)), absolute.slice(dirname(absolute).length + 1));
-    if (leases.getStore()?.get(key)?.active)
-        return action();
-    const lock = `${key}.write-lock`;
-    await recoverDeadCandidates(lock);
-    const candidate = await fs.mkdtemp(`${lock}.candidate-`);
+    options.signal?.throwIfAborted();
+    const guard = options.guardAcquisition ?? (async <R>(run: () => Promise<R>) => run());
+    let key = "", lock = "", candidate: string | undefined;
     const owner = `${host}.${process.pid}.${randomUUID()}`;
-    let published = false;
+    let published = false, reentrant = false;
     try {
-        await fs.chmod(candidate, 0o700);
-        await fs.writeFile(join(candidate, owner), "", { flag: "wx", mode: 0o600 });
-        await withRetry(async () => {
+        await guard(async () => {
+            options.signal?.throwIfAborted();
+            const absolute = resolve(path);
+            await fs.mkdir(dirname(absolute), { recursive: true, mode: 0o700 });
+            key = join(await fs.realpath(dirname(absolute)), absolute.slice(dirname(absolute).length + 1));
+            options.signal?.throwIfAborted();
+            if (leases.getStore()?.get(key)?.active) { reentrant = true; return; }
+            lock = `${key}.write-lock`;
+            await recoverDeadCandidates(lock);
+            candidate = await fs.mkdtemp(`${lock}.candidate-`);
+            await fs.chmod(candidate, 0o700);
+            await fs.writeFile(join(candidate, owner), "", { flag: "wx", mode: 0o600 });
+        });
+        if (reentrant) return action();
+        await withRetry(() => guard(async () => {
+            options.signal?.throwIfAborted();
             try {
-                await fs.rename(candidate, lock);
+                await fs.rename(candidate as string, lock);
                 published = true;
             }
             catch (error) {
@@ -173,12 +183,13 @@ export async function withFileTransactionLock<T>(path: string, action: () => Pro
                 await recoverDeadOwner(lock);
                 throw Object.assign(Error("Storage is busy with another live writer; retry shortly."), { code: "ELOCKED" });
             }
-        }, {
+        }), {
             maxAttempts: lockMaxAttemptsForWaitMs(options.waitMs ?? 10000),
             backoffMs: lockRetryBaseDelayMs,
             jitterMs: LOCK_RETRY_JITTER_MS,
             retryableCodes: ["ELOCKED", "EBUSY", "EPERM", "EACCES", "EAGAIN"],
         });
+        options.signal?.throwIfAborted();
         const lease = { active: true };
         const context = new Map(leases.getStore());
         context.set(key, lease);
@@ -191,19 +202,21 @@ export async function withFileTransactionLock<T>(path: string, action: () => Pro
     }
     finally {
         const directory = published ? lock : candidate;
-        try { await withRetry(async () => {
-            try {
-                await fs.unlink(join(directory, owner));
+        if (directory) {
+            try { await withRetry(async () => {
+                try {
+                    await fs.unlink(join(directory, owner));
+                }
+                catch (error) {
+                    if (code(error) !== "ENOENT")
+                        throw error;
+                }
+                await removeEmpty(directory);
+            }, { maxAttempts: 6, backoffMs: 25 });
+            } catch (error) {
+                abandonedOwners.add(owner);retryAbandonedRelease(directory, owner);
+                logWarn("Storage lock cleanup deferred", { code: code(error) ?? "unknown" });
             }
-            catch (error) {
-                if (code(error) !== "ENOENT")
-                    throw error;
-            }
-            await removeEmpty(directory);
-        }, { maxAttempts: 6, backoffMs: 25 });
-        } catch (error) {
-            abandonedOwners.add(owner);retryAbandonedRelease(directory, owner);
-            logWarn("Storage lock cleanup deferred", { code: code(error) ?? "unknown" });
         }
     }
 }

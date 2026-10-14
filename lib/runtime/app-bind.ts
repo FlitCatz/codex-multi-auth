@@ -1,3 +1,4 @@
+import type { WebSocketDisconnectDiagnostic } from "./responses-websocket.js";
 import { withNativeBindingLock } from "./native-binding-lock.js";
 import { isRecord } from "../utils.js";
 import { hasNativeProviderConfig, rewriteNativeProviderConfig, restoreNativeProviderConfig } from "./native-provider-config.js";
@@ -87,6 +88,7 @@ export interface AppBindState {
 }
 
 export interface AppBindRouterStatus {
+	lastWebsocketDisconnect?: WebSocketDisconnectDiagnostic | null;
 	schedulingStrategy?: "hybrid" | "sequential";
 	state: string | null;
 	pid: number | null;
@@ -409,10 +411,25 @@ async function readAppBindBackup(path: string): Promise<AppBindBackup | null> {
 	};
 }
 
+function readWebsocketDisconnect(value: unknown): WebSocketDisconnectDiagnostic | null {
+ if (!isRecord(value) || typeof value.at !== "number" || !Number.isFinite(value.at) || value.at < 0) return null;
+ const { cause, stage, closeCode, routeKind, connectionAgeMs, eventCount } = value;
+ if (routeKind !== undefined && routeKind !== "oauth" && routeKind !== "api" && routeKind !== "zdr") return null;
+ for (const count of [connectionAgeMs, eventCount]) if (count !== undefined && (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0)) return null;
+ if (cause !== "close" && cause !== "transport_error" && cause !== "invalid_event" && cause !== "buffer_limit" && cause !== "send_error") return null;
+ if (stage !== "awaiting_first_event" && stage !== "streaming") return null;
+ if (closeCode !== undefined && (typeof closeCode !== "number" || !Number.isInteger(closeCode) || closeCode < 1000 || closeCode > 4999)) return null;
+ return {at:value.at,cause,stage,...(typeof closeCode === "number" ? {closeCode} : {}),
+ ...(routeKind === "oauth" || routeKind === "api" || routeKind === "zdr" ? {routeKind} : {}),
+ ...(typeof connectionAgeMs === "number" ? {connectionAgeMs} : {}),
+ ...(typeof eventCount === "number" ? {eventCount} : {})};
+}
+
 async function readRouterStatus(path: string): Promise<AppBindRouterStatus | null> {
 	const record = await readJsonFile(path);
 	if (!record) return null;
 	return {
+		lastWebsocketDisconnect: readWebsocketDisconnect(record.lastWebsocketDisconnect),
 		schedulingStrategy: record.schedulingStrategy === "hybrid" || record.schedulingStrategy === "sequential"
 			? record.schedulingStrategy : undefined,
 		state: readString(record, "state"),
@@ -1876,6 +1893,12 @@ async function unbindCodexAppRuntimeRotationLocked(
 	};
 }
 
+export function formatWebsocketDisconnect(value: unknown): string | null {
+ const diagnostic = readWebsocketDisconnect(value);
+ if (!diagnostic || diagnostic.at > 8.64e15) return null;
+ return `Last WebSocket disconnect: ${new Date(diagnostic.at).toISOString()}; cause=${diagnostic.cause}; stage=${diagnostic.stage}${diagnostic.closeCode !== undefined ? `; closeCode=${diagnostic.closeCode}` : ""}${diagnostic.routeKind !== undefined ? `; route=${diagnostic.routeKind}` : ""}${diagnostic.connectionAgeMs !== undefined ? `; connectionAgeMs=${diagnostic.connectionAgeMs}` : ""}${diagnostic.eventCount !== undefined ? `; events=${diagnostic.eventCount}` : ""}`;
+}
+
 export function formatAppBindStatus(status: AppBindStatus): string {
 	if (status.unmanagedBind && !status.state) {
 		return [
@@ -1898,9 +1921,11 @@ export function formatAppBindStatus(status: AppBindStatus): string {
 	} else if (status.router?.lastAccountIndex !== null && status.router?.lastAccountIndex !== undefined) {
 		parts.push(`lastAccount=Account ${status.router.lastAccountIndex + 1}`);
 	}
-	if (status.state.nativeOpenai) return `Codex app bind: ${parts.join(", ")}, native OpenAI, live account catalogs`;
+	const diagnostic = formatWebsocketDisconnect(status.router?.lastWebsocketDisconnect);
+	if (status.state.nativeOpenai) return [`Codex app bind: ${parts.join(", ")}, native OpenAI, live account catalogs`, ...(diagnostic ? [diagnostic] : [])].join("\n");
 	return [
 		`Codex app bind: ${parts.join(", ")}`,
+		...(diagnostic ? [diagnostic] : []),
 		[
 			"Note: Codex Desktop may hide history while the app bind selects the",
 			"codex-multi-auth-runtime-proxy provider; use `codex-multi-auth rotation",

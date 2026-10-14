@@ -59,7 +59,7 @@ describe("private API route storage", () => {
 			},
 		];
 		await saveApiRoutes(routes, file);
-		expect(await loadApiRoutes(file)).toEqual(routes);
+		expect(await loadApiRoutes(file)).toMatchObject(routes);
 		if (process.platform !== "win32")
 			expect((await stat(file)).mode & 0o777).toBe(0o600);
 		expect(JSON.parse(await readFile(file, "utf8")).version).toBe(1);
@@ -70,6 +70,26 @@ describe("private API route storage", () => {
 		await expect(loadApiRoutes(file)).rejects.toThrow(
 			"Invalid API route configuration",
 		);
+	});
+	it("repairs a malformed store on an unconditional save while strict saves still reject", async () => {
+		const file = join(await tempDir(), "routes.json");
+		await writeFile(file, "{broken");
+		const route = {
+			id: "fixture",
+			label: "Fixture",
+			kind: "api" as const,
+			apiKey: "fixture-key",
+			enabled: true,
+			priority: 0,
+			visibleModels: ["model-a"],
+		};
+		await expect(saveApiRoutes([route], file, [])).rejects.toThrow(
+			"Invalid API route configuration",
+		);
+		await saveApiRoutes([route], file);
+		expect(await loadApiRoutes(file)).toMatchObject([
+			{ id: "fixture", capabilityEpoch: expect.any(String) },
+		]);
 	});
 });
 
@@ -92,7 +112,7 @@ it("rejects a stale login menu save rather than re-enabling another writer's dis
 	await expect(
 		saveApiRoutes([{ ...initial[0]!, priority: 1 }], file, initial),
 	).rejects.toThrow("changed");
-	expect(await loadApiRoutes(file)).toEqual(changed);
+	expect(await loadApiRoutes(file)).toMatchObject(changed);
 });
 
 it("refuses configurations larger than its bounded reader accepts", async () => {
@@ -143,8 +163,12 @@ it("baselines existing models, then adds only newly discovered GPT text models w
 		["gpt-selected", "gpt-hidden", "gpt-new", "gpt-next"],
 		file,
 	);
-	expect(next.visibleModels).toEqual(["gpt-selected", "gpt-next"]);
+	expect(next.enabled).toBe(false);
+	expect((await loadApiRoutes(file))[0]?.visibleModels).toEqual(["gpt-selected"]);
 	expect((await loadApiRoutes(file))[0]?.knownModels).toContain("other-new");
+	const [current] = await loadApiRoutes(file);
+	const refreshed = await updateApiModelDiscovery(current, ["gpt-selected", "gpt-hidden", "gpt-new", "gpt-next"], file);
+	expect(refreshed.visibleModels).toEqual(["gpt-selected", "gpt-next"]);
 });
 
 it("serializes discovery updates for multiple credentials without losing either baseline", async () => {
@@ -178,7 +202,7 @@ it("preserves validated program configuration through discovery updates",async()
  const file=join(await tempDir(),"routes.json");
  const route={id:"private",label:"Fixture",kind:"zdr" as const,apiKey:"fixture-key",priority:9,enabled:true,visibleModels:["example"],accessPrograms:{research:["extended"]},modelAccessPrograms:{example:{research:["restricted"]}}};
  await saveApiRoutes([route],file);
- expect((await loadApiRoutes(file))[0]).toEqual(route);
+ expect((await loadApiRoutes(file))[0]).toMatchObject(route);
  const updated=await updateApiModelDiscovery(route,["example","gpt-fixture"],file);
  expect(updated.accessPrograms).toEqual(route.accessPrograms);
  expect(updated.modelAccessPrograms).toEqual(route.modelAccessPrograms);
@@ -199,4 +223,68 @@ it.each(["EBUSY","EPERM","EACCES"])("retries a transient %s opening the API rout
   return original(...args);
  });
  try{expect(await loadApiRoutes(path)).toEqual([]);expect(calls).toBe(2);}finally{open.mockRestore();}
+});
+
+it("returns its own canonical save snapshot and still rejects a later writer's edits",async()=>{
+ const {saveApiRoutesSnapshot}=await import("../lib/api-route-store.js");
+ const transactions=await import("../lib/storage/transactions.js");
+ const file=join(await tempDir(),"routes.json");
+ const route={id:"fixture",label:"Fixture",kind:"api" as const,apiKey:"fixture",priority:9,enabled:true,visibleModels:[]};
+ const initial=await saveApiRoutesSnapshot([route],file,[]);
+ expect(initial).toEqual(await loadApiRoutes(file));
+ const original=transactions.withStorageLock;let armed=true;
+ const spy=vi.spyOn(transactions,"withStorageLock").mockImplementation(async action=>{
+  const result=await original(action);
+  if(armed){armed=false;const current=await loadApiRoutes(file);await saveApiRoutes(current.map(value=>({...value,enabled:false})),file,current);}
+  return result;
+ });
+ try{
+  const saved=await saveApiRoutesSnapshot(initial.map(value=>({...value,priority:2})),file,initial);
+  expect(saved[0]).toMatchObject({priority:2,enabled:true,capabilityEpoch:initial[0].capabilityEpoch});
+  expect((await loadApiRoutes(file))[0].enabled).toBe(false);
+  await expect(saveApiRoutesSnapshot(saved.map(value=>({...value,priority:3})),file,saved)).rejects.toThrow("changed");
+  expect((await loadApiRoutes(file))[0]).toMatchObject({priority:2,enabled:false});
+ }finally{spy.mockRestore();}
+});
+
+it.each(["not-json", JSON.stringify({version:1,routes:[{id:"broken"}]})])("repairs an invalid store only with an unconditional save: %s", async raw => {
+ const file=join(await tempDir(),"routes.json");
+ const route={id:"repair",label:"Repair",kind:"api" as const,apiKey:"fixture",enabled:true,priority:0,visibleModels:["fixture"],capabilityEpoch:"00000000-0000-4000-8000-000000000001",legacyCapabilityCache:true};
+ await writeFile(file,raw);
+ await expect(saveApiRoutes([route],file,[])).rejects.toThrow("Invalid API route configuration");
+ expect(await readFile(file,"utf8")).toBe(raw);
+ await saveApiRoutes([route],file);
+ const [saved]=await loadApiRoutes(file);
+ expect(saved).toMatchObject({id:"repair",apiKey:"fixture",visibleModels:["fixture"]});
+ expect(saved.capabilityEpoch).toEqual(expect.any(String));
+ expect(saved.capabilityEpoch).not.toBe(route.capabilityEpoch);
+ expect(saved.legacyCapabilityCache).toBeUndefined();
+});
+it.each(["oversized","EACCES","EIO"])("does not repair an unreadable store (%s)",async failure=>{
+ const file=join(await tempDir(),"routes.json"),raw=failure==="oversized"?"x".repeat(1024*1024+1):"not-json";
+ await writeFile(file,raw);
+ const open=fs.open.bind(fs);
+ const spy=vi.spyOn(fs,"open").mockImplementation(async(...args)=>{if(args[0]===file&&failure!=="oversized")throw Object.assign(Error("unreadable"),{code:failure});return open(...args);});
+ try{await expect(saveApiRoutes([],file)).rejects.toThrow("Unable to read API route configuration");expect(await readFile(file,"utf8")).toBe(raw);}finally{spy.mockRestore();}
+});
+
+it("keeps ownership when a menu sorts discovered visibility without changing the selected set", async () => {
+ const {saveApiRoutesSnapshot,updateApiModelDiscovery}=await import("../lib/api-route-store.js");
+ const file=join(await tempDir(),"routes.json");
+ const initial={id:"order",label:"Order",kind:"api" as const,apiKey:"fixture",enabled:true,probeCapabilities:true,priority:0,visibleModels:["gpt-z"],knownModels:["gpt-z"]};
+ await saveApiRoutes([initial],file);
+ const discovered=await updateApiModelDiscovery(initial,["gpt-z","gpt-a"],file);
+ expect(discovered.visibleModels).toEqual(["gpt-z","gpt-a"]);
+ const before=JSON.stringify(discovered);
+ const selection={...discovered,visibleModels:[...discovered.visibleModels].sort()};
+ const selectionBefore=JSON.stringify(selection);
+ const [saved]=await saveApiRoutesSnapshot([selection],file,[discovered]);
+ expect(saved.capabilityEpoch).toBe(discovered.capabilityEpoch);
+ expect(saved.visibleModels).toEqual(["gpt-a","gpt-z"]);
+ expect(JSON.stringify(discovered)).toBe(before);
+ expect(JSON.stringify(selection)).toBe(selectionBefore);
+ const [added]=await saveApiRoutesSnapshot([{...saved,visibleModels:[...saved.visibleModels,"gpt-new"]}],file,[saved]);
+ expect(added.capabilityEpoch).not.toBe(saved.capabilityEpoch);
+ const [removed]=await saveApiRoutesSnapshot([{...added,visibleModels:["gpt-a"]}],file,[added]);
+ expect(removed.capabilityEpoch).not.toBe(added.capabilityEpoch);
 });
