@@ -52,18 +52,19 @@ it("routes all capability enrichment traffic through the provided fetcher", asyn
     const root = await mkdtemp(join(tmpdir(), "enrich-fetch-impl-"));
     const previous = process.env.CODEX_MULTI_AUTH_DIR;
     process.env.CODEX_MULTI_AUTH_DIR = root;
-    const calls: string[] = [];
+    const calls: { url: string; method?: string }[] = [];
     const fetcher: typeof fetch = async (input, init) => {
-        calls.push(String(input));
+        calls.push({ url: String(input), method: init?.method });
         if (init?.method !== "POST") return new Response("missing", { status: 404 });
         const body = JSON.parse(String(init.body));
         return Response.json({ status: "completed", reasoning: body.reasoning, access_programs: body.access_programs, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
     };
     const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, visibleModels: ["fixture"], accessPrograms: { cyber: ["standard"] } };
-    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("capability checks must not bypass the configured fetcher"));
+    const globalFetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("capability checks must not bypass the configured fetcher"));
     try {
         await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, { fetchImpl: fetcher, now: () => 1000 });
-        expect(calls.length).toBeGreaterThan(0);
+        expect(calls).toContainEqual({ url: "https://api.openai.com/v1/responses", method: "POST" });
+        expect(globalFetch).not.toHaveBeenCalled();
     } finally {
         if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
         else process.env.CODEX_MULTI_AUTH_DIR = previous;
