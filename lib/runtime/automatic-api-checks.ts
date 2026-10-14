@@ -33,7 +33,9 @@ export async function runAutomaticApiChecks(options:{path:string;loadRoutes:()=>
   const observed=(await options.loadRoutes()).find(r=>eligible(r)&&key(r)===key(route));
   if(!observed)continue;
   // Complete store-owned migrations before capturing the exact claim snapshot.
-  const current=options.prepareRoute?await options.prepareRoute(observed,signal):observed;
+  let current:ApiRouteCredential|undefined;
+  try{current=options.prepareRoute?await options.prepareRoute(observed,signal):observed;}
+  catch{if(signal.aborted)return;logWarn("Automatic API route preparation failed; skipping this route.");continue;}
   if(!current||!eligible(current)||signal.aborted)continue;
   // Commit the claim before network I/O. Concurrent routers and restarts share it.
   let programRefreshBefore=startedAt+AUTOMATIC_API_CHECK_INTERVAL_MS;

@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { getApiRoutesPath } from "../api-route-store.js";
 import { withRetry } from "../fs-retry.js";
@@ -15,13 +16,23 @@ const retry = { maxAttempts: 6, backoffMs: 25 };
  */
 export async function clearCredentialSidecars(): Promise<void> {
 	const routes = getApiRoutesPath();
+	const dir = getCodexMultiAuthDir();
 	// Same locks as saveApiRoutes, so a concurrent menu save cannot resurrect keys.
 	await withStorageLock(() =>
-		withFileTransactionLock(routes, () =>
-			withRetry(() => fs.rm(routes, { force: true }), retry),
-		),
+		withFileTransactionLock(routes, async () => {
+			await withRetry(() => fs.rm(routes, { force: true }), retry);
+			const leases = join(dir, "api-probe-locks");
+			try {
+				const stat = await fs.lstat(leases);
+				if (!stat.isDirectory() || stat.isSymbolicLink()) throw Error("Invalid API probe lease directory; manual repair required");
+				// Detach while publication is excluded; never recursively delete a
+				// canonical directory that a replacement owner can populate.
+				await withRetry(() => fs.rename(leases, join(dir, `api-probe-locks.wiped-${randomUUID()}`)), retry);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}),
 	);
-	const dir = getCodexMultiAuthDir();
 	// Each writer read-modify-writes under its file lock; deleting under the same
 	// lock stops an in-flight refresh or redemption renaming its old state (and a
 	// last-resort policy) back after the reset.
@@ -33,6 +44,12 @@ export async function clearCredentialSidecars(): Promise<void> {
 		await withFileTransactionLock(path, () =>
 			withRetry(() => fs.rm(path, { force: true }), retry),
 		);
+	}
+	// Also finish deletion after an interrupted earlier wipe. These unique paths
+	// can contain old holders/candidates, but never a new canonical lease.
+	for (const entry of await fs.readdir(dir)) {
+		if (/^api-probe-locks\.wiped-[a-f0-9-]{36}$/.test(entry))
+			await withRetry(() => fs.rm(join(dir, entry), { recursive: true, force: true }), retry);
 	}
 	// Per-account timestamps only; their writers take no lock and hold no secrets.
 	const activity = join(dir, "inference-activity");

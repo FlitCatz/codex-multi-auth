@@ -96,6 +96,7 @@ rm -rf "$ROOT"/local-client-tokens.json*
 rm -rf "$ROOT"/api-routes.json*
 rm -rf "$ROOT"/reset-credits.json*
 rm -rf "$ROOT"/api-capability-probes.json*
+rm -rf "$ROOT"/api-probe-locks*
 rm -rf "$ROOT"/automatic-api-checks.json*
 rm -rf "$ROOT"/model-discovery.json*
 rm -rf "$ROOT/refresh-leases"
@@ -134,6 +135,7 @@ Remove-Item "$root\local-client-tokens.json*" -Recurse -Force -ErrorAction Silen
 Remove-Item "$root\api-routes.json*" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$root\reset-credits.json*" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$root\api-capability-probes.json*" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item "$root\api-probe-locks*" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$root\automatic-api-checks.json*" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$root\model-discovery.json*" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$root\refresh-leases" -Recurse -Force -ErrorAction SilentlyContinue

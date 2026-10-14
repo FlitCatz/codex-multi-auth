@@ -36,7 +36,7 @@ const retainedOwners = new Map<string, string>();
 const probeWaiters: Array<() => void> = [];
 const unavailableLeaseCodes = new Set([
 	"ELOCKED", "EACCES", "EPERM", "EROFS", "ENOSPC", "EDQUOT", "EMFILE", "ENFILE",
-	"EBUSY", "EIO", "ENOENT", "ENOTDIR",
+	"EBUSY", "EIO", "ENOENT", "ENOTDIR", "ESTALE",
 ]);
 
 /** Reject resets during work so live waiters cannot lose their concurrency slots. */
@@ -299,7 +299,12 @@ async function enrichPersistedApiCapabilitiesImpl(
 					logWarn("API capability results could not be persisted.");
 				}
 				return result ?? model;
-			}, { waitMs: 60_000, signal: options.signal });
+			}, { waitMs: 60_000, signal: options.signal,
+				guardAcquisition: options.requireStoredRoute ? action => withFileTransactionLock(getApiRoutesPath(), async () => {
+					if (!await ownsRoute()) throw Object.assign(Error("API route ownership changed"), { code: "ESTALE" });
+					return action();
+				}, { signal: options.signal }) : undefined,
+			});
 		} catch (error) {
 			if (!unavailableLeaseCodes.has((error as NodeJS.ErrnoException).code ?? "")) throw error;
 			logWarn("API capability lease unavailable; skipping paid probes.");

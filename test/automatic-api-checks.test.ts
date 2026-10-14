@@ -391,7 +391,7 @@ it.each(["readonly","abort"])("does not claim or probe a legacy route when migra
    if(args[0]===api.getApiRoutesPath()){if(failure==="abort"){controller.abort();controller.signal.throwIfAborted();}throw Object.assign(Error("readonly"),{code:"EROFS"});}
    return original(...args);
   });
-  await expect(createAutomaticApiCheck()(controller.signal)).rejects.toThrow();
+  await createAutomaticApiCheck()(controller.signal);
   expect(network).not.toHaveBeenCalled();
   for(const name of ["automatic-api-checks.json","api-capability-probes.json","model-discovery.json"])await expect(fs.stat(join(history,"..",name))).rejects.toMatchObject({code:"ENOENT"});
  }finally{if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;}
