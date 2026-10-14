@@ -718,6 +718,52 @@ describe("recoverStaleRuntimeState", () => {
 		expect(state.activeAccountManager).toBe(nativeSwap);
 		expect(state.knownAccountManagers.has(reloaded)).toBe(false);
 	});
+
+	it("carries a rotation only onto the matching row when same-email siblings exist", async () => {
+		const initialStorage = storageWith(2);
+		initialStorage.accounts[0]!.recordId = "row-a";
+		initialStorage.accounts[0]!.email = "shared@example.com";
+		initialStorage.accounts[0]!.accountId = "workspace-a";
+		initialStorage.accounts[0]!.workspaces = [{ id: "workspace-a", enabled: true }];
+		initialStorage.accounts[1]!.recordId = "row-b";
+		initialStorage.accounts[1]!.email = "shared@example.com";
+		initialStorage.accounts[1]!.accountId = "workspace-b";
+		initialStorage.accounts[1]!.workspaces = [{ id: "workspace-b", enabled: true }];
+		const resident = new AccountManager(undefined, initialStorage);
+		const state = createRotationProxyState({ ...stateInit(), activeAccountManager: resident });
+		const rotatedRow = resident.getAccountByIndex(0);
+		if (!rotatedRow) throw new Error("missing resident account");
+
+		const reloaded = new AccountManager(undefined, structuredClone(initialStorage));
+		let signalLoadStarted!: () => void;
+		const loadStarted = new Promise<void>((resolve) => { signalLoadStarted = resolve; });
+		let releaseLoad!: () => void;
+		const loadGate = new Promise<void>((resolve) => { releaseLoad = resolve; });
+		loadFromDisk.mockImplementationOnce(async () => {
+			signalLoadStarted();
+			await loadGate;
+			return reloaded;
+		});
+
+		const pending = recoverStaleRuntimeState(state);
+		await loadStarted;
+		// The rotation lands while recovery is suspended: only the row that
+		// rotated must receive the new credential — the sibling keeps its own.
+		rotatedRow.access = "rotated-access";
+		rotatedRow.refreshToken = "rotated-refresh";
+		rotatedRow.expires = NOW + 7_200_000;
+		releaseLoad();
+
+		const result = await pending;
+		const carried = result?.getAccountByIndex(0);
+		const sibling = result?.getAccountByIndex(1);
+
+		expect(state.activeAccountManager).toBe(reloaded);
+		expect(carried?.access).toBe("rotated-access");
+		expect(carried?.refreshToken).toBe("rotated-refresh");
+		expect(sibling?.access).toBe("access-2");
+		expect(sibling?.refreshToken).toBe("refresh-2");
+	});
 });
 
 describe("resolveRuntimeRefreshTarget", () => {
