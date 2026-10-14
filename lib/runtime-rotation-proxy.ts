@@ -458,8 +458,8 @@ function getApiModelRuntime(state:RotationProxyState):ApiModelRuntime {
  if(state.apiModelRuntime)return state.apiModelRuntime;
  const production=state.readApiRoutes===loadApiRoutes;
  // Public documentation survives refresh outages without retaining paid probe state.
- if(production)state.apiModelCapabilities??=new ApiModelCapabilities(fetch,state.now);
- state.apiModelRuntime=new ApiModelRuntime(state.fetchImpl,state.now,production?updateApiModelDiscovery:undefined,production?(models,refresh,route,force)=>enrichPersistedApiCapabilities(models,refresh,route,force,{now:state.now,metadata:state.apiModelCapabilities,requireStoredRoute:true}):undefined,()=>{
+ if(production)state.apiModelCapabilities??=new ApiModelCapabilities(state.upstreamFetchImpl,state.now);
+ state.apiModelRuntime=new ApiModelRuntime(state.fetchImpl,state.now,production?updateApiModelDiscovery:undefined,production?(models,refresh,route,force)=>enrichPersistedApiCapabilities(models,refresh,route,force,{fetchImpl:state.upstreamFetchImpl,now:state.now,metadata:state.apiModelCapabilities,requireStoredRoute:true}):undefined,()=>{
   const runtime=state.apiModelRuntime;
   if(!runtime)return;
   const models=[...(state.catalogOAuthModels??[]),...buildVisibleModelUnion(runtime.cachedCatalogs())];
@@ -1250,6 +1250,7 @@ export async function startRuntimeRotationProxy(
 		routingMutexMode,
 		schedulingStrategy,
 		fetchImpl,
+		upstreamFetchImpl: fetchImpl,
 		upstreamBaseUrl,
 		clientApiKey,
 		now,

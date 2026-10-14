@@ -47,7 +47,14 @@ export async function clearCredentialSidecars(): Promise<void> {
 	}
 	// Also finish deletion after an interrupted earlier wipe. These unique paths
 	// can contain old holders/candidates, but never a new canonical lease.
-	for (const entry of await fs.readdir(dir)) {
+	let leftovers: string[];
+	try {
+		leftovers = await fs.readdir(dir);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		leftovers = [];
+	}
+	for (const entry of leftovers) {
 		if (/^api-probe-locks\.wiped-[a-f0-9-]{36}$/.test(entry))
 			await withRetry(() => fs.rm(join(dir, entry), { recursive: true, force: true }), retry);
 	}

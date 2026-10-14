@@ -69,6 +69,17 @@ it.each(["reset-credits.json", "api-capability-probes.json", "automatic-api-chec
 	},
 );
 
+it("treats a missing multi-auth dir as already clean during the wiped-lease sweep", async () => {
+	const realReaddir = fs.readdir.bind(fs);
+	// Only the sweep reads `dir` with no options; lock internals pass
+	// withFileTypes or read lock/candidate paths, so they keep the real fs.
+	vi.spyOn(fs, "readdir").mockImplementation(((path: unknown, options?: unknown) =>
+		String(path) === dir && options === undefined
+			? Promise.reject(Object.assign(new Error("gone"), { code: "ENOENT" }))
+			: (realReaddir as (...args: never[]) => unknown)(path as never, options as never)) as never);
+	await expect(clearCredentialSidecars()).resolves.toBeUndefined();
+});
+
 it("removes the credential sidecars even when the pool clear fails, then rethrows", async () => {
 	const { clearAccountsAndCredentialSidecars } = await import("../lib/storage/credential-sidecars.js");
 	await fs.writeFile(join(dir, "api-routes.json"), '{"apiKey":"sk-fixture"}');

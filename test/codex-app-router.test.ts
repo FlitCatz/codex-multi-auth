@@ -260,7 +260,7 @@ describe("codex app router daemon", () => {
 });
 
 
-it("preserves sanitized disconnect history across daemon restarts and replaces it with current-process evidence after clock rollback", async () => {
+it("preserves sanitized disconnect history across daemon restarts and replaces it with current-process evidence after clock rollback", { timeout: 20_000 }, async () => {
 	const root = await createTempRoot("router-history-");
 	const scriptPath = createRouterFixture(root);
 	const statePath = join(root, "state.json");

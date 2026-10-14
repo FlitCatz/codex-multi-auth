@@ -50,6 +50,7 @@ function stateInit(): RotationProxyStateInit {
 		routingMutexMode: "enabled",
 		schedulingStrategy: "hybrid",
 		fetchImpl: fetch,
+		upstreamFetchImpl: fetch,
 		upstreamBaseUrl: "https://upstream.example",
 		clientApiKey: "key",
 		now: () => NOW,

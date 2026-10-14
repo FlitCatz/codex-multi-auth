@@ -47,6 +47,29 @@ it("preserves transient backoff when scheduled program evidence is due", async (
         await removeWithRetry(root, { recursive: true, force: true });
     }
 });
+it("routes all capability enrichment traffic through the provided fetcher", async () => {
+    const { enrichPersistedApiCapabilities } = await import("../lib/runtime/persisted-api-capabilities.js");
+    const root = await mkdtemp(join(tmpdir(), "enrich-fetch-impl-"));
+    const previous = process.env.CODEX_MULTI_AUTH_DIR;
+    process.env.CODEX_MULTI_AUTH_DIR = root;
+    const calls: string[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+        calls.push(String(input));
+        if (init?.method !== "POST") return new Response("missing", { status: 404 });
+        const body = JSON.parse(String(init.body));
+        return Response.json({ status: "completed", reasoning: body.reasoning, access_programs: body.access_programs, service_tier: body.service_tier, output: [{ type: "function_call", name: "capability_probe" }] });
+    };
+    const route = { id: "fixture", label: "fixture", kind: "api" as const, apiKey: "fixture-key", enabled: true, priority: 0, probeCapabilities: true, visibleModels: ["fixture"], accessPrograms: { cyber: ["standard"] } };
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("capability checks must not bypass the configured fetcher"));
+    try {
+        await enrichPersistedApiCapabilities([{ slug: "fixture" }], false, route, false, { fetchImpl: fetcher, now: () => 1000 });
+        expect(calls.length).toBeGreaterThan(0);
+    } finally {
+        if (previous === undefined) delete process.env.CODEX_MULTI_AUTH_DIR;
+        else process.env.CODEX_MULTI_AUTH_DIR = previous;
+        await removeWithRetry(root, { recursive: true, force: true });
+    }
+});
 it.each([1, 86400_000 - 300_000])("renews programs before claiming another daily interval after %s ms of live evidence", async (age) => {
     const { loadModelInventory } = await import("../lib/runtime/model-discovery-status.js");
     const root = await mkdtemp(join(tmpdir(), "automatic-program-horizon-"));

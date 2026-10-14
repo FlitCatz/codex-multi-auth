@@ -71,6 +71,26 @@ describe("private API route storage", () => {
 			"Invalid API route configuration",
 		);
 	});
+	it("repairs a malformed store on an unconditional save while strict saves still reject", async () => {
+		const file = join(await tempDir(), "routes.json");
+		await writeFile(file, "{broken");
+		const route = {
+			id: "fixture",
+			label: "Fixture",
+			kind: "api" as const,
+			apiKey: "fixture-key",
+			enabled: true,
+			priority: 0,
+			visibleModels: ["model-a"],
+		};
+		await expect(saveApiRoutes([route], file, [])).rejects.toThrow(
+			"Invalid API route configuration",
+		);
+		await saveApiRoutes([route], file);
+		expect(await loadApiRoutes(file)).toMatchObject([
+			{ id: "fixture", capabilityEpoch: expect.any(String) },
+		]);
+	});
 });
 
 it("rejects a stale login menu save rather than re-enabling another writer's disabled credential", async () => {

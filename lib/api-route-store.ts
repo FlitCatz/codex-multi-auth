@@ -120,7 +120,16 @@ async function saveApiRoutesLocked(
 		throw new Error("API route configuration is too large");
 
 	signal?.throwIfAborted();
-	const current = await loadApiRoutes(path);
+	let current: ApiRouteCredential[];
+	try {
+		current = await loadApiRoutes(path);
+	} catch (error) {
+		// A strict save needs a readable baseline to compare `expected` against.
+		// An unconditional save is the only repair path for a corrupt file, so
+		// it treats unreadable contents as empty rather than failing forever.
+		if (expected !== undefined) throw error;
+		current = [];
+	}
 	await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	const temp = tempPathFor(path);
 	try {

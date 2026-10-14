@@ -34,6 +34,13 @@ export interface RotationProxyStateInit {
 	routingMutexMode: "enabled" | "legacy";
 	schedulingStrategy: "hybrid" | "sequential";
 	fetchImpl: typeof fetch;
+	/**
+	 * The embedder's configured fetcher, captured before `state.fetchImpl` is
+	 * rebound to the WebSocket gateway. Capability/doc probes must use this —
+	 * the gateway fetch exists for Responses transport upgrades, and bare
+	 * `fetch` would bypass a custom fetcher's instrumentation entirely.
+	 */
+	upstreamFetchImpl: typeof fetch;
 	upstreamBaseUrl: string;
 	clientApiKey: string;
 	now: () => number;
