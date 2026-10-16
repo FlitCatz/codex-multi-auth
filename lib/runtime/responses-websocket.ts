@@ -1,3 +1,5 @@
+import { MAX_API_ROUTES } from "../api-route-store.js";
+import { OPENAI_HEADER_VALUES } from "../constants.js";
 import { ClientCancellationError } from "../request/client-cancellation.js";
 import type { Duplex } from "node:stream";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -18,14 +20,42 @@ export interface WebSocketDisconnectDiagnostic {
  routeKind?: "oauth" | "api" | "zdr";
  connectionAgeMs?: number;
  eventCount?: number;
+ requestBytes?: number;
+ inputItemCount?: number;
+ isPrewarm?: boolean;
+ hasPreviousResponse?: boolean;
+ reusedConnection?: boolean;
+ /** Local send callback success, not evidence of upstream receipt. */
+ sendCompleted?: boolean;
+ compressionNegotiated?: boolean;
+ transportErrorCode?: "ECONNRESET" | "EPIPE" | "ETIMEDOUT" | "OTHER";
+ tcpEndReceived?: boolean;
+ tcpCloseHadError?: boolean;
+}
+/** Local admission evidence only; no headers, credentials, or conversation IDs. */
+export interface WebSocketUpgradeRejectionDiagnostic {
+ at: number;
+ reason: "origin" | "capacity" | "repeated_disconnect";
+ status: number;
+ activeConnections: number;
 }
 interface WebSocketStats {
  connections: number;
+ activeConnections: number;
+ capacityReclaims: number;
  upstreamConnections: number;
  upstreamRequests: number;
  lastDisconnect?: WebSocketDisconnectDiagnostic;
+ lastUpgradeRejection?: WebSocketUpgradeRejectionDiagnostic;
 }
 const CONTEXT_HEADER = "x-local-responses-transport";
+const HTTP_FALLBACK_COOLDOWN_MS = 60_000;
+const MAX_HTTP_FALLBACK_SCOPES = 256;
+const HTTP_FALLBACK_FAILURE_THRESHOLD = 2;
+const MAX_CLIENT_SESSIONS = 64;
+// Conservative request ceiling below observed upstream 1009 rejections. This
+// is a local routing guard, not a claim about the upstream's undocumented cap.
+const MAX_UPSTREAM_WEBSOCKET_REQUEST_BYTES = 8 * 1024 * 1024;
 const terminal = new Set([
 	"response.completed",
 	"response.failed",
@@ -36,6 +66,26 @@ const terminal = new Set([
 type Json = Record<string, unknown>;
 type Chain = { body: Json; output: unknown[]; pool: string; bytes: number };
 type Context = { routeKind: "oauth" | "api" | "zdr"; signal: AbortSignal; session: SocketSession; previousId?: string; delta?: unknown; clientBeta?: string };
+/** A thread-scoped hint only; authentication is checked separately before use. */
+function fallbackScope(req: IncomingMessage): string | undefined {
+	// Native clients can share a session across threads. Prefer the conversation
+	// identity so a failed thread does not downgrade a healthy sibling.
+	// Current native clients send hyphenated names; retain older underscore
+	// aliases, with thread identity taking priority over a shared session.
+	const identity = ["thread-id", "conversation_id", "session-id", "session_id"]
+		.map(name => req.headers[name])
+		.find((value): value is string => typeof value === "string" && !!value.trim())
+		?.trim();
+	if (!identity || identity.length > 1024) return undefined;
+	const bearer = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+	const apiKey = req.headers["x-api-key"];
+	const credentials = [...new Set([
+		bearer,
+		typeof apiKey === "string" ? apiKey.trim() : undefined,
+	].filter((value): value is string => !!value))].sort();
+	if (!credentials.length) return undefined;
+	return createHash("sha256").update(JSON.stringify([credentials, identity])).digest("hex");
+}
 /** Headers that describe the synthetic body or the upgrade itself, never the upstream decision. */
 const LOCAL_ONLY_HEADERS = /^(connection|upgrade|keep-alive|sec-websocket-.*|content-length|content-encoding|content-type|transfer-encoding|set-cookie)$/i;
 function upstreamHeaders(source: unknown): Record<string, string> {
@@ -49,11 +99,12 @@ function upstreamHeaders(source: unknown): Record<string, string> {
 	}
 	return headers;
 }
-/** Union of comma-separated OpenAI-Beta features; the client's own flags are kept. */
+/** Remove the router's HTTP-only flag; preserve every explicit client beta. */
 function mergeBeta(current: string | null, client: string | undefined): string | null {
-	if (!client) return current;
-	const features = [...(current ?? "").split(","), ...client.split(",")].map(item => item.trim()).filter(Boolean);
-	return [...new Set(features)].join(", ") || null;
+	const routingFlags = (current ?? "").split(",").map(item => item.trim())
+		.filter(item => item && item !== OPENAI_HEADER_VALUES.BETA_RESPONSES);
+	const clientFlags = (client ?? "").split(",").map(item => item.trim()).filter(Boolean);
+	return [...new Set([...routingFlags, ...clientFlags])].join(", ") || null;
 }
 function wireError(code: string, status = 400): Json {
 	return {
@@ -79,14 +130,24 @@ function bodyJson(body: RequestInit["body"]): Json {
 	return value;
 }
 
+type TransportErrorCode = NonNullable<WebSocketDisconnectDiagnostic["transportErrorCode"]>;
+interface SocketTransportEvidence {
+	tcpEndReceived: boolean;
+	tcpCloseHadError?: boolean;
+	transportErrorCode?: TransportErrorCode;
+}
+function transportErrorCode(error: unknown): TransportErrorCode {
+	const code = isRecord(error) ? error.code : undefined;
+	return code === "ECONNRESET" || code === "EPIPE" || code === "ETIMEDOUT" ? code : "OTHER";
+}
+
 /** Per-client memory only; credentials never leave the existing routing boundary. */
 class SocketSession {
 	readonly channels = new Map<string, WebSocket>();
 	private readonly openedAt = new WeakMap<WebSocket, number>();
+	private readonly transportEvidence = new WeakMap<WebSocket, SocketTransportEvidence>();
 	readonly owners = new Map<string, WebSocket>();
 	readonly chains = new Map<string, Chain>();
-	/** Credentials whose WebSocket handshake was refused; they use HTTP for the session. */
-	private readonly httpOnly = new Set<string>();
 	bytes = 0;
 	controller: AbortController | undefined;
 	closed = false;
@@ -94,6 +155,10 @@ class SocketSession {
 		readonly maxBytes: number,
 		readonly stats: WebSocketStats,
 		private readonly httpFetch: typeof fetch = fetch,
+		private readonly onDisconnect?: () => void,
+		private readonly onComplete?: () => void,
+		private readonly needsHttpRecovery: () => boolean = () => false,
+		private readonly httpOnly: Map<string, number> = new Map(),
 	) {}
 	close() {
 		this.closed = true;
@@ -106,7 +171,7 @@ class SocketSession {
 	}
 	remember(id: string, body: Json, output: unknown[], pool: string) {
 		const bytes = Buffer.byteLength(JSON.stringify({ body, output }));
-		if (bytes > this.maxBytes) return;
+		if (bytes > this.maxBytes) return false;
 		const old = this.chains.get(id);
 		if (old) this.bytes -= old.bytes;
 		this.chains.delete(id);
@@ -120,6 +185,21 @@ class SocketSession {
 			this.chains.delete(first);
 			this.owners.delete(first);
 		}
+		return true;
+	}
+	private httpRecovery(input: string | URL | Request, init: RequestInit, body: Json): Promise<Response> {
+		// generate=false is a WebSocket-only prewarm control. Never turn a
+		// transport warmup into a generating HTTP request. The local chain is
+		// remembered by serve(), so the next create can reconstruct its input.
+		if (body.generate === false) {
+			return Promise.resolve(new Response(`data: ${JSON.stringify({
+				type: "response.completed",
+				response: { id: `resp_local_prewarm_${randomUUID()}`, object: "response", status: "completed", output: [] },
+			})}\n\n`, { headers: { "content-type": "text/event-stream" } }));
+		}
+		// This is a newly submitted create. Never retry a create already sent
+		// over a WebSocket; its generation outcome can be ambiguous.
+		return this.httpFetch(input, init);
 	}
 	async fetch(
 		input: string | URL | Request,
@@ -130,10 +210,12 @@ class SocketSession {
 		const url = new URL(String(input));
 		url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
 		const headers = new Headers(init.headers);
-		// The routing pipeline stamps its HTTP beta flag; the native client's
-		// WebSocket flag (e.g. responses_websockets=<date>) must survive the hop.
+		// The OAuth HTTP beta selects an incompatible upstream protocol when
+		// combined with the native WebSocket beta (metadata then close 1011).
+		// Keep the original client flags, without the router's HTTP injection.
 		const beta = mergeBeta(headers.get("openai-beta"), context.clientBeta);
 		if (beta) headers.set("openai-beta", beta);
+		else headers.delete("openai-beta");
 		const key = createHash("sha256")
 			.update(url.toString())
 			.update("\0")
@@ -141,11 +223,14 @@ class SocketSession {
 			.update("\0")
 			.update(headers.get("chatgpt-account-id") ?? "")
 			.digest("hex");
-		// API/ZDR credentials are not ChatGPT workspaces: when their WebSocket
-		// handshake is refused, the turn (and the session) uses plain HTTP.
 		const apiCredential = !headers.has("chatgpt-account-id");
-		if (apiCredential && this.httpOnly.has(key)) return this.httpFetch(input, init);
 		const body = bodyJson(init.body);
+		for (const [credential, until] of this.httpOnly) {
+			if (until <= Date.now()) this.httpOnly.delete(credential);
+		}
+		if (this.needsHttpRecovery() || (apiCredential && this.httpOnly.has(key))) {
+			return this.httpRecovery(input, init, body);
+		}
 		delete body.stream;
 		delete body.background;
 		body.store = false;
@@ -167,6 +252,13 @@ class SocketSession {
 		else if (context.previousId && hasOrphanToolResult(body.input)) {
 			return Response.json(wireError("previous_response_not_found"), {status: 400});
 		}
+		const serializedBody = JSON.stringify(body);
+		// Measure the actual UTF-8 create after connection-local delta reduction.
+		// HTTP receives the original reconstructed request, never a WS-only delta.
+		if (Buffer.byteLength(serializedBody) > MAX_UPSTREAM_WEBSOCKET_REQUEST_BYTES) {
+			return this.httpRecovery(input, init, body);
+		}
+		const reusedConnection = !!socket;
 		let handshakeHeaders: Record<string, string> | undefined;
 		if (!socket) {
 			if (context.signal.aborted || this.closed) throw new ClientCancellationError();
@@ -192,7 +284,16 @@ class SocketSession {
 				followRedirects: false,
 				handshakeTimeout: 15000,
 				maxPayload: this.maxBytes,
-				perMessageDeflate: false,
+				// Offer native compression with modest zlib work and request dictionary
+				// resets. Message limits also apply after inflation; peers can decline
+				// the extension and continue using WebSockets.
+				perMessageDeflate: {
+					clientNoContextTakeover: true,
+					serverNoContextTakeover: true,
+					concurrencyLimit: 4,
+					threshold: 1024,
+					zlibDeflateOptions: { level: 3 },
+				},
 			});
 			const opening = socket;
 			const rejected = await new Promise<Response | undefined>(
@@ -210,6 +311,20 @@ class SocketSession {
 					init.signal?.addEventListener("abort", abort, { once: true });
 					opening.once("upgrade", (response) => {
 						handshakeHeaders = upstreamHeaders(response.headers);
+						// ws consumes TCP/TLS errors without re-emitting them. Observe
+						// the public upgrade socket before its close handler runs.
+						const tcp = response.socket;
+						const evidence: SocketTransportEvidence = { tcpEndReceived: false };
+						this.transportEvidence.set(opening, evidence);
+						const onEnd = () => { evidence.tcpEndReceived = true; };
+						const onError = (error: Error) => { evidence.transportErrorCode = transportErrorCode(error); };
+						tcp.once("end", onEnd);
+						tcp.once("error", onError);
+						tcp.once("close", (hadError) => {
+							evidence.tcpCloseHadError = hadError;
+							tcp.off("end", onEnd);
+							tcp.off("error", onError);
+						});
 					});
 					opening.once("open", () => {
 						cleanup();
@@ -241,8 +356,12 @@ class SocketSession {
 			);
 			if (rejected) {
 				if (!apiCredential) return rejected;
-				this.httpOnly.add(key);
-				return this.httpFetch(input, init);
+				if (!this.httpOnly.has(key) && this.httpOnly.size >= MAX_API_ROUTES) {
+					const oldest = this.httpOnly.keys().next().value;
+					if (oldest) this.httpOnly.delete(oldest);
+				}
+				this.httpOnly.set(key, Date.now() + HTTP_FALLBACK_COOLDOWN_MS);
+				return this.httpRecovery(input, init, body);
 			}
 			this.openedAt.set(socket, Date.now());
 			this.channels.set(key, socket);
@@ -253,6 +372,8 @@ class SocketSession {
 				finished = false;
 			let bodyCancelled = false;
 			let eventCount = 0;
+			let sendCompleted = false;
+			let requestTransportErrorCode: TransportErrorCode | undefined;
 			let streamController: ReadableStreamDefaultController<Uint8Array>;
 			const stream = new ReadableStream<Uint8Array>(
 				{
@@ -280,12 +401,25 @@ class SocketSession {
 				this.channels.delete(key);
                 const cancelled = bodyCancelled || init.signal?.aborted || context.signal.aborted || this.closed;
                 if (!cancelled) {
+                    this.onDisconnect?.();
                     const at = Date.now();
+                    const transport = this.transportEvidence.get(active);
+                    const errorCode = transport?.transportErrorCode ?? requestTransportErrorCode;
                     this.stats.lastDisconnect = {
                         at, cause, routeKind: context.routeKind,
                         connectionAgeMs: Math.max(0, at - (this.openedAt.get(active) ?? at)), eventCount,
                         stage: accepted ? "streaming" : "awaiting_first_event",
                         ...(typeof closeCode === "number" ? {closeCode} : {}),
+                        requestBytes: Buffer.byteLength(serializedBody),
+                        ...(Array.isArray(body.input) ? { inputItemCount: body.input.length } : {}),
+                        isPrewarm: body.generate === false,
+                        hasPreviousResponse: typeof body.previous_response_id === "string" && body.previous_response_id.length > 0,
+                        reusedConnection, sendCompleted,
+                        compressionNegotiated: active.extensions.split(",").some(extension => extension.trim() === "permessage-deflate"),
+                        ...(transport ? { tcpEndReceived: transport.tcpEndReceived,
+                            ...(transport.tcpCloseHadError !== undefined ? { tcpCloseHadError: transport.tcpCloseHadError } : {}),
+                        } : {}),
+                        ...(errorCode ? { transportErrorCode: errorCode } : {}),
                     };
                 }
                 // Once create has been sent, a disconnect cannot prove generation
@@ -304,7 +438,10 @@ class SocketSession {
                 }
 			};
 			const onSocketClose = (code: number) => onClose(code);
-			const onError = () => onClose(undefined, "transport_error");
+			const onError = (error: Error) => {
+				requestTransportErrorCode = transportErrorCode(error);
+				onClose(undefined, "transport_error");
+			};
 			const abort = () => active.terminate();
 			const onMessage = (raw: WebSocket.RawData, isBinary: boolean) => {
 				let failureCause: WebSocketDisconnectDiagnostic["cause"] = "invalid_event";
@@ -353,6 +490,10 @@ class SocketSession {
 						}
 					}
 					if (terminal.has(event.type)) {
+						// A prewarm completion proves only connection setup, not that
+						// generation works. It must not erase a real disconnect history.
+						if (event.type === "response.completed" && body.generate !== false)
+							this.onComplete?.();
 						finished = true;
 						cleanup();
 						streamController.close();
@@ -372,11 +513,12 @@ class SocketSession {
 				return;
 			}
 			this.stats.upstreamRequests++;
-			active.send(JSON.stringify(body), (error) => {
+			active.send(serializedBody, (error) => {
 				if (error) {
+					requestTransportErrorCode = transportErrorCode(error);
 					onClose(undefined, "send_error");
 					active.terminate();
-				}
+				} else sendCompleted = true;
 			});
 		});
 	}
@@ -386,12 +528,17 @@ class SocketSession {
 export class ResponsesWebSocketGateway {
 	readonly stats: WebSocketStats = {
 		connections: 0,
+		activeConnections: 0,
+		capacityReclaims: 0,
 		upstreamConnections: 0,
 		upstreamRequests: 0,
 	};
 	private readonly contexts = new Map<string, Context>();
 	private readonly scope = new AsyncLocalStorage<Context>();
-	private readonly sessions = new Set<SocketSession>();
+	private readonly sessions = new Map<SocketSession, { socket: WebSocket; canReclaim: () => boolean }>();
+	/** Credential-hashed, bounded API handshake backoff survives local reconnects. */
+	private readonly apiHandshakeBackoff = new Map<string, number>();
+	private readonly websocketFailures = new Map<string, { until: number; count: number }>();
 	private readonly wss: WebSocketServer;
 	private readonly maxBytes: number;
 	/** Loopback hops must never go through an environment HTTP proxy (NODE_USE_ENV_PROXY). */
@@ -415,6 +562,22 @@ export class ResponsesWebSocketGateway {
 			noServer: true,
 			maxPayload: this.maxBytes,
 			perMessageDeflate: false,
+			// ws validates method/key/version/subprotocol before this synchronous gate.
+			// An invalid newcomer must never evict an existing usable connection.
+			verifyClient: ({ req }, done) => {
+				if (req.socket.destroyed || !req.socket.readable || !req.socket.writable) {
+					done(false, 503);
+					return;
+				}
+				if (this.sessions.size >= MAX_CLIENT_SESSIONS && !this.reclaimIdleSession()) {
+					// Capacity is not an authentication failure. Native Codex handles
+					// 426 immediately instead of retrying five rejected handshakes.
+					this.recordUpgradeRejection("capacity", 426);
+					done(false, 426);
+					return;
+				}
+				done(true);
+			},
 		});
 	}
 	readonly fetch: typeof fetch = async (input, init) => {
@@ -427,6 +590,47 @@ export class ResponsesWebSocketGateway {
 			return context.session.fetch(input, init, context);
 		return this.upstreamFetch(input, init);
 	};
+	private rememberDisconnect(scope: string | undefined): void {
+		if (!scope) return;
+		const now = Date.now();
+		for (const [key, failure] of this.websocketFailures) {
+			if (failure.until <= now) this.websocketFailures.delete(key);
+		}
+		const count = Math.min((this.websocketFailures.get(scope)?.count ?? 0) + 1, HTTP_FALLBACK_FAILURE_THRESHOLD);
+		this.websocketFailures.delete(scope);
+		this.websocketFailures.set(scope, { until: now + HTTP_FALLBACK_COOLDOWN_MS, count });
+		while (this.websocketFailures.size > MAX_HTTP_FALLBACK_SCOPES) {
+			const oldest = this.websocketFailures.keys().next().value;
+			if (oldest === undefined) break;
+			this.websocketFailures.delete(oldest);
+		}
+	}
+	private needsHttpFallback(req: IncomingMessage): boolean {
+		const scope = fallbackScope(req);
+		if (!scope) return false;
+		const failure = this.websocketFailures.get(scope);
+		if (!failure) return false;
+		if (failure.until > Date.now()) return failure.count >= HTTP_FALLBACK_FAILURE_THRESHOLD;
+		this.websocketFailures.delete(scope);
+		return false;
+	}
+	/** One writer for the upgrade-rejection diagnostic so the two reject paths cannot drift. */
+	private recordUpgradeRejection(reason: WebSocketUpgradeRejectionDiagnostic["reason"], status: number): void {
+		this.stats.lastUpgradeRejection = { at: Date.now(), reason, status, activeConnections: this.sessions.size };
+	}
+	/** Release idle setup sockets only; active work and generated history stay pinned. */
+	private reclaimIdleSession(): boolean {
+		for (const [session, client] of this.sessions) {
+			if (!client.canReclaim()) continue;
+			this.sessions.delete(session);
+			this.stats.activeConnections = this.sessions.size;
+			this.stats.capacityReclaims++;
+			session.close();
+			client.socket.terminate();
+			return true;
+		}
+		return false;
+	}
 	handle(req: IncomingMessage, handler: () => Promise<void>): void {
 		const id = req.headers[CONTEXT_HEADER];
 		delete req.headers[CONTEXT_HEADER];
@@ -448,6 +652,11 @@ export class ResponsesWebSocketGateway {
 					`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
 				);
 			};
+			const rejectAdmission = (reason: WebSocketUpgradeRejectionDiagnostic["reason"], status: number) => {
+				if (socket.destroyed) return;
+				this.recordUpgradeRejection(reason, status);
+				reject(status);
+			};
 			void (async () => {
 				const credentials: Record<string, string> = {};
 				for (const name of ["authorization", "x-api-key"]) {
@@ -467,7 +676,7 @@ export class ResponsesWebSocketGateway {
 					return;
 				}
 				if (req.headers.origin) {
-					reject(403);
+					rejectAdmission("origin", 403);
 					return;
 				}
 				if (await this.options.upgrade?.(req, socket, head)) return;
@@ -482,10 +691,13 @@ export class ResponsesWebSocketGateway {
 					reject(404);
 					return;
 				}
-				if (req.headers.origin || this.sessions.size >= 64) {
-					reject(403);
-					return;
-				}
+                // Keep native transport on WebSocket during temporary upstream
+                // HTTP recovery. At capacity, preserve admission behavior rather
+                // than evicting another session just to serve a recovery scope.
+                if (this.needsHttpFallback(req) && this.sessions.size >= MAX_CLIENT_SESSIONS) {
+                    rejectAdmission("repeated_disconnect", 426);
+                    return;
+                }
                 if (socket.destroyed) return;
 				this.wss.handleUpgrade(req, socket, head, (ws) =>
 					this.serve(ws, req, baseUrl),
@@ -495,12 +707,25 @@ export class ResponsesWebSocketGateway {
 	}
 	private serve(ws: WebSocket, req: IncomingMessage, baseUrl: string): void {
 		this.stats.connections++;
-		const session = new SocketSession(this.maxBytes, this.stats, this.upstreamFetch);
-		this.sessions.add(session);
+		const scope = fallbackScope(req);
+		const session = new SocketSession(
+			this.maxBytes, this.stats, this.upstreamFetch,
+			() => this.rememberDisconnect(scope),
+			() => { if (scope) this.websocketFailures.delete(scope); },
+			() => this.needsHttpFallback(req),
+			this.apiHandshakeBackoff,
+		);
 		let queue = Promise.resolve(),
 			queued = 0,
 			queuedBytes = 0;
 		let generation = 0;
+		// Pending work is protected by queued/controller; rejected creates retain no history.
+		let hasGeneratedHistory = false;
+		this.sessions.set(session, {
+			socket: ws,
+			canReclaim: () => !hasGeneratedHistory && queued === 0 && !session.controller && !session.closed && ws.readyState === WebSocket.OPEN,
+		});
+		this.stats.activeConnections = this.sessions.size;
 		const send = (event: Json) => {
 			if (ws.readyState !== WebSocket.OPEN) return;
 			if (ws.bufferedAmount > this.maxBytes) {
@@ -513,6 +738,7 @@ export class ResponsesWebSocketGateway {
 		ws.once("close", () => {
 			session.close();
 			this.sessions.delete(session);
+			this.stats.activeConnections = this.sessions.size;
 		});
 		ws.on("message", (raw, isBinary) => {
 			let event: Json;
@@ -656,12 +882,12 @@ export class ResponsesWebSocketGateway {
 										typeof parsed.response.id === "string"
 									) {
 										const output = outputHistory.finish(parsed.response.output);
-										if (output) session.remember(
+										if (output && session.remember(
 											parsed.response.id,
 											body,
 											output,
 											pool,
-										);
+										) && body.generate !== false) hasGeneratedHistory = true;
 									}
 									send(parsed);
 								}
@@ -684,8 +910,12 @@ export class ResponsesWebSocketGateway {
 	}
 	close() {
 		for (const ws of this.wss.clients) ws.terminate();
-		for (const session of this.sessions) session.close();
+		for (const session of this.sessions.keys()) session.close();
+		this.sessions.clear();
+		this.stats.activeConnections = 0;
 		this.contexts.clear();
+		this.websocketFailures.clear();
+		this.apiHandshakeBackoff.clear();
 		this.wss.close();
 		void this.loopback.close().catch(() => undefined);
 	}

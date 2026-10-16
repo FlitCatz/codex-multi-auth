@@ -84,12 +84,17 @@ export class AccountModelCatalog {
 			this.pending.delete(key);
 		}
 	}
+	/** Includes successful empty catalogs; stale or failed discovery remains unknown. */
+	hasUsablePickerSnapshot(key: string): boolean {
+		const entry = this.cache.get(key);
+		return Boolean(entry && !entry.error && entry.checkedAt <= this.now() && this.now() - entry.checkedAt < 15 * 60_000);
+	}
 	/** Picker-only stale-while-refresh view; routing still awaits fresh discovery. */
 	cachedList(accountKeys: string[]): CatalogModel[] {
 		return buildVisibleModelUnion(accountKeys.map((key, index) => {
 			const entry = this.cache.get(key);
-			const usable = entry && !entry.error && entry.checkedAt <= this.now() && this.now() - entry.checkedAt < 15 * 60_000;
-			return {id: key, kind: "oauth" as const, priority: index, enabled: true, models: usable ? entry.models ?? [] : [], visibleModels: null};
+			const usable = this.hasUsablePickerSnapshot(key);
+			return {id: key, kind: "oauth" as const, priority: index, enabled: true, models: usable ? entry?.models ?? [] : [], visibleModels: null};
 		}));
 	}
 	invalidate(): void { this.cache.clear(); }

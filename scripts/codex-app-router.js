@@ -143,6 +143,25 @@ function writeStatus(statusPath, payload) {
 function readDisconnect(value) {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const { at, cause, stage, closeCode, routeKind, connectionAgeMs, eventCount } = value;
+	const transport = {};
+	for (const key of ["requestBytes", "inputItemCount"]) {
+		const field = value[key];
+		if (field !== undefined) {
+			if (typeof field !== "number" || !Number.isSafeInteger(field) || field < 0) return null;
+			transport[key] = field;
+		}
+	}
+	for (const key of ["isPrewarm", "hasPreviousResponse", "reusedConnection", "sendCompleted", "compressionNegotiated", "tcpEndReceived", "tcpCloseHadError"]) {
+		const field = value[key];
+		if (field !== undefined) {
+			if (typeof field !== "boolean") return null;
+			transport[key] = field;
+		}
+	}
+	if (value.transportErrorCode !== undefined) {
+		if (!["ECONNRESET", "EPIPE", "ETIMEDOUT", "OTHER"].includes(value.transportErrorCode)) return null;
+		transport.transportErrorCode = value.transportErrorCode;
+	}
 	if (typeof at !== "number" || !Number.isFinite(at) || at < 0 || at > 8.64e15) return null;
 	if (!["close", "transport_error", "invalid_event", "buffer_limit", "send_error"].includes(cause)) return null;
 	if (!["awaiting_first_event", "streaming"].includes(stage)) return null;
@@ -157,7 +176,22 @@ function readDisconnect(value) {
 		...(routeKind !== undefined ? { routeKind } : {}),
 		...(connectionAgeMs !== undefined ? { connectionAgeMs } : {}),
 		...(eventCount !== undefined ? { eventCount } : {}),
+		...transport,
 	};
+}
+
+function readWebsocketCounter(value, maximum = Number.MAX_SAFE_INTEGER) {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= maximum
+		? value : null;
+}
+
+function readUpgradeRejection(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const { at, reason, status, activeConnections } = value;
+	if (readWebsocketCounter(at, 8.64e15) === null || readWebsocketCounter(activeConnections, 64) === null) return null;
+	if (!((reason === "origin" && status === 403) ||
+		((reason === "capacity" || reason === "repeated_disconnect") && status === 426))) return null;
+	return { at, reason, status, activeConnections };
 }
 
 function createStatusPayload({
@@ -170,12 +204,14 @@ function createStatusPayload({
 	routerScriptPath,
 	identityToken,
 	previousDisconnect = null,
+	previousUpgradeRejection = null,
 }) {
 	const proxyStatus =
 		typeof proxyServer?.getStatus === "function" ? proxyServer.getStatus() : {};
 	const currentDisconnect = readDisconnect(proxyStatus.lastWebsocketDisconnect);
 	// A current-process event is newer history even after wall-clock rollback.
 	const lastDisconnect = currentDisconnect ?? previousDisconnect;
+	const lastUpgradeRejection = readUpgradeRejection(proxyStatus.lastWebsocketUpgradeRejection) ?? previousUpgradeRejection;
 	const lastAccountIndex = proxyStatus.lastAccountIndex ?? null;
 	const lastAccountLabel =
 		typeof proxyStatus.lastAccountLabel === "string" &&
@@ -205,6 +241,9 @@ function createStatusPayload({
 		upstreamRequests: proxyStatus.upstreamRequests ?? 0,
 		websocketConnections: proxyStatus.websocketConnections ?? 0,
 		websocketUpstreamRequests: proxyStatus.websocketUpstreamRequests ?? 0,
+		websocketActiveConnections: readWebsocketCounter(proxyStatus.websocketActiveConnections, 64) ?? 0,
+		websocketCapacityReclaims: readWebsocketCounter(proxyStatus.websocketCapacityReclaims) ?? 0,
+		lastWebsocketUpgradeRejection: lastUpgradeRejection,
 		lastWebsocketDisconnect: lastDisconnect,
 		streamQuotaUpdates: proxyStatus.streamQuotaUpdates ?? 0,
 		lastStreamQuotaUpdateAt: proxyStatus.lastStreamQuotaUpdateAt ?? null,
@@ -293,7 +332,9 @@ async function main() {
 	const args = parseArgs(process.argv.slice(2));
 	installLogBounds(args.maxLogBytes, args.logPath).unref?.();
 	const stateRecord = readState(args.statePath);
-	let previousDisconnect = readDisconnect(readState(args.statusPath || stateRecord?.statusPath || "")?.lastWebsocketDisconnect);
+	const previousStatus = readState(args.statusPath || stateRecord?.statusPath || "");
+	let previousDisconnect = readDisconnect(previousStatus?.lastWebsocketDisconnect);
+	let previousUpgradeRejection = readUpgradeRejection(previousStatus?.lastWebsocketUpgradeRejection);
 	if (args.statePath && stateRecord === null) {
 		const error = new Error(
 			"Codex app runtime router state is unreadable; refusing to bind an ephemeral port.",
@@ -302,6 +343,7 @@ async function main() {
 			args.statusPath,
 			createStatusPayload({
 				previousDisconnect,
+				previousUpgradeRejection,
 				state: "error",
 				proxyServer: null,
 				error,
@@ -341,6 +383,7 @@ async function main() {
 	const writeCurrentStatus = (state, error) => {
 		const payload = createStatusPayload({
 			previousDisconnect,
+			previousUpgradeRejection,
 			state,
 			proxyServer,
 			error,
@@ -351,6 +394,7 @@ async function main() {
 			identityToken: args.identityToken || stateRecord?.identityToken || "",
 		});
 		previousDisconnect = payload.lastWebsocketDisconnect;
+		previousUpgradeRejection = payload.lastWebsocketUpgradeRejection;
 		writeStatus(args.statusPath || stateRecord?.statusPath || "", payload);
 	};
 

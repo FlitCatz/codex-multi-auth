@@ -160,16 +160,17 @@ export function chooseAccount(params: {
 	/**
 	 * Admit a pinned account that is only blocked by its own cooldown.
 	 *
-	 * Set by the proxy for the RETRY passes of one pinned request, never for
-	 * the first pass. A cooldown exists to keep OTHER requests off a flaky
-	 * account; a retry budget exists to give THIS request another attempt.
+	 * Set by the proxy for RETRY passes, or the first pass when a pin only
+	 * has a shared network-error cooldown. Independent concurrent work must
+	 * not fail solely because another request encountered a transport error.
+	 * Other cooldown reasons still protect the pin from new requests.
 	 * Conflating them meant every transient branch cooled the pin down before
 	 * the next selection pass and the budget could never be spent — a pinned
 	 * request got exactly one upstream attempt under shipped defaults.
 	 *
 	 * Only the cooldown is waived. Rate limits, an open circuit, a disabled
 	 * account, workspace and policy blocks all still reject the pin, and the
-	 * cooldown itself stays on the account for everyone else and for the 503's
+	 * cooldown itself stays on the account for unpinned selection and the 503's
 	 * `retry_after_ms`.
 	 *
 	 * One ordering note: `getAccountRuntimeSkipReason` reports the FIRST

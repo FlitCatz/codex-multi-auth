@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	bindCodexAppRuntimeRotation,
 	formatAppBindStatus,
+	formatWebsocketDisconnect,
 	getAppBindStatus,
 	parsePosixProcessStartTime,
 	resolveAppBindPaths,
@@ -2249,7 +2250,7 @@ it.each([
 });
 
 
-it.each([true,false])("shows safe WebSocket disconnect details for native=%s", (nativeOpenai) => {
+it.each([true,false])("shows safe WebSocket disconnect and admission details for native=%s", (nativeOpenai) => {
  const configPath="fixture/config.toml";
  const status: Parameters<typeof formatAppBindStatus>[0] = {
 		bound: true,
@@ -2291,4 +2292,81 @@ it.each([true,false])("shows safe WebSocket disconnect details for native=%s", (
  const withDiagnostic = {...status,router:{lastWebsocketDisconnect:{at:1000,cause:"transport_error" as const,stage:"streaming" as const,closeCode:1006,routeKind:"api" as const,connectionAgeMs:42,eventCount:7}}};
  expect(formatAppBindStatus(withDiagnostic)).toContain("Last WebSocket disconnect: 1970-01-01T00:00:01.000Z; cause=transport_error; stage=streaming; closeCode=1006; route=api; connectionAgeMs=42; events=7");
  expect(formatAppBindStatus(status)).not.toContain("Last WebSocket disconnect:");
+ const withAdmission = { ...status, router: { websocketActiveConnections: 3, websocketCapacityReclaims: 7, lastWebsocketUpgradeRejection: { at: 1000, reason: "capacity" as const, status: 426, activeConnections: 64 } } };
+ expect(formatAppBindStatus(withAdmission)).toContain("WebSocket connections: active=3; idleReclaimed=7");
+ expect(formatAppBindStatus(withAdmission)).toContain("Last WebSocket upgrade rejection: 1970-01-01T00:00:01.000Z; reason=capacity; status=426; active=64");
+ expect(formatAppBindStatus(status)).not.toContain("Last WebSocket upgrade rejection:");
+});
+
+
+it.each([
+	{ stored: { at: 123, reason: "capacity", status: 426, activeConnections: 64, authorization: "private-token" }, expected: { at: 123, reason: "capacity", status: 426, activeConnections: 64 } },
+	{ stored: { at: 123, reason: "origin", status: 403, activeConnections: 0 }, expected: { at: 123, reason: "origin", status: 403, activeConnections: 0 } },
+	{ stored: { at: 123, reason: "repeated_disconnect", status: 426, activeConnections: 2 }, expected: { at: 123, reason: "repeated_disconnect", status: 426, activeConnections: 2 } },
+	...[
+		{ reason: "capacity", status: 403 }, { reason: "origin", status: 426 },
+		{ reason: "repeated_disconnect", status: 403 }, { reason: "private-reason" },
+		{ activeConnections: 65 }, { activeConnections: -1 }, { activeConnections: 1.5 },
+		{ activeConnections: "1" }, { at: 8.64e15 + 1 }, { at: -1 }, { at: "123" },
+	].map(invalid => ({ stored: { at: 123, reason: "capacity", status: 426, activeConnections: 64, ...invalid }, expected: null })),
+])("validates persisted WebSocket admission diagnostics: %j", async ({ stored, expected }) => {
+	const root = await createTempRoot("app-bind-ws-admission-");
+	const options = { platform: "linux" as const, home: root, env: { CODEX_HOME: join(root, "codex"), CODEX_MULTI_AUTH_DIR: join(root, "multi-auth") } };
+	const paths = resolveAppBindPaths(options);
+	await mkdir(paths.bindDir, { recursive: true });
+	await writeFile(paths.statusPath, JSON.stringify({ state: "stopped", lastWebsocketUpgradeRejection: stored, websocketActiveConnections: 3, websocketCapacityReclaims: 7 }));
+	const status = await getAppBindStatus(options);
+	expect(status.router?.lastWebsocketUpgradeRejection).toEqual(expected);
+	expect(status.router?.websocketActiveConnections).toBe(3);
+	expect(status.router?.websocketCapacityReclaims).toBe(7);
+});
+
+it.each([-1, 1.5, "1", Number.MAX_SAFE_INTEGER + 1, null])("drops invalid persisted WebSocket capacity counters: %j", async count => {
+	const root = await createTempRoot("app-bind-ws-capacity-");
+	const options = { platform: "linux" as const, home: root, env: { CODEX_HOME: join(root, "codex"), CODEX_MULTI_AUTH_DIR: join(root, "multi-auth") } };
+	const paths = resolveAppBindPaths(options);
+	await mkdir(paths.bindDir, { recursive: true });
+	await writeFile(paths.statusPath, JSON.stringify({ state: "stopped", websocketActiveConnections: count, websocketCapacityReclaims: count }));
+	const status = await getAppBindStatus(options);
+	expect(status.router?.websocketActiveConnections).toBeNull();
+	expect(status.router?.websocketCapacityReclaims).toBeNull();
+});
+
+
+it("bounds active WebSocket connections without capping the lifetime reclaim counter", async () => {
+	const root = await createTempRoot("app-bind-ws-counter-bound-");
+	const options = { platform: "linux" as const, home: root, env: { CODEX_HOME: join(root, "codex"), CODEX_MULTI_AUTH_DIR: join(root, "multi-auth") } };
+	const paths = resolveAppBindPaths(options);
+	await mkdir(paths.bindDir, { recursive: true });
+	await writeFile(paths.statusPath, JSON.stringify({ state: "stopped", websocketActiveConnections: 65, websocketCapacityReclaims: Number.MAX_SAFE_INTEGER }));
+	const status = await getAppBindStatus(options);
+	expect(status.router?.websocketActiveConnections).toBeNull();
+	expect(status.router?.websocketCapacityReclaims).toBe(Number.MAX_SAFE_INTEGER);
+});
+
+
+it.each([
+	{ fields: { requestBytes: 1234, inputItemCount: 2, isPrewarm: false, hasPreviousResponse: true, reusedConnection: true, sendCompleted: true, compressionNegotiated: false, transportErrorCode: "ECONNRESET", tcpEndReceived: false, tcpCloseHadError: true }, valid: true },
+	{ fields: { requestBytes: 0, inputItemCount: 0, transportErrorCode: "OTHER" }, valid: true },
+	...[
+		{ requestBytes: -1 }, { requestBytes: 1.5 }, { inputItemCount: "2" },
+		{ isPrewarm: "false" }, { hasPreviousResponse: 1 }, { reusedConnection: null },
+		{ sendCompleted: "true" }, { compressionNegotiated: "secret" },
+		{ transportErrorCode: "secret-error" }, { tcpEndReceived: 0 }, { tcpCloseHadError: "false" },
+	].map(fields => ({ fields, valid: false })),
+])("validates safe WebSocket transport evidence: %j", async ({ fields, valid }) => {
+	const root = await createTempRoot("app-bind-ws-transport-");
+	const options = { platform: "linux" as const, home: root, env: { CODEX_HOME: join(root, "codex"), CODEX_MULTI_AUTH_DIR: join(root, "multi-auth") } };
+	const paths = resolveAppBindPaths(options);
+	await mkdir(paths.bindDir, { recursive: true });
+	const base = { at: 123, cause: "close", stage: "awaiting_first_event", closeCode: 1006 };
+	await writeFile(paths.statusPath, JSON.stringify({ state: "stopped", lastWebsocketDisconnect: { ...base, ...fields, message: "private-message", request: "private-body" } }));
+	expect((await getAppBindStatus(options)).router?.lastWebsocketDisconnect).toEqual(valid ? { ...base, ...fields } : null);
+});
+
+
+it("formats safe WebSocket transport evidence and keeps old records compatible", () => {
+	const base = { at: 1000, cause: "close", stage: "awaiting_first_event", closeCode: 1006 };
+	expect(formatWebsocketDisconnect(base)).toBe("Last WebSocket disconnect: 1970-01-01T00:00:01.000Z; cause=close; stage=awaiting_first_event; closeCode=1006");
+	expect(formatWebsocketDisconnect({ ...base, requestBytes: 120, inputItemCount: 2, isPrewarm: false, hasPreviousResponse: true, reusedConnection: true, sendCompleted: true, compressionNegotiated: false, transportErrorCode: "ECONNRESET", tcpEndReceived: false, tcpCloseHadError: true })).toContain("requestBytes=120; inputItemCount=2; isPrewarm=false; hasPreviousResponse=true; reusedConnection=true; sendCompleted=true; compressionNegotiated=false; transportErrorCode=ECONNRESET; tcpEndReceived=false; tcpCloseHadError=true");
 });

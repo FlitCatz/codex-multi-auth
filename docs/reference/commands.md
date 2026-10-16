@@ -992,6 +992,51 @@ connection age in milliseconds, and the number of valid events received for
 the interrupted request. Older records remain readable without these fields.
 `status --json` exposes it as `lastWebsocketDisconnect`. Local cancellation and
 request timeouts are excluded; raw upstream messages and payloads are not stored.
+New interruption records may also include outgoing request byte/item counts,
+prewarm/continuation/reuse flags, negotiated compression, local send completion,
+and observed TCP end/error flags. `sendCompleted` means the local WebSocket send
+callback succeeded; it does not prove upstream receipt or generation. Transport
+error codes are limited to `ECONNRESET`, `EPIPE`, `ETIMEDOUT`, or `OTHER`; error
+messages and request content are never retained.
+
+Upstream WebSockets offer `permessage-deflate` compression with modest zlib
+settings and requested dictionary resets. Servers that decline compression still
+use WebSockets, and decompressed messages retain the same size limits. Compression
+reduces request bytes; it does not establish or eliminate every cause of a `1006`
+disconnect.
+
+`rotation status` also reports the number of currently open WebSocket
+connections and idle connections reclaimed to admit new work. The router status
+JSON exposes these as `websocketActiveConnections` and
+`websocketCapacityReclaims`. Its `lastWebsocketUpgradeRejection` records only a
+timestamp, reason (`origin`, `capacity`, or `repeated_disconnect`), HTTP status,
+and open-connection count. This distinguishes a rejected handshake from an
+upstream interruption without recording headers, credentials, or chat identifiers.
+The last rejection survives router restarts; connection counters reset.
+
+The router limits local WebSocket connections to 64. At that limit, a valid
+new connection can replace an idle connection used only for setup or warm-up.
+Queued work, active requests, and connections with generated response history
+are protected. If all connections are protected, native Codex recovers over HTTP
+immediately instead of retrying five rejected WebSocket handshakes.
+
+WebSocket forwarding preserves the client's beta flags without injecting the
+HTTP-only Responses beta. After an unexpected upstream disconnect, native Codex
+can retry on a fresh WebSocket. After a second disconnect within 60 seconds,
+newly submitted creates use HTTP upstream during a 60-second cooldown while the
+local WebSocket stays open. The next create after expiry tries upstream WebSockets
+automatically. Successful WebSocket generation clears the failure count; HTTP
+recovery and warm-up do not. API/ZDR handshake refusals use the same cooldown.
+Other conversations remain eligible for WebSockets, and the router never replays
+a request whose generation outcome is uncertain.
+
+An upstream create larger than 8 MiB of serialized UTF-8 after delta reduction
+uses HTTP for that request, retaining the local WebSocket. This is a conservative
+local guard, not the upstream's documented limit. Subsequent requests can use
+WebSockets when they fit. Non-generating prewarm during HTTP recovery completes
+locally without inference. At capacity, recovery can still reject the native
+upgrade; an already-fallen-back native session can retain HTTP until it is
+reinitialized because the router cannot reset native transport state.
 
 API model entries require explicit selection and never serve as automatic paid
 fallbacks; see [model route pools](../design/model-route-pools.md) for setup

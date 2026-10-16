@@ -53,6 +53,7 @@ function createRouterFixture(root: string, options: { withProxyModule?: boolean 
 				"      upstreamRequests: 1,",
 				"      websocketConnections: 3,",
 				"      websocketUpstreamRequests: 7,",
+				'      ...JSON.parse(process.env.CODEX_APP_ROUTER_TEST_ADMISSION ?? "{}"),',
 				'      lastWebsocketDisconnect: process.env.CODEX_APP_ROUTER_TEST_DISCONNECT === undefined ? { at: 123, cause: "close", stage: "streaming", closeCode: 1011 } : JSON.parse(process.env.CODEX_APP_ROUTER_TEST_DISCONNECT),',
 				"      retries: 0,",
 				"      rotations: 1,",
@@ -142,6 +143,9 @@ describe("codex app router daemon", () => {
 			expect(running.lastAccountLabel).toBe("Account 2");
 			expect(running.websocketConnections).toBe(3);
 			expect(running.websocketUpstreamRequests).toBe(7);
+			expect(running.websocketActiveConnections).toBe(0);
+			expect(running.websocketCapacityReclaims).toBe(0);
+			expect(running.lastWebsocketUpgradeRejection).toBeNull();
 			expect(running.lastWebsocketDisconnect).toEqual({at:123,cause:"close",stage:"streaming",closeCode:1011});
 			expect(running).not.toHaveProperty("clientApiKey");
 			if (process.platform !== "win32") {
@@ -268,7 +272,7 @@ it("preserves sanitized disconnect history across daemon restarts and replaces i
 	const statePath = join(root, "state.json");
 	const statusPath = join(root, "status.json");
 	await writeState(statePath, { clientApiKey: "fixture-token", host: "127.0.0.1", port: 0, statusPath });
-	const prior = { at: 123, cause: "close", stage: "streaming", closeCode: 1011, routeKind: "zdr", eventCount: 4, connectionAgeMs: 100 };
+	const prior = { at: 123, cause: "close", stage: "streaming", closeCode: 1011, routeKind: "zdr", eventCount: 4, connectionAgeMs: 100, requestBytes: 1234, inputItemCount: 2, isPrewarm: false, hasPreviousResponse: true, reusedConnection: true, sendCompleted: true, compressionNegotiated: false, transportErrorCode: "ECONNRESET", tcpEndReceived: false, tcpCloseHadError: true };
 	writeFileSync(statusPath, JSON.stringify({
 		state: "stopped",
 		lastWebsocketDisconnect: { ...prior, reason: "private-reason", authorization: "private-token" },
@@ -298,6 +302,119 @@ it("preserves sanitized disconnect history across daemon restarts and replaces i
 	try {
 		const status = await readJsonWhen(statusPath, value => value.state === "running" && value.pid === child.pid);
 		expect(status.lastWebsocketDisconnect).toBeNull();
+	} finally {
+		await stopChild(child);
+	}
+});
+
+
+it.each([
+	{ reason: "origin", status: 403 },
+	{ reason: "capacity", status: 426 },
+	{ reason: "repeated_disconnect", status: 426 },
+])("persists sanitized WebSocket admission diagnostics for $reason", async ({ reason, status }) => {
+	const root = await createTempRoot("router-admission-");
+	const scriptPath = createRouterFixture(root);
+	const statePath = join(root, "state.json");
+	const statusPath = join(root, "status.json");
+	await writeState(statePath, { clientApiKey: "fixture-token", host: "127.0.0.1", port: 0, statusPath });
+	const expected = { at: 123, reason, status, activeConnections: 64 };
+	const child = spawn(process.execPath, [scriptPath, "--status", statusPath, "--state", statePath], {
+		env: { ...process.env, CODEX_APP_ROUTER_TEST_ADMISSION: JSON.stringify({
+			websocketActiveConnections: 64,
+			websocketCapacityReclaims: 2,
+			lastWebsocketUpgradeRejection: { ...expected, authorization: "private-token", thread: "private-thread", headers: { origin: "private-origin" } },
+		}) },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	try {
+		const running = await readJsonWhen(statusPath, value => value.state === "running");
+		expect(running.websocketActiveConnections).toBe(64);
+		expect(running.websocketCapacityReclaims).toBe(2);
+		expect(running.lastWebsocketUpgradeRejection).toEqual(expected);
+		expect(JSON.stringify(running)).not.toMatch(/private-token|private-thread|private-origin/);
+	} finally {
+		await stopChild(child);
+	}
+});
+
+it.each([
+	{ reason: "capacity", status: 403, activeConnections: 64 },
+	{ reason: "origin", status: 426, activeConnections: 64 },
+	{ reason: "repeated_disconnect", status: 403, activeConnections: 64 },
+	{ reason: "private-reason", status: 426, activeConnections: 64 },
+	{ reason: "capacity", status: 426, activeConnections: 65 },
+	{ reason: "capacity", status: 426, activeConnections: -1 },
+	{ reason: "capacity", status: 426, activeConnections: 1.5 },
+	{ reason: "capacity", status: 426, activeConnections: "1" },
+	{ reason: "capacity", status: 426, activeConnections: 1, at: 8.64e15 + 1 },
+])("drops invalid WebSocket admission history: %j", async stored => {
+	const root = await createTempRoot("router-invalid-admission-");
+	const scriptPath = createRouterFixture(root);
+	const statePath = join(root, "state.json");
+	const statusPath = join(root, "status.json");
+	await writeState(statePath, { clientApiKey: "fixture-token", host: "127.0.0.1", port: 0, statusPath });
+	await writeState(statusPath, { lastWebsocketUpgradeRejection: { at: 123, ...stored } });
+	const child = spawn(process.execPath, [scriptPath, "--status", statusPath, "--state", statePath], {
+		env: { ...process.env, CODEX_APP_ROUTER_TEST_ADMISSION: JSON.stringify({
+			websocketActiveConnections: stored.activeConnections,
+			websocketCapacityReclaims: -1,
+			lastWebsocketUpgradeRejection: { at: 123, ...stored },
+		}) },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	try {
+		const running = await readJsonWhen(statusPath, value => value.state === "running");
+		expect(running.lastWebsocketUpgradeRejection).toBeNull();
+		expect(running.websocketCapacityReclaims).toBe(0);
+		if (typeof stored.activeConnections !== "number" || !Number.isSafeInteger(stored.activeConnections) || stored.activeConnections < 0 || stored.activeConnections > 64) {
+			expect(running.websocketActiveConnections).toBe(0);
+		}
+	} finally {
+		await stopChild(child);
+	}
+});
+
+it("preserves WebSocket admission history across restarts and replaces it after clock rollback", async () => {
+	const root = await createTempRoot("router-admission-history-");
+	const scriptPath = createRouterFixture(root);
+	const statePath = join(root, "state.json");
+	const statusPath = join(root, "status.json");
+	await writeState(statePath, { clientApiKey: "fixture-token", host: "127.0.0.1", port: 0, statusPath });
+	const prior = { at: 123, reason: "capacity", status: 426, activeConnections: 64 };
+	await writeState(statusPath, { lastWebsocketUpgradeRejection: { ...prior, authorization: "private-token" } });
+	for (const [live, expected] of [[null, prior], [{ ...prior, at: 100 }, { ...prior, at: 100 }]] as const) {
+		const child = spawn(process.execPath, [scriptPath, "--status", statusPath, "--state", statePath], {
+			env: { ...process.env, CODEX_APP_ROUTER_TEST_ADMISSION: JSON.stringify({ lastWebsocketUpgradeRejection: live }) },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		try {
+			const running = await readJsonWhen(statusPath, value => value.state === "running" && value.pid === child.pid);
+			expect(running.lastWebsocketUpgradeRejection).toEqual(expected);
+			expect(JSON.stringify(running)).not.toContain("private-token");
+		} finally {
+			await stopChild(child);
+		}
+	}
+});
+
+
+it.each([{ requestBytes: -1 }, { tcpEndReceived: "false" }, { transportErrorCode: "private-code" }])("rejects invalid persisted or current WebSocket transport evidence: %j", async invalid => {
+	const root = await createTempRoot("router-invalid-transport-");
+	const scriptPath = createRouterFixture(root);
+	const statePath = join(root, "state.json");
+	const statusPath = join(root, "status.json");
+	const diagnostic = { at: 123, cause: "close", stage: "awaiting_first_event", closeCode: 1006, ...invalid };
+	await writeState(statePath, { clientApiKey: "fixture-token", host: "127.0.0.1", port: 0, statusPath });
+	await writeState(statusPath, { lastWebsocketDisconnect: diagnostic });
+	const child = spawn(process.execPath, [scriptPath, "--status", statusPath, "--state", statePath], {
+		env: { ...process.env, CODEX_APP_ROUTER_TEST_DISCONNECT: JSON.stringify(diagnostic) },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	try {
+		const running = await readJsonWhen(statusPath, value => value.state === "running");
+		expect(running.lastWebsocketDisconnect).toBeNull();
+		expect(JSON.stringify(running)).not.toContain("private-code");
 	} finally {
 		await stopChild(child);
 	}

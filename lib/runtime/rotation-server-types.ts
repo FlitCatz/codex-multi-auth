@@ -1,4 +1,4 @@
-import type { WebSocketDisconnectDiagnostic } from "./responses-websocket.js";
+import type { WebSocketDisconnectDiagnostic, WebSocketUpgradeRejectionDiagnostic } from "./responses-websocket.js";
 import type { QuotaCacheData } from "../quota-cache.js";
 import type { ApiRouteCredential } from "../api-route-store.js";
 import type { AccountStorageV3 } from "../storage.js";
@@ -26,6 +26,9 @@ export interface RuntimeRotationProxyStatus {
 	lastStreamQuotaUpdateAt?: number;
  websocketConnections?: number;
  websocketUpstreamRequests?: number;
+ websocketActiveConnections?: number;
+ websocketCapacityReclaims?: number;
+ lastWebsocketUpgradeRejection?: WebSocketUpgradeRejectionDiagnostic;
  lastWebsocketDisconnect?: WebSocketDisconnectDiagnostic;
 	startedAt: number;
 	totalRequests: number;

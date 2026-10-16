@@ -1,3 +1,4 @@
+import * as modelInventory from "../lib/runtime/model-discovery-status.js";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
@@ -1299,14 +1300,14 @@ describe("runtime rotation proxy", () => {
 		expect(tokenTracker.getTokens(trackerKey, quotaKey)).toBe(before);
 	});
 
-	it("does not extend the pinned cooldown waiver to unpinned selection", async () => {
+	it.each(["server-error", "network-error"] as const)("does not extend the pinned %s cooldown waiver to unpinned selection", async reason => {
 		// allowPinnedCooldown is set only on the pinned branch. An unpinned pool
 		// must keep skipping a cooling-down account and rotate past it.
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 2));
 		const first = accountManager.getAccountByIndex(0);
 		if (!first) throw new Error("missing account");
-		accountManager.markAccountCoolingDown(first, 60_000, "server-error");
+		accountManager.markAccountCoolingDown(first, 60_000, reason);
 		const { calls, fetchImpl } = createRecordingFetch(() =>
 			textEventStream("data: ok\n\n"),
 		);
@@ -1322,6 +1323,38 @@ describe("runtime rotation proxy", () => {
 		expect(
 			calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID)),
 		).toEqual(["acc_2"]);
+	});
+
+	it("admits concurrent pinned requests despite another request's network cooldown", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 2));
+		const pinned = accountManager.getAccountByIndex(0);
+		if (!pinned) throw new Error("missing pinned account");
+		accountManager.markAccountCoolingDown(pinned, 60_000, "network-error");
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream("data: healthy\n\n"));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { forcedAccountIndex: 0 } });
+		const responses = await Promise.all(Array.from({ length: 3 }, (_, i) => postResponses(proxy, {
+			model: "gpt-5-codex", stream: true, input: [{ type: "message", role: "user", content: `independent task ${i}` }],
+		})));
+		expect(responses.map(response => response.status)).toEqual([200, 200, 200]);
+		await Promise.all(responses.map(response => response.text()));
+		expect(calls).toHaveLength(3);
+		expect(calls.map(call => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual(["acc_1", "acc_1", "acc_1"]);
+		expect(proxy.getStatus().rotations).toBe(0);
+		expect(proxy.getStatus().retries).toBe(0);
+	});
+
+	it("still enforces an open circuit beneath a pinned network cooldown", async () => {
+		const accountManager = new AccountManager(undefined, createStorage(Date.now(), 1));
+		const pinned = accountManager.getAccountByIndex(0);
+		if (!pinned) throw new Error("missing pinned account");
+		accountManager.markAccountCoolingDown(pinned, 60_000, "network-error");
+		for (let i = 0; i < 3; i++) accountManager.recordFailure(pinned, "codex", "gpt-5-codex");
+		const { calls, fetchImpl } = createRecordingFetch(() => textEventStream("data: unreachable\n\n"));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { forcedAccountIndex: 0 } });
+		const response = await postResponses(proxy, { model: "gpt-5-codex", stream: true, input: [] });
+		expect(response.status).toBe(503);
+		expect((await response.json()).error.reason).toBe("circuit-open");
+		expect(calls).toHaveLength(0);
 	});
 
 	it("still refuses a pin that arrives already cooling down from another request", async () => {
@@ -5342,15 +5375,15 @@ describe("model pool capability boundaries",()=>{
   expect(response.status).toBe(403);expect((await response.json()).error.code).toBe("model_not_available_in_account_catalog");
   expect(calls.filter(c=>c.url.includes("/responses"))).toHaveLength(0);
  });
- it("fails a stored native pin with codex_pinned_account_unavailable instead of rotating",async()=>{
+ it("keeps a stored native pin on its account despite a shared network cooldown",async()=>{
   vi.spyOn(storageMetaModule,"readStorageMetaFromDisk").mockReturnValue({pinnedAccountIndex:0,affinityGeneration:1});
   const manager=new AccountManager(undefined,createStorage(Date.now()));
   manager.markAccountCoolingDown(manager.getAccountByIndex(0)!,10*60_000,"network-error");
   const {calls,fetchImpl}=createRecordingFetch(call=>call.url.includes("/models")?Response.json({models:[{slug:"common"}]}):textEventStream('data: {"type":"response.completed","response":{}}\n\n'));
   const proxy=await startProxy({accountManager:manager,fetchImpl,options:{nativeOpenai:true}});
   const response=await postResponses(proxy,{model:"common",input:"test",stream:true});
-  expect(response.status).toBe(503);expect((await response.json()).error.code).toBe("codex_pinned_account_unavailable");
-  expect(calls.filter(c=>c.url.includes("/responses"))).toHaveLength(0);
+  expect(response.status).toBe(200);await response.text();
+  expect(calls.filter(c=>c.url.includes("/responses")).map(c=>c.headers.get("chatgpt-account-id"))).toEqual(["acc_1"]);
  });
 
  it("advertises an exclusive OAuth model and sends it only to its eligible account",async()=>{
@@ -6532,4 +6565,184 @@ describe("Luna Reserve fallback", () => {
 		expect(recorder.mock.calls.map(([input]) => input.model)).toEqual(expect.arrayContaining(["gpt-6-luna", "gpt-reserve"]));
 	});
 
+});
+
+it("waits for cold subscription discovery even when API models are already cached", async () => {
+ const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+ let release!: () => void;
+ const gate = new Promise<void>(resolve => { release = resolve; });
+ let discoveryStarted!: () => void;
+ const started = new Promise<void>(resolve => { discoveryStarted = resolve; });
+ const proxy = await startProxy({accountManager: manager, fetchImpl: async input => {
+  const url = new URL(String(input));
+  if (url.hostname === "api.openai.com") return Response.json({data: [{id: "fixture-api"}]});
+  if (url.searchParams.get("client_version") === "2.0") { discoveryStarted(); await gate; }
+  return Response.json({models: [{slug: "fixture-subscription"}]});
+ }, options: {nativeOpenai: true, readApiRoutes: async () => [{id: "fixture", label: "Fixture", kind: "zdr", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["fixture-api"]}]}});
+ await (await getModels(proxy, "/models?client_version=1.0&refresh_capabilities=1")).text();
+ let deadlineScheduled!: () => void;
+ const waiting = new Promise<"waiting">(resolve => { deadlineScheduled = () => resolve("waiting"); });
+ const realSetTimeout = globalThis.setTimeout;
+ const timerSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) => {
+  if (delay === 2000) deadlineScheduled();
+  return realSetTimeout(callback, delay, ...args);
+ });
+ const pending = getModels(proxy, "/models?client_version=2.0");
+ await started;
+ try {
+  // Race observable outcomes: the handler enters its bounded wait, or it
+  // incorrectly completes the API-only response. No wall-clock sleep.
+  expect(await Promise.race([waiting, pending.then(() => "premature")])).toBe("waiting");
+ } finally { release(); timerSpy.mockRestore(); }
+ const response = await pending;
+ expect((await response.json()).models.map((m: {slug: string}) => m.slug)).toEqual(["fixture-subscription", "zdr/fixture-api"]);
+});
+
+
+it("does not publish an API-only picker cache when cold subscription discovery exceeds the deadline", async () => {
+ const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+ let release!: () => void;
+ const gate = new Promise<void>(resolve => { release = resolve; });
+ const proxy = await startProxy({accountManager: manager, fetchImpl: async input => {
+  const url = new URL(String(input));
+  if (url.hostname === "api.openai.com") return Response.json({data: [{id: "fixture-api"}]});
+  if (url.searchParams.get("client_version") === "2.0") await gate;
+  return Response.json({models: [{slug: "fixture-subscription"}]});
+ }, options: {nativeOpenai: true, readApiRoutes: async () => [{id: "fixture", label: "Fixture", kind: "zdr", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["fixture-api"]}]}});
+ await (await getModels(proxy, "/models?client_version=1.0&refresh_capabilities=1")).text();
+ vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout"]});
+ const fakeSetTimeout = globalThis.setTimeout;
+ let deadlineScheduled!: () => void;
+ const waiting = new Promise<void>(resolve => { deadlineScheduled = resolve; });
+ const timerSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback, delay, ...args) => {
+  const timer = fakeSetTimeout(callback, delay, ...args);
+  if (delay === 2000) deadlineScheduled();
+  return timer;
+ }) as typeof setTimeout);
+ try {
+  const pending = getModels(proxy, "/models?client_version=2.0");
+  await waiting;
+  await vi.advanceTimersByTimeAsync(2000);
+  const cold = await pending;
+  expect(cold.status).toBe(503);
+  expect(await cold.json()).toMatchObject({error: {code: "account_catalog_unavailable"}});
+ } finally { release(); timerSpy.mockRestore(); vi.useRealTimers(); }
+ const ready = await getModels(proxy, "/models?client_version=2.0");
+ expect((await ready.json()).models.map((m: {slug: string}) => m.slug)).toEqual(["fixture-subscription", "zdr/fixture-api"]);
+});
+
+
+it("keeps concurrent native WebSocket creates working through a shared pinned network cooldown", async () => {
+ const upstream = createServer();
+ const wss = new WebSocketServer({server: upstream});
+ const received: Array<{model: string; reasoning: unknown; service_tier: unknown}> = [];
+ wss.on("connection", socket => socket.on("message", raw => {
+  const body = JSON.parse(raw.toString());
+  received.push({model: body.model, reasoning: body.reasoning, service_tier: body.service_tier});
+  socket.send(JSON.stringify({type: "response.completed", response: {id: `resp_${received.length}`, output: []}}));
+ }));
+ upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
+ const address = upstream.address(); if (!address || typeof address === "string") throw Error("fixture listen");
+ const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+ const pinned = manager.getAccountByIndex(0); if (!pinned) throw Error("missing pin");
+ manager.markAccountCoolingDown(pinned, 60_000, "network-error");
+ let httpCreates = 0;
+ const proxy = await startProxy({accountManager: manager, fetchImpl: async url => {
+  if (String(url).includes("/responses")) httpCreates++;
+  return Response.json({models: [{slug: "common", supported_reasoning_levels: [{effort: "ultra"}], service_tiers: [{id: "priority", name: "Fast", description: "fixture"}]}]});
+ }, options: {nativeOpenai: true, forcedAccountIndex: 0, upstreamBaseUrl: `http://127.0.0.1:${address.port}`}});
+ const clients: WebSocket[] = [];
+ try {
+  await Promise.all(Array.from({length: 3}, async () => {
+   const client = new WebSocket(proxy.baseUrl.replace("http:", "ws:") + "/responses", {headers: {authorization: `Bearer ${DEFAULT_CLIENT_API_KEY}`}});
+   clients.push(client); await once(client, "open");
+   const event = once(client, "message");
+   client.send(JSON.stringify({type: "response.create", model: "common", reasoning: {effort: "ultra"}, service_tier: "priority", input: []}));
+   expect(JSON.parse(String((await event)[0])).type).toBe("response.completed");
+   expect(client.readyState).toBe(WebSocket.OPEN);
+  }));
+  expect(received).toEqual(Array.from({length: 3}, () => ({model: "common", reasoning: {effort: "ultra"}, service_tier: "priority"})));
+  expect(httpCreates).toBe(0);
+  expect(proxy.getStatus().websocketUpstreamRequests).toBe(3);
+ } finally {
+  for (const client of clients) client.terminate();
+  await proxy.close();
+  for (const socket of wss.clients) socket.terminate();
+  wss.close(); await new Promise<void>(resolve => upstream.close(() => resolve()));
+ }
+});
+
+
+it.each([429, 503, 200])("does not confuse failed subscription discovery with a successful empty catalog (%s)", async status => {
+ const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+ const proxy = await startProxy({accountManager: manager, fetchImpl: async input => {
+  const url = new URL(String(input));
+  if (url.hostname === "api.openai.com") return Response.json({data: [{id: "fixture-api"}]});
+  if (url.searchParams.get("client_version") === "2.0") return Response.json({models: []}, {status});
+  return Response.json({models: [{slug: "fixture-subscription"}]});
+ }, options: {nativeOpenai: true, readApiRoutes: async () => [{id: "fixture", label: "Fixture", kind: "zdr", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["fixture-api"]}]}});
+ await (await getModels(proxy, "/models?client_version=1.0&refresh_capabilities=1")).text();
+ const response = await getModels(proxy, "/models?client_version=2.0");
+ expect(response.status).toBe(status === 200 ? 200 : 503);
+ if (status === 200) expect((await response.json()).models.map((m: {slug: string}) => m.slug)).toEqual(["zdr/fixture-api"]);
+ else expect(await response.json()).toMatchObject({error: {code: "account_catalog_unavailable"}});
+});
+
+it("does not publish an API-only picker cache when stale subscription refresh exceeds the deadline", async () => {
+ let now = Date.now(); let slow = false;
+ const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
+ let release!: () => void;
+ const gate = new Promise<void>(resolve => { release = resolve; });
+ const proxy = await startProxy({accountManager: manager, fetchImpl: async input => {
+  const url = new URL(String(input));
+  if (url.hostname === "api.openai.com") return Response.json({data: [{id: "fixture-api"}]});
+  if (slow) await gate;
+  return Response.json({models: [{slug: "fixture-subscription"}]});
+ }, options: {nativeOpenai: true, now: () => now, readApiRoutes: async () => [{id: "fixture", label: "Fixture", kind: "zdr", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["fixture-api"]}]}});
+ await (await getModels(proxy, "/models?client_version=1.0&refresh_capabilities=1")).text();
+ now += 16 * 60_000; slow = true;
+ vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout"]});
+ const fakeSetTimeout = globalThis.setTimeout;
+ let deadlineScheduled!: () => void;
+ const waiting = new Promise<void>(resolve => { deadlineScheduled = resolve; });
+ const timerSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback, delay, ...args) => {
+  const timer = fakeSetTimeout(callback, delay, ...args);
+  if (delay === 2000) deadlineScheduled();
+  return timer;
+ }) as typeof setTimeout);
+ try {
+  const pending = getModels(proxy, "/models?client_version=1.0");
+  await waiting;
+  await vi.advanceTimersByTimeAsync(2000);
+  const cold = await pending;
+  expect(cold.status).toBe(503);
+  expect(await cold.json()).toMatchObject({error: {code: "account_catalog_unavailable"}});
+ } finally { release(); timerSpy.mockRestore(); vi.useRealTimers(); }
+ const ready = await getModels(proxy, "/models?client_version=1.0");
+ expect((await ready.json()).models.map((m: {slug: string}) => m.slug)).toEqual(["fixture-subscription", "zdr/fixture-api"]);
+});
+
+it("returns a cached API picker immediately after successful empty subscription discovery", async () => {
+ const proxy = await startProxy({accountManager: new AccountManager(undefined, createStorage(Date.now(), 1)), fetchImpl: async input => {
+  return new URL(String(input)).hostname === "api.openai.com"
+   ? Response.json({data: [{id: "fixture-api"}]}) : Response.json({models: []});
+ }, options: {nativeOpenai: true, readApiRoutes: async () => [{id: "fixture", label: "Fixture", kind: "zdr", apiKey: "fixture-key", enabled: true, priority: 0, visibleModels: ["fixture-api"]}]}});
+ await (await getModels(proxy, "/models?client_version=1.0&refresh_capabilities=1")).text();
+ let release!: () => void;
+ const gate = new Promise<void>(resolve => { release = resolve; });
+ const saveSpy = vi.spyOn(modelInventory, "saveModelInventory").mockImplementation(async () => { await gate; });
+ let deadlineScheduled!: () => void;
+ const waiting = new Promise<"waiting">(resolve => { deadlineScheduled = () => resolve("waiting"); });
+ const realTimeout = globalThis.setTimeout;
+ const timerSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback, delay, ...args) => {
+  if (delay === 2000) deadlineScheduled();
+  return realTimeout(callback, delay, ...args);
+ }) as typeof setTimeout);
+ const pending = getModels(proxy, "/models?client_version=1.0");
+ try {
+  expect(await Promise.race([waiting, pending.then(() => "response")])).toBe("response");
+ } finally { release(); timerSpy.mockRestore(); saveSpy.mockRestore(); }
+ const response = await pending;
+ expect(response.status).toBe(200);
+ expect((await response.json()).models.map((m: {slug: string}) => m.slug)).toEqual(["zdr/fixture-api"]);
 });

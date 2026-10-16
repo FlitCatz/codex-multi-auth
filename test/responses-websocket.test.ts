@@ -264,7 +264,7 @@ it.each(["oauth", "api", "zdr"] as const)("records sanitized %s close context wi
  const ws = await f.connect();
  const before = Date.now();
  await turn(ws, {model:routeKind === "oauth" ? "shared" : `${routeKind}/shared`,input:[]});
- expect(f.stats.lastDisconnect).toEqual({at:expect.any(Number),cause:"close",stage:"streaming",closeCode:1011,routeKind,connectionAgeMs:expect.any(Number),eventCount:1});
+ expect(f.stats.lastDisconnect).toMatchObject({at:expect.any(Number),cause:"close",stage:"streaming",closeCode:1011,routeKind,connectionAgeMs:expect.any(Number),eventCount:1});
  expect(f.stats.lastDisconnect?.connectionAgeMs).toBeGreaterThanOrEqual(0);
  expect(f.stats.lastDisconnect?.at).toBeGreaterThanOrEqual(before);
  expect(JSON.stringify(f.stats)).not.toContain("secret fixture reason");
@@ -274,7 +274,7 @@ it("distinguishes invalid upstream events from transport disconnects", async () 
  const f = await fixture(ws => { ws.send("not JSON: secret"); return true; });
  const ws = await f.connect();
  await turn(ws,{model:"shared",input:[]});
- expect(f.stats.lastDisconnect).toEqual({at:expect.any(Number),cause:"invalid_event",stage:"streaming",routeKind:"oauth",connectionAgeMs:expect.any(Number),eventCount:1});
+ expect(f.stats.lastDisconnect).toMatchObject({at:expect.any(Number),cause:"invalid_event",stage:"streaming",routeKind:"oauth",connectionAgeMs:expect.any(Number),eventCount:1});
  expect(JSON.stringify(f.stats)).not.toContain("secret");
 });
 it("does not report an idle close after completion as an interrupted response", async () => {
@@ -439,13 +439,14 @@ async function customGateway(options: {
 	upstream: Server;
 	auth?: (req: IncomingMessage) => number | null;
 	outboundHeaders?: Record<string, string>;
+	maxPayloadBytes?: number;
 }) {
 	const upstreamUrl = await listen(options.upstream);
 	cleanups.push(async () => {
 		options.upstream.closeAllConnections();
 		await new Promise<void>((r) => options.upstream.close(() => r()));
 	});
-	const gateway = new ResponsesWebSocketGateway(fetch, { maxPayloadBytes: 16384 });
+	const gateway = new ResponsesWebSocketGateway(fetch, { maxPayloadBytes: options.maxPayloadBytes ?? 16384 });
 	const responses: Response[] = [];
 	const server = createServer((req, res) => {
 		gateway.handle(req, async () => {
@@ -469,8 +470,12 @@ async function customGateway(options: {
 			});
 			responses.push(response);
 			res.writeHead(response.status, Object.fromEntries(response.headers));
-			if (response.body) for await (const chunk of response.body) res.write(chunk);
-			res.end();
+			try {
+				if (response.body) for await (const chunk of response.body) res.write(chunk);
+				res.end();
+			} catch {
+				res.destroy();
+			}
 		});
 	});
 	const baseUrl = await listen(server);
@@ -569,19 +574,29 @@ it("authenticates a WebSocket upgrade that presents the client key as x-api-key"
 	expect(await g.handshakeStatus({ "x-api-key": "wrong" })).toBe(401);
 });
 
-it("forwards the client's OpenAI-Beta WebSocket flag alongside the routing flag", async () => {
+it("does not send the HTTP routing beta to the OAuth WebSocket endpoint", async () => {
 	const upstream = createServer();
 	const wss = new WebSocketServer({ server: upstream });
 	cleanups.push(async () => { for (const ws of wss.clients) ws.terminate(); wss.close(); });
 	const betas: (string | undefined)[] = [];
 	wss.on("connection", (ws, req) => {
 		betas.push(req.headers["openai-beta"] as string | undefined);
-		ws.on("message", () => ws.send(JSON.stringify({ type: "response.completed", response: { id: "resp_b", output: [] } })));
+		ws.on("message", () => {
+		// The OAuth endpoint accepts the handshake, emits metadata, then closes
+		// 1011 when the HTTP-only responses=experimental flag is combined with WS.
+		if (req.headers["openai-beta"]?.includes("responses=experimental")) {
+			ws.send(JSON.stringify({type: "codex.rate_limits"}));
+			ws.send(JSON.stringify({type: "codex.response.metadata", headers: {}}));
+			ws.close(1011);
+			return;
+		}
+		ws.send(JSON.stringify({ type: "response.completed", response: { id: "resp_b", output: [] } }));
+	});
 	});
 	const g = await customGateway({ upstream, outboundHeaders: { "chatgpt-account-id": "acc_fixture", "openai-beta": "responses=experimental" } });
 	const ws = await g.connect({ authorization: "Bearer fixture-local", "openai-beta": "responses_websockets=2026-02-06" });
-	await turn(ws, { model: "shared", input: [] });
-	expect(betas).toEqual(["responses=experimental, responses_websockets=2026-02-06"]);
+	expect((await turn(ws, { model: "shared", input: [] })).at(-1)).toMatchObject({type: "response.completed"});
+	expect(betas).toEqual(["responses_websockets=2026-02-06"]);
 });
 
 it("falls back to HTTP for an API credential whose WebSocket handshake is refused", async () => {
@@ -690,7 +705,7 @@ it.each(["transport_error","buffer_limit"] as const)("records one %s diagnostic 
 it("records a send callback failure without replaying the create",async()=>{
  const f=await fixture(undefined,{sendFailure:true});const ws=await f.connect();
  await turn(ws,{model:"shared",input:[]});
- expect(f.stats.lastDisconnect).toMatchObject({cause:"send_error",stage:"awaiting_first_event"});
+ expect(f.stats.lastDisconnect).toMatchObject({cause:"send_error",stage:"awaiting_first_event",sendCompleted:false,transportErrorCode:"OTHER",requestBytes:expect.any(Number),inputItemCount:0});
  const peer=[...f.peers][0]!;
  expect(peer.readyState).not.toBe(WebSocket.OPEN);
  if(peer.readyState!==WebSocket.CLOSED)await once(peer,"close");
@@ -711,4 +726,260 @@ it("does not diagnose response body cancellation as an upstream disconnect",asyn
  expect([...f.peers].every(peer=>peer.readyState===WebSocket.CLOSED)).toBe(true);
  expect(f.stats.upstreamRequests).toBe(1);
  expect(f.calls).toHaveLength(1);
+});
+
+it.each([
+	{name: "future client flags", current: "responses=experimental, routing=fixture", client: "responses_websockets=future, custom=one, custom=one", expected: "routing=fixture, responses_websockets=future, custom=one"},
+	{name: "missing client beta", current: "responses=experimental", client: undefined, expected: undefined},
+	{name: "explicit client HTTP beta", current: "responses=experimental", client: "responses=experimental, client=explicit", expected: "responses=experimental, client=explicit"},
+	{name: "API beta flags", current: "api=fixture", client: "responses_websockets=future", expected: "api=fixture, responses_websockets=future"},
+])("preserves beta provenance for $name", async ({current, client, expected}) => {
+	const upstream = createServer();
+	const wss = new WebSocketServer({server: upstream});
+	cleanups.push(async () => { for (const ws of wss.clients) ws.terminate(); wss.close(); });
+	const betas: (string | undefined)[] = [];
+	wss.on("connection", (ws, req) => {
+		betas.push(req.headers["openai-beta"] as string | undefined);
+		ws.on("message", () => ws.send(JSON.stringify({type: "response.completed", response: {id: "resp_beta", output: []}})));
+	});
+	const g = await customGateway({upstream, outboundHeaders: {"openai-beta": current}});
+	const headers: Record<string, string> = {authorization: "Bearer fixture-local"};
+	if (client !== undefined) headers["openai-beta"] = client;
+	const ws = await g.connect(headers);
+	expect((await turn(ws, {model: "api/fixture", input: []})).at(-1)?.type).toBe("response.completed");
+	expect(betas).toEqual([expected]);
+});
+
+
+it.each([
+	{ mode: "end", reused: false, prewarm: false },
+	{ mode: "reset", reused: false, prewarm: false },
+	{ mode: "end", reused: true, prewarm: true },
+])("records safe transport evidence for $mode before the first event (reused=$reused)", async ({ mode, reused, prewarm }) => {
+	const upstream = createServer();
+	const wss = new WebSocketServer({ server: upstream });
+	cleanups.push(async () => { for (const ws of wss.clients) ws.terminate(); wss.close(); });
+	let messages = 0;
+	let requestBytes = 0;
+	wss.on("connection", (ws, req) => ws.on("message", raw => {
+		messages++;
+		if (reused && messages === 1) {
+			ws.send(JSON.stringify({ type: "response.completed", response: { id: "resp_fixture", output: [] } }));
+			return;
+		}
+		requestBytes = Buffer.byteLength(raw.toString());
+		if (mode === "reset") req.socket.resetAndDestroy();
+		else req.socket.end();
+	}));
+	const g = await customGateway({ upstream, outboundHeaders: { "chatgpt-account-id": "acc_fixture" } });
+	const ws = await g.connect();
+	if (reused) await turn(ws, { model: "shared", input: [] });
+	const events = await turn(ws, {
+		model: "shared", input: [{ role: "user", content: "private-prompt 🔒" }],
+		...(prewarm ? { generate: false } : {}),
+		...(reused ? { previous_response_id: "resp_fixture" } : {}),
+	});
+	expect(events.at(-1)?.type).toBe("error");
+	expect(g.stats.lastDisconnect).toMatchObject({
+		cause: "close", closeCode: 1006, stage: "awaiting_first_event",
+		requestBytes, inputItemCount: 1, isPrewarm: prewarm, hasPreviousResponse: reused,
+		reusedConnection: reused, sendCompleted: true, compressionNegotiated: false,
+		tcpEndReceived: mode === "end", tcpCloseHadError: mode === "reset",
+	});
+	if (mode === "reset") expect(g.stats.lastDisconnect?.transportErrorCode).toBe("ECONNRESET");
+	else expect(g.stats.lastDisconnect).not.toHaveProperty("transportErrorCode");
+	expect(messages).toBe(reused ? 2 : 1);
+	expect(g.stats.upstreamRequests).toBe(messages);
+	expect(JSON.stringify(g.stats.lastDisconnect)).not.toMatch(/private-prompt|resp_fixture|acc_fixture/);
+});
+
+it.each(["EPIPE", "ETIMEDOUT", "private-code"])("allowlists transport error codes: %s", async code => {
+	const f = await fixture();
+	const ws = await f.connect();
+	const created = once(ws, "message");
+	const pending = turn(ws, { model: "stall", input: [] });
+	await created;
+	const peer = [...f.peers][0]!;
+	peer.emit("error", Object.assign(Error("private-error-message"), { code }));
+	await pending;
+	expect(f.stats.lastDisconnect).toMatchObject({ transportErrorCode: code === "private-code" ? "OTHER" : code });
+	expect(JSON.stringify(f.stats.lastDisconnect)).not.toMatch(/private-code|private-error-message/);
+	expect(f.stats.upstreamRequests).toBe(1);
+	peer.terminate();
+});
+
+it("negotiates bounded upstream compression and transmits the full request with fewer wire bytes", async () => {
+	const upstream = createServer();
+	const wss = new WebSocketServer({ server: upstream, perMessageDeflate: true });
+	cleanups.push(async () => { for (const ws of wss.clients) ws.terminate(); wss.close(); });
+	const received: { extensions: string; wireBytes: number; body: Record<string, unknown> }[] = [];
+	wss.on("connection", (ws, req) => {
+		const before = req.socket.bytesRead;
+		ws.on("message", raw => {
+			received.push({ extensions: ws.extensions, wireBytes: req.socket.bytesRead - before, body: JSON.parse(raw.toString()) });
+			ws.send(JSON.stringify({ type: "response.completed", response: { id: "resp_compressed", output: [] } }));
+		});
+	});
+	const g = await customGateway({ upstream, outboundHeaders: { "chatgpt-account-id": "acc_fixture" } });
+	const ws = await g.connect();
+	const input = [{ role: "user", content: [{ type: "input_text", text: "synthetic padding ".repeat(500) }] }];
+	expect((await turn(ws, { model: "shared", input })).at(-1)?.type).toBe("response.completed");
+	expect(received).toHaveLength(1);
+	expect(received[0]?.extensions).toBe("permessage-deflate");
+	expect(received[0]?.body.input).toEqual(input);
+	expect(received[0]?.wireBytes).toBeLessThan(Buffer.byteLength(JSON.stringify(input)) / 4);
+});
+
+it("enforces the decompressed upstream payload limit without replay or HTTP fallback", async () => {
+	let posts = 0, requests = 0, extensions = "";
+	const upstream = createServer((_req, res) => { posts++; res.writeHead(500); res.end(); });
+	const wss = new WebSocketServer({ server: upstream, perMessageDeflate: true });
+	cleanups.push(async () => { for (const ws of wss.clients) ws.terminate(); wss.close(); });
+	wss.on("connection", ws => {
+		extensions = ws.extensions;
+		ws.on("error", () => {});
+		ws.on("message", () => {
+			requests++;
+			ws.send(JSON.stringify({ type: "response.output_text.delta", delta: "synthetic output ".repeat(4000) }));
+		});
+	});
+	const g = await customGateway({ upstream, outboundHeaders: { "chatgpt-account-id": "acc_fixture" } });
+	const ws = await g.connect();
+	expect((await turn(ws, { model: "shared", input: [] })).at(-1)?.type).toBe("error");
+	expect(extensions).toBe("permessage-deflate");
+	expect(requests).toBe(1);
+	expect(posts).toBe(0);
+	expect(g.stats.lastDisconnect).toMatchObject({ cause: "transport_error", stage: "awaiting_first_event", eventCount: 0 });
+});
+
+
+it("routes oversized UTF-8 creates over HTTP without downgrading the client socket or generating prewarm", async () => {
+ const posts: string[] = [];
+ const upstream = createServer(async (req, res) => {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  posts.push(Buffer.concat(chunks).toString());
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.end(`data: ${JSON.stringify({type: "response.completed", response: {id: "resp_http_large", output: []}})}\n\n`);
+ });
+ const wss = new WebSocketServer({server: upstream});
+ cleanups.push(async () => { for (const ws of wss.clients) ws.terminate(); wss.close(); });
+ const creates: Record<string, unknown>[] = [];
+ wss.on("connection", ws => ws.on("message", raw => {
+  creates.push(JSON.parse(raw.toString()));
+  ws.send(JSON.stringify({type: "response.completed", response: {id: "resp_small", output: []}}));
+ }));
+ const g = await customGateway({upstream, maxPayloadBytes: 12 * 1024 * 1024, outboundHeaders: {"chatgpt-account-id": "fixture-workspace"}});
+ const ws = await g.connect();
+ const input = [{role: "user", content: "é".repeat(4 * 1024 * 1024)}];
+ expect((await turn(ws, {model: "fixture", input, generate: false})).at(-1)).toMatchObject({type: "response.completed"});
+ expect(posts).toHaveLength(0);
+ expect(creates).toHaveLength(0);
+ expect((await turn(ws, {model: "fixture", input})).at(-1)).toMatchObject({type: "response.completed"});
+ expect(posts).toHaveLength(1);
+ expect(JSON.parse(posts[0]!)).toMatchObject({input, stream: true});
+ expect(creates).toHaveLength(0);
+ expect((await turn(ws, {model: "fixture", input: []})).at(-1)).toMatchObject({type: "response.completed"});
+ expect(creates).toHaveLength(1);
+ expect(posts).toHaveLength(1);
+ expect(ws.readyState).toBe(WebSocket.OPEN);
+});
+
+
+it("retries API WebSocket support after a temporary handshake rejection", async () => {
+ const now = vi.spyOn(Date, "now").mockReturnValue(100_000);
+ let upgrades = 0;
+ let posts = 0;
+ const upstream = rejectingUpstream(404, {}, () => { posts++; });
+ upstream.on("upgrade", () => { upgrades++; });
+ const g = await customGateway({upstream});
+ const ws = await g.connect();
+ await turn(ws, {model: "api/fixture", input: []});
+ await turn(ws, {model: "api/fixture", input: []});
+ expect(upgrades).toBe(1);
+ now.mockReturnValue(160_001);
+ await turn(ws, {model: "api/fixture", input: []});
+ expect(upgrades).toBe(2);
+ expect(posts).toBe(3);
+});
+
+
+it("restores WebSockets with complete tool history after HTTP recovery without replaying failed creates", async () => {
+ const now = vi.spyOn(Date, "now").mockReturnValue(100_000);
+ const posts: Record<string, unknown>[] = [];
+ const creates: Record<string, unknown>[] = [];
+ const call = {type: "function_call", call_id: "call_recovery", name: "fixture", arguments: "{}"};
+ const upstream = createServer(async (req, res) => {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  posts.push(JSON.parse(Buffer.concat(chunks).toString()));
+  res.writeHead(200, {"content-type": "text/event-stream"});
+  res.end(`data: ${JSON.stringify({type: "response.completed", response: {id: "resp_recovery", output: [call]}})}\n\n`);
+ });
+ const wss = new WebSocketServer({server: upstream});
+ cleanups.push(async () => { for (const ws of wss.clients) ws.terminate(); wss.close(); });
+ wss.on("connection", ws => ws.on("message", raw => {
+  creates.push(JSON.parse(raw.toString()));
+  if (creates.length <= 2) ws.close(1011);
+  else ws.send(JSON.stringify({type: "response.completed", response: {id: "resp_restored", output: []}}));
+ }));
+ const g = await customGateway({upstream, outboundHeaders: {"chatgpt-account-id": "fixture-workspace"}});
+ const ws = await g.connect({authorization: "Bearer fixture-local", "thread-id": "fixture-recovery"});
+ for (let i = 0; i < 2; i++) expect((await turn(ws, {model: "fixture", input: []})).at(-1)?.type).toBe("error");
+ expect(posts).toHaveLength(0);
+ const input = [{role: "user", content: "fixture input"}];
+ expect((await turn(ws, {model: "fixture", input})).at(-1)?.type).toBe("response.completed");
+ expect(creates).toHaveLength(2);
+ now.mockReturnValue(160_001);
+ const result = {type: "function_call_output", call_id: "call_recovery", output: "done"};
+ expect((await turn(ws, {model: "fixture", previous_response_id: "resp_recovery", input: [result]})).at(-1)?.type).toBe("response.completed");
+ expect(posts).toHaveLength(1);
+ expect(creates).toHaveLength(3);
+ expect(creates[2]).toMatchObject({input: [...input, call, result]});
+ expect(creates[2]).not.toHaveProperty("previous_response_id");
+});
+
+it("keeps API handshake backoff across local reconnects and isolates credentials", async () => {
+ const now = vi.spyOn(Date, "now").mockReturnValue(100_000);
+ let upgrades = 0;
+ let posts = 0;
+ const upstream = rejectingUpstream(404, {}, () => { posts++; });
+ upstream.on("upgrade", () => { upgrades++; });
+ const outboundHeaders = {authorization: "Bearer fixture-first"};
+ const g = await customGateway({upstream, outboundHeaders});
+ const ws = await g.connect();
+ await turn(ws, {model: "api/fixture", input: []});
+ const closed = once(ws, "close"); ws.close(); await closed;
+ const replacement = await g.connect();
+ await turn(replacement, {model: "api/fixture", input: []});
+ expect(upgrades).toBe(1);
+ now.mockReturnValue(160_001);
+ await turn(replacement, {model: "api/fixture", input: []});
+ expect(upgrades).toBe(2);
+ expect(posts).toBe(3);
+ outboundHeaders.authorization = "Bearer fixture-second";
+ await turn(replacement, {model: "api/fixture", input: []});
+ expect(upgrades).toBe(3);
+});
+
+it("retains API handshake backoff for all 100 supported route credentials", async () => {
+ vi.spyOn(Date, "now").mockReturnValue(100_000);
+ let upgrades = 0;
+ const upstream = rejectingUpstream(404, {});
+ upstream.on("upgrade", () => { upgrades++; });
+ const outboundHeaders = {authorization: "Bearer fixture-0"};
+ const g = await customGateway({upstream, outboundHeaders});
+ const ws = await g.connect();
+ for (let i = 0; i < 100; i++) {
+  outboundHeaders.authorization = `Bearer fixture-${i}`;
+  await turn(ws, {model: "api/fixture", input: []});
+ }
+ expect(upgrades).toBe(100);
+ const closed = once(ws, "close"); ws.close(); await closed;
+ const replacement = await g.connect();
+ for (let i = 0; i < 100; i++) {
+  outboundHeaders.authorization = `Bearer fixture-${i}`;
+  await turn(replacement, {model: "api/fixture", input: []});
+ }
+ expect(upgrades).toBe(100);
 });

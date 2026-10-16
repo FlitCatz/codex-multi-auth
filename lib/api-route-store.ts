@@ -41,9 +41,10 @@ const routeSchema = z.object({
 	modelAccessPrograms: z.record(modelId, accessPrograms)
 		.refine(value => Object.keys(value).length <= 1000).optional(),
 });
+export const MAX_API_ROUTES = 100;
 const schema = z.object({
 	version: z.literal(1),
-	routes: z.array(routeSchema).max(100),
+	routes: z.array(routeSchema).max(MAX_API_ROUTES),
 });
 export type ApiRouteCredential = z.infer<typeof routeSchema>;
 export function getApiRoutesPath(): string {
