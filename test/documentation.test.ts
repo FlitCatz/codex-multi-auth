@@ -778,6 +778,7 @@ describe("Documentation Integrity", () => {
 		});
 		expect(packageJson.bin).toEqual({
 			mcodex: "scripts/mcodex.js",
+			"codex-ma": "scripts/codex-multi-auth.js",
 			"codex-multi-auth-app-launcher": "scripts/codex-app-launcher.js",
 			"codex-multi-auth-codex": "scripts/codex.js",
 			"codex-multi-auth": "scripts/codex-multi-auth.js",

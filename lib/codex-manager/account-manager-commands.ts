@@ -14,6 +14,7 @@ export const ACCOUNT_MANAGER_COMMANDS = new Set([
 	"login",
 	"list",
 	"status",
+	"web",
 	"limits",
 	"switch",
 	"unpin",

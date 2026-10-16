@@ -93,11 +93,15 @@ import { runRotationCommand } from "./codex-manager/commands/rotation.js";
 import {
 	runFeaturesCommand,
 	runStatusCommand,
+	type StatusCommandDeps,
 } from "./codex-manager/commands/status.js";
+import { runWebCommand } from "./web-dashboard.js";
 import { loadPersistedRuntimeObservabilitySnapshot } from "./runtime/runtime-observability.js";
 import { runSwitchCommand } from "./codex-manager/commands/switch.js";
 import { runHistoryCommand } from "./codex-manager/commands/history.js";
+import { runLocaleCommand } from "./codex-manager/commands/locale.js";
 import { runUnpinCommand } from "./codex-manager/commands/unpin.js";
+import { resolveOutputLocale } from "./locale.js";
 import { runWorkspaceCommand } from "./codex-manager/commands/workspace.js";
 import { runUsageCommand } from "./codex-manager/commands/usage.js";
 import { refreshQuotaCacheForMenu } from "./codex-manager/login-menu-data.js";
@@ -243,6 +247,7 @@ const IMPLEMENTED_FEATURES: ImplementedFeature[] = [
 	{ id: 52, name: "Why-selected and monitor diagnostics" },
 	{ id: 53, name: "Config explain, init-config templates, and debug bundle" },
 	{ id: 54, name: "mcodex convenience launcher (monitor/tmux/forward)" },
+	{ id: 55, name: "Local real-time web pool dashboard" },
 ];
 
 async function runForecast(args: string[]): Promise<number> {
@@ -394,8 +399,9 @@ type CliCommandHandler = (rest: string[]) => number | Promise<number>;
 /**
  * Shared handler for `list` and `status` (aliases of the same view).
  */
-const runListOrStatusCommand: CliCommandHandler = (rest) =>
-	runStatusCommand({
+
+function buildStatusCommandDeps(rest: string[], logInfo?: (message: string) => void): StatusCommandDeps {
+	return {
 		loadApiRoutes,
 		loadResetCreditState,
 		loadInferenceRequestTimes,
@@ -420,7 +426,27 @@ const runListOrStatusCommand: CliCommandHandler = (rest) =>
 		loadAppHelperStatus: readAppRuntimeHelperAccountSignal,
 		loadQuotaCache,
 		json: rest.includes("--json") || rest.includes("-j"),
-	});
+		compact: !rest.includes("--details") && !rest.includes("--verbose") && !rest.includes("--json") && !rest.includes("-j"),
+		locale: resolveOutputLocale(loadPluginConfig().locale),
+		...(logInfo ? { logInfo } : {}),
+	};
+}
+
+const runListOrStatusCommand: CliCommandHandler = (rest) =>
+	runStatusCommand(buildStatusCommandDeps(rest));
+
+async function loadStatusJsonSnapshot(): Promise<Record<string, unknown>> {
+	let serialized = "";
+	const exitCode = await runStatusCommand(buildStatusCommandDeps(["--json"], (message) => {
+		serialized = message;
+	}));
+	if (exitCode !== 0) throw new Error("Unable to load status snapshot.");
+	const parsed: unknown = JSON.parse(serialized);
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("Status snapshot is not an object.");
+	}
+	return parsed as Record<string, unknown>;
+}
 
 /**
  * Command registry for the `auth` dispatcher (audit roadmap §4.1.1 phase 2).
@@ -440,6 +466,10 @@ const CLI_COMMAND_HANDLERS: ReadonlyMap<string, CliCommandHandler> = new Map<
 	["login", (rest) => runAuthLogin(rest, { runForecast, createRepairCommandDeps })],
 	["list", runListOrStatusCommand],
 	["status", runListOrStatusCommand],
+	["web", (rest) => runWebCommand(rest, {
+		getStatus: loadStatusJsonSnapshot,
+		locale: resolveOutputLocale(loadPluginConfig().locale),
+	})],
 	[
 		"limits",
 		(rest) =>
@@ -628,6 +658,12 @@ const CLI_COMMAND_HANDLERS: ReadonlyMap<string, CliCommandHandler> = new Map<
 			if (subcommand === "template") {
 				return runInitConfigCommand(configArgs);
 			}
+			if (subcommand === "locale") {
+				return runLocaleCommand(configArgs, {
+					loadConfig: () => loadPluginConfig(),
+					saveConfig: savePluginConfig,
+				});
+			}
 			console.error(`Unknown config command: ${subcommand ?? "(missing)"}`);
 			return 1;
 		},
@@ -654,6 +690,28 @@ const CLI_COMMAND_HANDLERS: ReadonlyMap<string, CliCommandHandler> = new Map<
 ]);
 
 export async function runCodexMultiAuthCli(rawArgs: string[]): Promise<number> {
+	const localeArgs = [...rawArgs];
+	const previousLocaleOverride = process.env.CODEX_MULTI_AUTH_LOCALE;
+	let localeOverrideChanged = false;
+	const restoreLocaleOverride = () => {
+		if (!localeOverrideChanged) return;
+		if (previousLocaleOverride === undefined) delete process.env.CODEX_MULTI_AUTH_LOCALE;
+		else process.env.CODEX_MULTI_AUTH_LOCALE = previousLocaleOverride;
+	};
+	for (let i = 0; i < localeArgs.length; i += 1) {
+		const arg = localeArgs[i];
+		if (arg === "--locale" && localeArgs[i + 1]) {
+			process.env.CODEX_MULTI_AUTH_LOCALE = localeArgs[i + 1];
+			localeOverrideChanged = true;
+			localeArgs.splice(i, 2);
+			i -= 1;
+		} else if (typeof arg === "string" && arg.startsWith("--locale=")) {
+			process.env.CODEX_MULTI_AUTH_LOCALE = arg.slice("--locale=".length);
+			localeOverrideChanged = true;
+			localeArgs.splice(i, 1);
+			i -= 1;
+		}
+	}
 	// Lazy install setup (audit roadmap §4.5.4): app detection, Codex app bind,
 	// and launcher routing moved out of npm postinstall to the first CLI run.
 	// ensureFirstRunSetup never throws; the catch is belt-and-braces so no
@@ -665,34 +723,43 @@ export async function runCodexMultiAuthCli(rawArgs: string[]): Promise<number> {
 	applyUiThemeFromDashboardSettings(startupDisplaySettings);
 
 	const args =
-		rawArgs[0] && rawArgs[0] !== "auth" && ACCOUNT_MANAGER_COMMANDS.has(rawArgs[0])
-			? ["auth", ...rawArgs]
-			: [...rawArgs];
+		localeArgs[0] && localeArgs[0] !== "auth" && ACCOUNT_MANAGER_COMMANDS.has(localeArgs[0])
+			? ["auth", ...localeArgs]
+			: [...localeArgs];
 	if (args.length === 0) {
+		restoreLocaleOverride();
 		printUsage();
 		return 0;
 	}
 	if (args[0] === "--help" || args[0] === "-h") {
+		restoreLocaleOverride();
 		printUsage();
 		return 0;
 	}
 
 	const [root, sub, ...rest] = args;
 	if (root !== "auth") {
+		restoreLocaleOverride();
 		printUsage();
 		return 1;
 	}
 
 	const command = sub ?? "login";
 	if (command === "--help" || command === "-h") {
+		restoreLocaleOverride();
 		printUsage();
 		return 0;
 	}
 
 	const handler = CLI_COMMAND_HANDLERS.get(command);
 	if (handler) {
-		return handler(rest);
+		try {
+			return await handler(rest);
+		} finally {
+			restoreLocaleOverride();
+		}
 	}
+	restoreLocaleOverride();
 
 	console.error(`Unknown command: ${command}`);
 	printUsage();

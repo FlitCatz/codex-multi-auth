@@ -233,7 +233,7 @@ describe("cli output contracts", () => {
 		// removed or renamed line is a breaking change to the documented surface.
 		const DOCUMENTED_COMMAND_LINES = [
 			"codex-multi-auth login [--device-auth|--manual|--no-browser] [--org <org_id>]",
-			"codex-multi-auth status [--json]",
+			"codex-multi-auth status [--json|--details]",
 			"codex-multi-auth check",
 			"codex-multi-auth list [--json]",
 			"codex-multi-auth switch <index>",
@@ -305,7 +305,7 @@ describe("cli output contracts", () => {
 
 			expect(result.exitCode).toBe(0);
 			const payload = parseSingleJsonObject(result);
-			expect(sortedKeys(payload)).toEqual(["accountCount", "accounts", "activeIndex", "apiAccounts", "lastRequestedWorkspace", "lastWebsocketDisconnect", "modelInventory", "pinnedAccountIndex", "recommendationReason", "recommendedIndex", "runtimeInUseIndex", "selectionMode", "storageHealth", "storagePath", "totalAccountCount"]);
+			expect(sortedKeys(payload)).toEqual(["accountCount", "accounts", "activeIndex", "apiAccounts", "lastRequestedWorkspace", "lastWebsocketDisconnect", "modelInventory", "pinnedAccountIndex", "recommendationReason", "recommendedIndex", "runtime", "runtimeInUseIndex", "selectionMode", "storageHealth", "storagePath", "totalAccountCount"]);
 			expect(payload.lastWebsocketDisconnect).toBeNull();
 
 			expect(payload.storagePath).toBe(MOCK_STORAGE_PATH);
@@ -326,7 +326,7 @@ describe("cli output contracts", () => {
 			expect(Array.isArray(accounts)).toBe(true);
 			expect(accounts).toHaveLength(2);
 			for (const account of accounts) {
-				expect(sortedKeys(account)).toEqual(["autoPrime", "automaticOrder", "current", "enabled", "forecastQuotaUpdatedAt", "forecastRiskLevel", "forecastRiskScore", "index", "label", "lastInferenceRequestAt", "lastUsed", "markers", "priority", "quotaDrainPerHour", "quotaResetAt", "reason", "resetCreditsAvailable", "resetCreditsCheckedAt", "selectionPreference", "subscription", "subscriptionReserve"]);
+				expect(sortedKeys(account)).toEqual(["autoPrime", "automaticOrder", "current", "enabled", "forecastQuotaUpdatedAt", "forecastRiskLevel", "forecastRiskScore", "index", "label", "lastInferenceRequestAt", "lastUsed", "markers", "priority", "quota", "quotaDrainPerHour", "quotaResetAt", "reason", "resetCreditsAvailable", "resetCreditsCheckedAt", "selectionPreference", "subscription", "subscriptionReserve"]);
 				expect(account.priority).toBeTypeOf("number");
 				expect(account.autoPrime).toBe(false);
 				expect(account.subscription).toEqual({

@@ -1,4 +1,5 @@
 import { CODEX_BASE_URL, MAX_RATE_LIMIT_DELAY_MS } from "./constants.js";
+import { fetchWithProxy } from "./request/proxy-fetch.js";
 import { createCodexHeaders, getUnsupportedCodexModelInfo } from "./request/fetch-helpers.js";
 import {
 	QUOTA_PROBE_MODEL_CHAIN,
@@ -430,7 +431,7 @@ export async function fetchCodexQuotaSnapshot(
 					snapshot.diagnosticProbeRequests += 1;
 					snapshot.runtimeMetrics.diagnosticProbeRequests += 1;
 				});
-				response = await fetch(`${CODEX_BASE_URL}/codex/responses`, {
+				response = await fetchWithProxy(`${CODEX_BASE_URL}/codex/responses`, {
 					method: "POST",
 					headers,
 					body: JSON.stringify(probeBody),

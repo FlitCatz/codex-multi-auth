@@ -9,6 +9,7 @@ import type {
 import { logError } from "../logger.js";
 import { safeParseOAuthTokenResponse } from "../schemas.js";
 import { isAbortError } from "../utils.js";
+import { fetchAuth } from "./http.js";
 
 // OAuth constants (from openai/codex)
 export const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -467,7 +468,7 @@ export async function exchangeAuthorizationCode(
 	verifier: string,
 	redirectUri: string = REDIRECT_URI,
 ): Promise<TokenResult> {
-	const res = await fetch(TOKEN_URL, {
+	const res = await fetchAuth(TOKEN_URL, {
 		method: "POST",
 		headers: { "Content-Type": "application/x-www-form-urlencoded" },
 		body: new URLSearchParams({
@@ -560,7 +561,7 @@ export async function refreshAccessToken(
 	options: RefreshAccessTokenOptions = {},
 ): Promise<TokenResult> {
 	try {
-		const response = await fetch(TOKEN_URL, {
+		const response = await fetchAuth(TOKEN_URL, {
 			method: "POST",
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
 			signal: options?.signal,

@@ -2,6 +2,7 @@ import { createAutomaticApiCheck, startAutomaticApiChecks } from "./runtime/auto
 import { startAutomaticAccountChecks } from "./runtime/automatic-account-checks.js";
 import { createAutomaticSubscriptionCheck } from "./runtime/automatic-subscription-checks.js";
 import { ClientCancellationError } from "./request/client-cancellation.js";
+import { fetchWithProxy } from "./request/proxy-fetch.js";
 import { createNativeAccountStorageReader } from "./runtime/native-account-storage.js";
 import { resetSnapshotQuota } from "./runtime/reset-credits.js";
 import { createResetCreditService, loadResetCreditState } from "./runtime/account-reset-credits.js";
@@ -1157,7 +1158,7 @@ export async function startRuntimeRotationProxy(
 	const routingMutexMode = getRoutingMutexMode(pluginConfig);
 	activeAccountManager.setRoutingMutexMode(routingMutexMode);
 	const schedulingStrategy = getSchedulingStrategy(pluginConfig);
-	const fetchImpl = options.fetchImpl ?? fetch;
+	const fetchImpl = options.fetchImpl ?? fetchWithProxy;
 	const host = options.host ?? DEFAULT_HOST;
 	// Defense in depth (runtime-proxy-01): the proxy presents managed OAuth tokens
 	// and must never be reachable off-box. It is loopback-only with NO opt-out —

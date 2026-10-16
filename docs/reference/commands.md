@@ -40,7 +40,7 @@ per-project pools are a runtime-proxy routing concern, not a CLI one.
 
 ---
 
-## Subcommand inventory (31 commands)
+## Subcommand inventory (32 commands)
 
 ### Accounts and access
 
@@ -48,7 +48,8 @@ per-project pools are a runtime-proxy routing concern, not a CLI one.
 | --- | --- |
 | `codex-multi-auth login` | OAuth login; opens the interactive auth dashboard on a TTY when the pool is populated. Flags: `--device-auth`, `--manual`/`--no-browser`, `--org <org_id>`, `--preserve-selection`, `--account <index\|email\|account_id>` |
 | `codex-multi-auth login --api` | Manage API/ZDR credentials, priority, and visible models in an interactive terminal (TTY only; use alone) |
-| `codex-multi-auth status` | Account pool, pin, runtime metrics, storage summary, cached model discovery; `list` is the same command (`--json`) |
+| `codex-multi-auth status` | Human-friendly account summary, routing, runtime metrics, and quota bars showing used/remaining percentages; `list` is the same command. Use `--details` for the full diagnostic view or `--json` for automation |
+| `codex-multi-auth web` | Start the local real-time pool dashboard and open it in a browser. Options: `--host`, `--port` (default `4317`), `--token`, `--interval` (milliseconds), `--no-open` |
 | `codex-multi-auth switch <index>` | Set the active account by 1-based index and pin it for runtime routing |
 | `codex-multi-auth unpin` | Clear the manual pin set by `switch` and resume hybrid rotation |
 | `codex-multi-auth workspace <account> [workspace]` | List an account's tracked workspaces, or set its active workspace |
@@ -76,6 +77,7 @@ per-project pools are a runtime-proxy routing concern, not a CLI one.
 | `codex-multi-auth why-selected` | Explain the rotation selector's pick: `--now`/`-n` (default) or `--last`/`-l`, `--json`; exit 1 when nothing is selectable |
 | `codex-multi-auth debug bundle` | Sanitized runtime/debug snapshot: `--json` |
 | `codex-multi-auth history` | List local Codex sessions across all providers, bypassing `model_provider` filtering: `history [list\|show <id>] [--json]` |
+| `codex-multi-auth config locale` | Show or set output language: `config locale [auto\|en\|zh]`; `auto` follows `LC_ALL`, `LC_MESSAGES`, or `LANG` |
 
 ### Local governance
 
@@ -120,11 +122,20 @@ All governance state is file-backed under `~/.codex/multi-auth`.
 | `--account <index\|email\|account_id>` | login | Re-authenticate exactly one saved account. Implies `--preserve-selection`, refuses a different OAuth identity before writing, keeps a disabled account disabled, and cannot be combined with `--org` |
 | `--api` | login | Open API credential and model visibility setup; use alone |
 | `--json` | limits, verify-flagged, verify, why-selected, best, forecast, report, usage, budget, models, monitor, integrations, fix, doctor, config explain, debug bundle, history | Print machine-readable output |
+| `--locale <auto\|en\|zh>` | human-facing manager commands | Select output language for this invocation; `auto` follows the system locale |
+| `--details` | status/list | Keep the detailed diagnostic view instead of the compact summary |
 | `--csv` | usage | Print or write CSV bucket output |
 | `--explain` | forecast, report | Include reasoning details (forecast text/JSON, report text) |
 | `--live` | best, forecast, report, fix | Use live probes before decisions/output. On `fix` this also rebinds an org-sourced account id the backend no longer authorizes and syncs a rebound active account into `~/.codex/auth.json` (see [the workspace note](#codex-multi-auth-workspace)) |
 | `--model <model>` | best, forecast, report, fix | Specify model for live probe paths |
 | `--no-runtime-overlay` | forecast | Score from stored account state only; skip the runtime observability overlay |
+
+`codex-multi-auth web` serves the same sanitized status JSON used by
+`status --json` through a local HTTP page and a server-sent event stream. It
+binds to `127.0.0.1` by default and refreshes every five seconds. Binding to a
+non-loopback host requires `--token` or `CODEX_MULTI_AUTH_WEB_TOKEN`; the token
+is checked on the page, JSON, and event-stream routes. `codex-ma web` is an
+equivalent short alias.
 | `--max-accounts <n>` | report | Cap how many accounts a live report walk inspects |
 | `--max-probes <n>` | report | Cap live probes during report |
 | `--cached-only` | report | Prefer cached quota/health data over live probes |
@@ -765,6 +776,14 @@ codex-multi-auth history show <session-id> [--json]
 cwd, most-recent first; `show <id>` prints provider/originator metadata and the
 first few user messages. Reopen any session with `codex resume <id>`.
 Read-only, no network calls, never mutates state.
+
+`mcodex resume <id>` also accepts a session created by the normal `codex`
+provider. The wrapper keeps the canonical `openai` provider name for Codex's
+session lookup, then temporarily points that built-in provider at the local
+rotation proxy through `openai_base_url` so the resumed request still uses the
+managed account pool. It avoids writing `[model_providers.openai]`, which newer
+Codex versions reject as a reserved provider ID. The session files and SQLite
+state remain under the canonical `CODEX_HOME`.
 
 ---
 

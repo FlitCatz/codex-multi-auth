@@ -23,6 +23,7 @@ function schemaLog(): ScopedLogger | null {
 // ============================================================================
 
 export const PluginConfigSchema = z.object({
+	locale: z.enum(["auto", "en", "zh"]).optional(),
 	codexMode: z.boolean().optional(),
 	codexRuntimeRotationProxy: z.boolean().optional(),
 	codexTuiV2: z.boolean().optional(),

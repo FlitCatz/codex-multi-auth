@@ -5232,6 +5232,139 @@ describe("codex bin wrapper", () => {
 		});
 	}
 
+	it("keeps a native openai rollout visible while routing its resumed requests through rotation", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"const args = process.argv.slice(2);",
+			'if (args[0] === "app-server") process.exit(0);',
+			"console.log(`PROVIDER_OPENAI:${args.includes('model_provider=\\\"openai\\\"')}`);",
+			"console.log(`OPENAI_PROXY_OVERRIDE:${args.some((arg) => arg.includes('openai_base_url='))}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		const sessionId = "019ddf47-2c01-7c73-9f81-ab0cd9c1d5b7";
+		mkdirSync(join(originalHome, "sessions", "2026", "10", "16"), { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+		writeFileSync(
+			join(originalHome, "sessions", "2026", "10", "16", `rollout-2026-10-16T00-00-00-${sessionId}.jsonl`),
+			JSON.stringify({ type: "session_meta", payload: { id: sessionId, model_provider: "openai" } }) + "\n",
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["resume", sessionId], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+		const output = combinedOutput(result);
+		if (result.status !== 0) throw new Error(output);
+		expect(output).toContain("PROVIDER_OPENAI:true");
+		expect(output).toContain("OPENAI_PROXY_OVERRIDE:true");
+		await waitForFileText(markerPath, "start:http://127.0.0.1:4567\nclose\n");
+	});
+
+	// `codex resume --last` resumes the newest session recorded *in this
+	// directory*. A newer rollout from another project must not win the pick:
+	// its provider could differ and the resumed thread would silently switch
+	// transports mid-conversation (#743 review).
+	it("scopes `resume --last` to sessions recorded in the current directory", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"const args = process.argv.slice(2);",
+			'if (args[0] === "app-server") process.exit(0);',
+			'const provider = args.map((a) => a.match(/^model_provider=\\\\?"?([^"\\\\]+)/)).filter(Boolean).map((m) => m[1]).join(",");',
+			"console.log(`PROVIDER:${provider}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		const sessionDir = join(originalHome, "sessions", "2026", "10", "16");
+		mkdirSync(sessionDir, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+		const foreignId = "019ddf47-aaaa-7c73-9f81-ab0cd9c1d5aa";
+		const localId = "019ddf47-bbbb-7c73-9f81-ab0cd9c1d5bb";
+		const foreignPath = join(sessionDir, `rollout-2026-10-16T00-00-00-${foreignId}.jsonl`);
+		const localPath = join(sessionDir, `rollout-2026-10-16T00-00-01-${localId}.jsonl`);
+		writeFileSync(foreignPath, JSON.stringify({ type: "session_meta", payload: { id: foreignId, model_provider: "custom-provider", cwd: "/elsewhere/project" } }) + "\n", "utf8");
+		writeFileSync(localPath, JSON.stringify({ type: "session_meta", payload: { id: localId, model_provider: "openai", cwd: process.cwd() } }) + "\n", "utf8");
+		// The foreign rollout is newer: an unfiltered `--last` would pick it.
+		const now = new Date();
+		utimesSync(foreignPath, now, now);
+		utimesSync(localPath, new Date(now.getTime() - 60_000), new Date(now.getTime() - 60_000));
+
+		const env = {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		};
+		const scoped = runWrapper(fixtureRoot, ["resume", "--last"], env);
+		const scopedOut = combinedOutput(scoped);
+		if (scoped.status !== 0) throw new Error(scopedOut);
+		expect(scopedOut).toContain('PROVIDER:openai');
+
+		const all = runWrapper(fixtureRoot, ["resume", "--last", "--all"], env);
+		const allOut = combinedOutput(all);
+		if (all.status !== 0) throw new Error(allOut);
+		expect(allOut).not.toContain('PROVIDER:openai');
+	});
+
+	// The provider probe used to read entire rollout files; a multi-MB
+	// transcript is normal after a long session. Only a bounded prefix should
+	// be needed — the meta record is always first — so a huge file must still
+	// resolve quickly and correctly.
+	it("resolves the resume provider from a bounded prefix of a large rollout", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"const args = process.argv.slice(2);",
+			'if (args[0] === "app-server") process.exit(0);',
+			"console.log(`PROVIDER_OPENAI:${args.includes('model_provider=\\\"openai\\\"')}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		const sessionDir = join(originalHome, "sessions", "2026", "10", "16");
+		mkdirSync(sessionDir, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+		const sessionId = "019ddf47-cccc-7c73-9f81-ab0cd9c1d5cc";
+		// 2 MB of transcript after the meta line: enough that a full read would
+		// be noticeable, harmless to a bounded one.
+		writeFileSync(
+			join(sessionDir, `rollout-2026-10-16T00-00-00-${sessionId}.jsonl`),
+			JSON.stringify({ type: "session_meta", payload: { id: sessionId, model_provider: "openai" } })
+				+ "\n" + "x".repeat(2 * 1024 * 1024),
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["resume", sessionId], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+		const output = combinedOutput(result);
+		if (result.status !== 0) throw new Error(output);
+		expect(output).toContain("PROVIDER_OPENAI:true");
+		await waitForFileText(markerPath, "start:http://127.0.0.1:4567\nclose\n");
+	});
+
 	// The rotation helper injects its own options (shim args plus
 	// `-c model_provider=...`) into subcommand argv, and appending those past a
 	// `--` hands them to the subcommand as positionals instead. The separator
@@ -7304,6 +7437,28 @@ describe("codex bin wrapper", () => {
 		expect(output).toContain(
 			"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
 		);
+		expect(output).not.toContain("Retrying with");
+	});
+
+	it("keeps interactive resume stdout attached even when capture is forced", () => {
+		const fixtureRoot = createWrapperFixture();
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), "", "utf8");
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"console.error(\"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.\");",
+			"process.exit(1);",
+		]);
+
+		const result = runWrapper(fixtureRoot, ["resume", "019ddf47-2c01-7c73-9f81-ab0cd9c1d5b7"], {
+			CODEX_MULTI_AUTH_CAPTURE_FORWARD_OUTPUT: "1",
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+		});
+
+		const output = combinedOutput(result);
+		expect(result.status).toBe(1);
 		expect(output).not.toContain("Retrying with");
 	});
 

@@ -31,6 +31,14 @@
     "pluginConfig": {
       "type": "object",
       "properties": {
+        "locale": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "en",
+            "zh"
+          ]
+        },
         "codexMode": {
           "type": "boolean"
         },

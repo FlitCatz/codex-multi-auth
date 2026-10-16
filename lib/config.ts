@@ -1,6 +1,7 @@
 import { existsSync, promises as fs, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseBooleanEnv } from "./env-parsing.js";
+import { normalizeOutputLocaleSetting } from "./locale.js";
 import { stripModelEffortSuffix } from "./constants.js";
 import { withRetry, withRetrySync } from "./fs-retry.js";
 import { logWarn } from "./logger.js";
@@ -191,6 +192,7 @@ function resolvePluginConfigPath(): string | null {
  * CODEX_MODE is enabled by default for better Codex CLI parity
  */
 export const DEFAULT_PLUGIN_CONFIG: PluginConfig = {
+	locale: "auto",
 	codexMode: true,
 	codexRuntimeRotationProxy: true,
 	codexTuiV2: true,
@@ -1847,6 +1849,7 @@ function normalizeConfigExplainValue(value: unknown): unknown {
 }
 
 const CONFIG_EXPLAIN_ENTRIES: ConfigExplainMeta[] = [
+	{ key: "locale", envNames: ["CODEX_MULTI_AUTH_LOCALE"], getValue: config => normalizeOutputLocaleSetting(process.env.CODEX_MULTI_AUTH_LOCALE?.trim() || config.locale || "auto") ?? "auto" },
 	{ key: "codexMode", envNames: ["CODEX_MODE"], getValue: getCodexMode },
 	{
 		key: "codexRuntimeRotationProxy",

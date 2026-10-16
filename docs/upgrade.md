@@ -59,6 +59,41 @@ The account pool under `~/.codex/multi-auth` carries over.
 
 ## Changes To Know About
 
+### Compact `status` Output Is The Default
+
+`codex-multi-auth status` and `codex-multi-auth list` now print a compact
+table instead of the long diagnostic view. Pass `--details` to restore the
+previous per-account output. `status --json` is unchanged and remains the
+stable interface for scripts — migrate any parsing of the text output to
+`--json` or `--details`.
+
+### Local Web Dashboard (`codex-ma web`)
+
+The package now ships a `codex-ma` alias for the account manager. Run
+`codex-ma web` to open a loopback-only, live-refreshing pool dashboard in
+your browser (`--host`, `--port`, `--token`, `--interval`, `--no-open` are
+supported). This is a new package binary, not an npm script.
+
+### Locale Selection
+
+CLI output can be localized. Precedence: `--locale`, then
+`CODEX_MULTI_AUTH_LOCALE`, then the saved `locale` setting
+(`codex-multi-auth config`), then auto-detection. Accepted values are `en`,
+`zh`, and `auto`; a blank `CODEX_MULTI_AUTH_LOCALE` is treated as unset.
+
+### Proxy Environment Variables
+
+OAuth, health, quota, and runtime requests now honor `HTTP_PROXY`,
+`HTTPS_PROXY`, and `NO_PROXY` (lowercase wins when both cases are set).
+Loopback destinations always bypass configured proxies.
+
+### `resume --last` Stays On The Right Provider
+
+`codex-multi-auth-codex resume --last` (and `fork`) now resolve the provider
+from the session Codex will actually resume — the newest session for the
+current working directory unless `--all` is passed — so native `openai`
+sessions keep their native provider.
+
 ### Automatic API Checks And Disconnect Diagnostics
 
 Enabled API/ZDR routes already configured with `probeCapabilities: true` receive

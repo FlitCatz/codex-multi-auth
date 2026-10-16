@@ -28,7 +28,8 @@ Using OpenCode rather than the Codex CLI? The sibling project [`oc-codex-multi-a
 
 | Binary | Role |
 | --- | --- |
-| `codex-multi-auth` | The account manager. Runs all 31 management subcommands locally (`login`, `status`, `switch`, `forecast`, `rotation`, `fix`, ...). The `auth` prefix is optional: `codex-multi-auth login` ≡ `codex-multi-auth auth login`. |
+| `codex-multi-auth` | The account manager. Runs all management subcommands locally (`login`, `status`, `web`, `switch`, `forecast`, `rotation`, `fix`, ...). The `auth` prefix is optional: `codex-multi-auth login` ≡ `codex-multi-auth auth login`. |
+| `codex-ma` | Short alias for `codex-multi-auth`, including the local real-time web dashboard. |
 | `codex-multi-auth-codex` | Opt-in wrapper. Handles `auth ...` locally and forwards every other command to the official Codex CLI, enabling the rotation proxy for request-bearing commands. |
 | `mcodex` | Convenience launcher over the wrapper, with optional `--monitor` and `--tmux` modes. No account logic of its own. |
 | `codex-multi-auth-app-launcher` | User-level OS launcher routing helper (Windows shortcut, macOS wrapper app, Linux `.desktop`). |
@@ -52,6 +53,7 @@ codex-multi-auth login
 
 # 2. Repeat login to add more accounts, then inspect the pool
 codex-multi-auth status
+codex-ma web --no-open
 
 # 3. Probe account health and preview which account would serve next
 codex-multi-auth check

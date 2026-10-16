@@ -4,15 +4,18 @@ import { execFile, execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
 	chmodSync,
+	closeSync,
 	copyFileSync,
 	cpSync,
 	existsSync,
 	linkSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	renameSync,
 	readFileSync,
+	readSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -86,6 +89,8 @@ const APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV =
 	"CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME";
 const APP_RUNTIME_HELPER_INSTALL_APP_SERVER_SHIM_ENV =
 	"CODEX_MULTI_AUTH_APP_ROTATION_INSTALL_APP_SERVER_SHIM";
+const APP_RUNTIME_HELPER_PROVIDER_ID_ENV =
+	"CODEX_MULTI_AUTH_APP_ROTATION_PROVIDER_ID";
 const RUNTIME_ROTATION_PROXY_UPSTREAM_BASE_URL_ENV =
 	"CODEX_MULTI_AUTH_RUNTIME_PROXY_UPSTREAM_BASE_URL";
 const APP_SERVER_CONFIG_ARGS_ENV =
@@ -4264,18 +4269,33 @@ function createRuntimeRotationProxyCanonicalCodexHome(
 	proxyBaseUrl,
 	clientApiKey,
 	configTomlModule,
+	providerId = RUNTIME_ROTATION_PROXY_PROVIDER_ID,
 ) {
 	const originalCodexHome = resolveRuntimeRotationProxyOriginalCodexHome(baseEnv);
-	const providerTable = `model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}`;
-	const configArgs = [
-		`${providerTable}.name=${configTomlModule.tomlStringLiteral(APP_SERVER_ACCOUNT_DISPLAY_NAME)}`,
-		`${providerTable}.base_url=${configTomlModule.tomlStringLiteral(proxyBaseUrl)}`,
-		`${providerTable}.env_key=${configTomlModule.tomlStringLiteral("OPENAI_API_KEY")}`,
-		`${providerTable}.requires_openai_auth=false`,
-		`${providerTable}.http_headers.x-openai-actor-authorization=${configTomlModule.tomlStringLiteral("codex-multi-auth-local")}`,
-		`${providerTable}.wire_api=${configTomlModule.tomlStringLiteral("responses")}`,
-		"disable_response_storage=false",
-	].flatMap((assignment) => ["-c", assignment]);
+	// Codex reserves the built-in `openai` provider ID and rejects a
+	// `[model_providers.openai]` table before the TUI can load a session. The
+	// built-in provider has a dedicated top-level base URL setting, so use that
+	// for native OpenAI rollouts and keep `model_provider=openai` for resume
+	// catalog compatibility. Custom provider IDs still use the normal provider
+	// table because they are not reserved by Codex.
+	const configAssignments = providerId === "openai"
+		? [
+				`openai_base_url=${configTomlModule.tomlStringLiteral(proxyBaseUrl)}`,
+				"disable_response_storage=false",
+			]
+		: (() => {
+				const providerTable = `model_providers.${providerId}`;
+				return [
+					`${providerTable}.name=${configTomlModule.tomlStringLiteral(APP_SERVER_ACCOUNT_DISPLAY_NAME)}`,
+					`${providerTable}.base_url=${configTomlModule.tomlStringLiteral(proxyBaseUrl)}`,
+					`${providerTable}.env_key=${configTomlModule.tomlStringLiteral("OPENAI_API_KEY")}`,
+					`${providerTable}.requires_openai_auth=false`,
+					`${providerTable}.http_headers.x-openai-actor-authorization=${configTomlModule.tomlStringLiteral("codex-multi-auth-local")}`,
+					`${providerTable}.wire_api=${configTomlModule.tomlStringLiteral("responses")}`,
+					"disable_response_storage=false",
+				];
+			})();
+	const configArgs = configAssignments.flatMap((assignment) => ["-c", assignment]);
 
 	return {
 		args: configArgs,
@@ -5192,6 +5212,7 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 					proxyServer.baseUrl,
 					clientApiKey,
 					configTomlModule,
+					process.env[APP_RUNTIME_HELPER_PROVIDER_ID_ENV] ?? RUNTIME_ROTATION_PROXY_PROVIDER_ID,
 				)
 			: createRuntimeRotationProxyCodexHome(
 					process.env,
@@ -5211,11 +5232,12 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 			(process.env[APP_RUNTIME_HELPER_INSTALL_APP_SERVER_SHIM_ENV] ?? "1").trim() !==
 			"0";
 		if (installAppServerShim) {
+			const providerId = process.env[APP_RUNTIME_HELPER_PROVIDER_ID_ENV] ?? RUNTIME_ROTATION_PROXY_PROVIDER_ID;
 			const appServerConfigArgs = useCanonicalHome
 				? [
 						...(runtimeContext.args ?? []),
 						"-c",
-						`model_provider=${configTomlModule.tomlStringLiteral(RUNTIME_ROTATION_PROXY_PROVIDER_ID)}`,
+						`model_provider=${configTomlModule.tomlStringLiteral(providerId)}`,
 					]
 				: [];
 			appServerShimDir = installRuntimeRotationAppServerCliShim(
@@ -5402,6 +5424,8 @@ function startRuntimeRotationAppHelper(baseContext, options = {}) {
 				options.useCanonicalHome === true ? "1" : "0",
 			[APP_RUNTIME_HELPER_INSTALL_APP_SERVER_SHIM_ENV]:
 				options.installAppServerShim === false ? "0" : "1",
+			[APP_RUNTIME_HELPER_PROVIDER_ID_ENV]:
+				options.providerId ?? RUNTIME_ROTATION_PROXY_PROVIDER_ID,
 		};
 		const helper = spawn(
 			process.execPath,
@@ -5546,10 +5570,11 @@ async function createRuntimeRotationAppHelperContext(
 		}
 	};
 
+	const providerId = options.providerId ?? RUNTIME_ROTATION_PROXY_PROVIDER_ID;
 	const injectedArgs = [
 		...helperArgs,
 		"-c",
-		`model_provider=${configTomlModule.tomlStringLiteral(RUNTIME_ROTATION_PROXY_PROVIDER_ID)}`,
+		`model_provider=${configTomlModule.tomlStringLiteral(providerId)}`,
 	];
 	return {
 		// Root TUI argv can end in the optional `[PROMPT]` positional, and `--`
@@ -5684,9 +5709,11 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	// answer is needed twice below.
 	const isRootTuiLaunch = isCodexInteractiveTuiCommand(rawArgs);
 	if (isRootTuiLaunch || isCodexInteractiveResumeCommand(rawArgs)) {
+		const resumeProvider = resolveResumeSessionProvider(rawArgs, baseContext.env);
 		return startAppHelperContext({
 			detachOnExit: true,
 			useCanonicalHome: true,
+			providerId: resumeProvider === "openai" ? "openai" : RUNTIME_ROTATION_PROXY_PROVIDER_ID,
 			// Root TUI launches may carry the optional `[PROMPT]` positional
 			// (possibly forced by `--`); the provider overrides must stay on the
 			// option side of it. `resume`/`fork` keep the appended ordering their
@@ -6096,6 +6123,107 @@ function isCodexInteractiveResumeCommand(rawArgs) {
 	return command === "resume" || command === "fork";
 }
 
+// Codex filters the resume catalog by the active model provider. Keep an
+// existing native `openai` rollout visible by using the local proxy under the
+// same provider name for this invocation. This only changes the transport
+// endpoint; account selection still happens inside the rotation proxy.
+// `fork` resolves the source session's provider the same way so a forked
+// native rollout keeps `model_provider=openai` instead of being re-labeled.
+function resolveResumeSessionProvider(rawArgs, env = process.env) {
+	const command = findForwardedCommand(rawArgs);
+	if (command?.command !== "resume" && command?.command !== "fork") return null;
+	let requestedId = null;
+	let useLast = false;
+	let showAll = false;
+	for (let index = command.index + 1; index < rawArgs.length; index += 1) {
+		const arg = rawArgs[index];
+		if (arg === "--") break;
+		if (arg === "--last") { useLast = true; continue; }
+		if (arg === "--all") { showAll = true; continue; }
+		if (arg === "--help" || arg === "-h") return null;
+		if (consumesNextArg(arg)) {
+			index += 1;
+			continue;
+		}
+		if (typeof arg === "string" && arg.startsWith("-")) continue;
+		// With `--last`, a positional token is the prompt (`resume --last "…"`),
+		// not a session id — keep scanning instead of rejecting the lookup.
+		if (!/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(arg)) {
+			if (useLast) continue;
+			return null;
+		}
+		requestedId = arg;
+		break;
+	}
+	if (!requestedId && !useLast) return null;
+	const sessionsRoot = join(resolveCodexHomeDir(env), "sessions");
+	const targetSuffix = requestedId ? `-${requestedId}.jsonl`.toLowerCase() : null;
+	const currentDirectory = process.cwd();
+	const candidates = [];
+	const collectRollouts = (directory) => {
+		let entries;
+		try { entries = readdirSync(directory, { withFileTypes: true }); } catch { return; }
+		for (const entry of entries) {
+			const path = join(directory, entry.name);
+			if (entry.isDirectory()) {
+				collectRollouts(path);
+			} else if (entry.isFile() && (!targetSuffix || entry.name.toLowerCase().endsWith(targetSuffix))) {
+				let mtimeMs = 0;
+				try { mtimeMs = statSync(path).mtimeMs; } catch { /* partial rollout */ }
+				candidates.push({ path, mtimeMs });
+			}
+		}
+	};
+	collectRollouts(sessionsRoot);
+	candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	// A rollout's provider and cwd live in its first `session_meta` record, so a
+	// bounded header read is enough — loading whole multi-MB transcripts just to
+	// pick a provider would multiply resume's startup cost (#743 review).
+	for (const candidate of candidates) {
+		const meta = readRolloutSessionMeta(candidate.path);
+		if (!meta) continue;
+		// Without `--all`, Codex's `--last` picks the newest session recorded in
+		// the current directory; a newer rollout elsewhere must not win it.
+		if (!requestedId && !showAll && meta.cwd !== currentDirectory) continue;
+		return typeof meta.model_provider === "string" ? meta.model_provider : null;
+	}
+	return null;
+}
+
+function readRolloutSessionMeta(path) {
+	let fd;
+	try {
+		fd = openSync(path, "r");
+		const buffer = Buffer.alloc(64 * 1024);
+		const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+		const head = buffer.toString("utf8", 0, bytesRead);
+		for (const line of head.split(/\r?\n/).slice(0, 12)) {
+			if (!line.trim()) continue;
+			let record;
+			try {
+				record = JSON.parse(line);
+			} catch {
+				// The bounded read can cut a line mid-record; earlier records
+				// already parsed still count.
+				break;
+			}
+			if (record?.type === "session_meta" && record.payload && typeof record.payload === "object") {
+				return {
+					model_provider: record.payload.model_provider,
+					cwd: typeof record.payload.cwd === "string" ? record.payload.cwd : null,
+				};
+			}
+		}
+	} catch {
+		return null;
+	} finally {
+		if (fd !== undefined) {
+			try { closeSync(fd); } catch { /* best effort */ }
+		}
+	}
+	return null;
+}
+
 function shouldUseRuntimeRoutingForForwardedArgs(rawArgs) {
 	if (!Array.isArray(rawArgs) || rawArgs.length === 0) {
 		return true;
@@ -6169,7 +6297,16 @@ function shouldTrackForwardedRuntimeObservability(rawArgs) {
 }
 
 function shouldCaptureForwardedOutputForArgs(rawArgs, env) {
-	if (isCodexAppServerCommand(rawArgs)) {
+	// Codex's TUI and resume/fork commands require their child stdout to remain
+	// a terminal. Capturing them into a pipe (even when an explicit retry
+	// override is set) makes the official CLI abort with "stdout is not a
+	// terminal" before it can load the requested session. Interactive commands
+	// never use the wrapper's non-interactive unsupported-model retry parser.
+	if (
+		isCodexAppServerCommand(rawArgs) ||
+		isCodexInteractiveTuiCommand(rawArgs) ||
+		isCodexInteractiveResumeCommand(rawArgs)
+	) {
 		return false;
 	}
 	return shouldCaptureForwardedCodexOutput(env);

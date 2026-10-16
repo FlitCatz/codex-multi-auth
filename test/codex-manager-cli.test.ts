@@ -1058,7 +1058,7 @@ describe("codex manager cli commands", () => {
 		const logSpy = silenceConsole("log");
 		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
 
-		const exitCode = await runCodexMultiAuthCli(["auth", "list"]);
+		const exitCode = await runCodexMultiAuthCli(["auth", "list", "--details"]);
 
 		expect(exitCode).toBe(0);
 		expect(logSpy).toHaveBeenCalledWith(
@@ -1086,7 +1086,7 @@ describe("codex manager cli commands", () => {
 		const logSpy = silenceConsole("log");
 		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
 
-		const exitCode = await runCodexMultiAuthCli(["auth", "list"]);
+		const exitCode = await runCodexMultiAuthCli(["auth", "list", "--details"]);
 
 		expect(exitCode).toBe(0);
 		expect(logSpy).toHaveBeenCalledWith(
@@ -1204,6 +1204,27 @@ describe("codex manager cli commands", () => {
 
 		expect(exitCode).toBe(1);
 		expect(errorSpy).toHaveBeenCalledWith("Unknown config command: unknown");
+	});
+
+	it("dispatches the web subcommand to the dashboard handler", async () => {
+		const writeSpy = vi
+			.spyOn(process.stdout, "write")
+			.mockImplementation(() => true);
+		try {
+			const { runCodexMultiAuthCli } = await import(
+				"../lib/codex-manager.js"
+			);
+
+			const exitCode = await runCodexMultiAuthCli(["web", "--help"]);
+
+			expect(exitCode).toBe(0);
+			const output = writeSpy.mock.calls
+				.map((call) => String(call[0]))
+				.join("");
+			expect(output).toContain("Usage: codex-multi-auth web");
+		} finally {
+			writeSpy.mockRestore();
+		}
 	});
 
 	it("prints debug bundle output in json mode", async () => {
@@ -1476,7 +1497,7 @@ describe("codex manager cli commands", () => {
 		const logSpy = silenceConsole("log");
 		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
 
-		const exitCode = await runCodexMultiAuthCli(["auth", "status"]);
+		const exitCode = await runCodexMultiAuthCli(["auth", "status", "--details"]);
 
 		expect(exitCode).toBe(0);
 		expect(storageMocks.setStoragePath).toHaveBeenCalledWith(null);
@@ -2036,7 +2057,7 @@ describe("codex manager cli commands", () => {
 		const exitCode = await runCodexMultiAuthCli(["auth", "features"]);
 		expect(exitCode).toBe(0);
 		expect(errorSpy).not.toHaveBeenCalled();
-		expect(logSpy.mock.calls[0]?.[0]).toBe("Implemented features (54)");
+		expect(logSpy.mock.calls[0]?.[0]).toBe("Implemented features (55)");
 		expect(
 			logSpy.mock.calls.some((call) =>
 				String(call[0]).includes("41. Auto-switch to best account command"),

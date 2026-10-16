@@ -113,6 +113,175 @@ function createRuntimeSnapshot(
 }
 
 describe("runStatusCommand", () => {
+	it("prints a compact actionable summary without account emails", async () => {
+		const logInfo = vi.fn();
+		const deps = createStatusDeps({ compact: true, locale: "zh", logInfo });
+		await runStatusCommand(deps);
+		const output = logInfo.mock.calls.flat().join("\n");
+		expect(output).toContain("Codex Multi-Auth 状态");
+		expect(output).toContain("账号");
+		expect(output).toContain("可用");
+		expect(output).not.toContain("one@example.com");
+		expect(output).toContain("--details");
+	});
+
+	it("lists API/ZDR accounts in compact view instead of hiding them", async () => {
+		const logInfo = vi.fn();
+		const deps = createStatusDeps({
+			compact: true,
+			locale: "en",
+			logInfo,
+			loadApiRoutes: async () => [
+				{ id: "route-1", kind: "api" as const, label: "Team API", enabled: true, priority: 1, visibleModels: ["gpt-5"], apiKey: "sk-hidden" },
+				{ id: "route-2", kind: "zdr" as const, label: "ZDR pool", enabled: false, priority: 2, visibleModels: [], apiKey: "sk-hidden-2" },
+			],
+		});
+		await runStatusCommand(deps);
+		const output = logInfo.mock.calls.flat().join("\n");
+		expect(output).toContain("API/ZDR accounts");
+		expect(output).toContain("Team API");
+		expect(output).toContain("ZDR pool");
+		expect(output).toContain("1 enabled / 1 disabled");
+		expect(output).not.toContain("sk-hidden");
+	});
+
+	it("counts blocked accounts separately from ready in compact view", async () => {
+		const logInfo = vi.fn();
+		const deps = createStatusDeps({
+			compact: true,
+			locale: "en",
+			logInfo,
+			loadQuotaCache: async () => ({
+				byEmail: {
+					"one@example.com": {
+						updatedAt: 2_000,
+						status: 200,
+						model: "fixture",
+						planType: "plus",
+						primary: { usedPercent: 100, resetAtMs: 500_000, windowMinutes: 300 },
+						secondary: { usedPercent: 20, resetAtMs: 500_000, windowMinutes: 10_080 },
+					},
+				},
+				byAccountId: {},
+			}),
+		});
+		await runStatusCommand(deps);
+		const output = logInfo.mock.calls.flat().join("\n");
+		expect(output).toContain("blocked");
+		expect(output).not.toContain("2 ready");
+	});
+
+	it("derives compact quota labels from windowMinutes instead of fixed 5h/7d", async () => {
+		const logInfo = vi.fn();
+		const deps = createStatusDeps({
+			compact: true,
+			locale: "en",
+			logInfo,
+			loadQuotaCache: async () => ({
+				byEmail: {
+					"one@example.com": {
+						updatedAt: 2_000,
+						status: 200,
+						model: "fixture",
+						planType: "plus",
+						primary: { usedPercent: 40, resetAtMs: 500_000, windowMinutes: 60 },
+						secondary: { usedPercent: 10, resetAtMs: 500_000, windowMinutes: 2_880 },
+					},
+				},
+				byAccountId: {},
+			}),
+		});
+		await runStatusCommand(deps);
+		const output = logInfo.mock.calls.flat().join("\n");
+		expect(output).toContain("1h");
+		expect(output).toContain("2d");
+		expect(output).not.toContain("5h");
+		expect(output).not.toContain("7d");
+	});
+
+	it("includes runtime:null in the zero-account JSON shape", async () => {
+		const logInfo = vi.fn();
+		await runStatusCommand(createStatusDeps({
+			json: true,
+			logInfo,
+			loadAccounts: vi.fn(async () => null),
+		}));
+		const parsed = JSON.parse(logInfo.mock.calls.flat().join(""));
+		expect(parsed.runtime).toBeNull();
+		expect(parsed.accounts).toEqual([]);
+		expect(parsed.lastWebsocketDisconnect).toBeNull();
+	});
+
+	it("renders the Chinese detailed disconnect line localized", async () => {
+		const logInfo = vi.fn();
+		await runStatusCommand(createStatusDeps({
+			locale: "zh",
+			logInfo,
+			loadAppBindStatus: async () => ({
+				state: null,
+				pid: null,
+				baseUrl: null,
+				totalRequests: null,
+				lastAccountIndex: null,
+				lastAccountLabel: null,
+				lastAccountEmail: null,
+				lastAccountId: null,
+				updatedAt: null,
+				lastError: null,
+				nativeOpenai: false,
+				lastWebsocketDisconnect: {
+					at: 1_900,
+					cause: "transport_error",
+					stage: "awaiting_first_event",
+					closeCode: 1006,
+					routeKind: "oauth",
+					connectionAgeMs: 5_000,
+					eventCount: 2,
+				},
+			}),
+		}));
+		const output = logInfo.mock.calls.flat().join("\n");
+		expect(output).toContain("上次 WebSocket 断开");
+		expect(output).toContain("；原因=transport_error");
+		expect(output).not.toContain("Last WebSocket disconnect");
+	});
+
+	it("renders the detailed Chinese view with localized labels and quota bars", async () => {
+		const logInfo = vi.fn();
+		const deps = createStatusDeps({
+			locale: "zh",
+			logInfo,
+			loadAccountPolicies: async () => ({ version: 1, accounts: {} }),
+			loadQuotaCache: async () => ({
+				byEmail: {
+					"one@example.com": {
+						updatedAt: 2_000,
+						status: 200,
+						model: "fixture",
+						planType: "plus",
+						primary: { usedPercent: 97, resetAtMs: 100_000, windowMinutes: 300 },
+						secondary: { usedPercent: 15, resetAtMs: 100_000, windowMinutes: 10_080 },
+					},
+				},
+				byAccountId: {},
+			}),
+			loadRuntimeObservabilitySnapshot: async () => createRuntimeSnapshot(),
+		});
+
+		await runStatusCommand(deps);
+		const output = logInfo.mock.calls.flat().join("\n");
+		expect(output).toContain("账号");
+		expect(output).toContain("配额：");
+		expect(output).toContain("5小时 [");
+		expect(output).toContain("已用 97% · 剩余 3%");
+		expect(output).toContain("████");
+		expect(output).toContain("预测风险");
+		expect(output).not.toContain("Runtime:");
+		expect(output).not.toContain("quota:");
+		expect(output).not.toContain("forecast risk:");
+		expect(output).not.toContain("Auto-prime");
+	});
+
 	it("separates saved workspace selection from the last outgoing request scope", async () => {
 		const storage = createStorage();
 		storage.accounts[0]!.accountId = "stored-org";
@@ -151,6 +320,20 @@ describe("runStatusCommand", () => {
 		expect(deps.logInfo).toHaveBeenCalledWith("No accounts configured.");
 		expect(deps.logInfo).toHaveBeenCalledWith("Storage: /tmp/codex.json");
 		expect(deps.logInfo).toHaveBeenCalledWith("Storage health: healthy");
+	});
+
+	it("localizes empty detailed status output", async () => {
+		const logInfo = vi.fn();
+		await runStatusCommand(createStatusDeps({
+			locale: "zh",
+			logInfo,
+			loadAccounts: vi.fn(async () => null),
+		}));
+		const output = logInfo.mock.calls.flat().join("\n");
+		expect(output).toContain("未配置账号");
+		expect(output).toContain("存储健康：正常");
+		expect(output).not.toContain("No accounts configured");
+		expect(output).not.toContain("Storage health:");
 	});
 
 	it("prints intentional reset state from empty storage metadata", async () => {
@@ -781,7 +964,7 @@ it.each([
    expect(payload.selectionMode).toBe(live ? "model-priority" : "legacy-pin");
    expect(payload.accounts[0].automaticOrder).toBe(live ? 1 : null);
    log.mockClear();
-   expect(await runCodexMultiAuthCli(["status"])).toBe(0);
+   expect(await runCodexMultiAuthCli(["status", "--details"])).toBe(0);
    const output = log.mock.calls.flat().join("\n");
    expect(output).toContain("1970-01-01T00:00:01.000Z");
    expect(output).toContain("streaming");

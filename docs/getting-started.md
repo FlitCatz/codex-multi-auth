@@ -38,6 +38,7 @@ Upgrading from the old prerelease package? See [the legacy note in upgrade.md](u
 | `codex-multi-auth` | The account manager: login, list, switch, check, forecast, doctor, and other local commands |
 | `codex-multi-auth-codex` | Forwards commands to the official Codex CLI, with account rotation on by default |
 | `mcodex` | Short launcher for the wrapper; same forwarding plus `--monitor` and `--tmux` / `-t` extras |
+| `codex-ma` | Short alias for `codex-multi-auth`; includes the `web` real-time pool dashboard |
 | `codex` | Still the official CLI. This package never installs a `codex` binary |
 
 ---
@@ -109,6 +110,7 @@ codex-multi-auth unpin             # drop the pin, resume automatic selection
 codex-multi-auth check             # health plus quota windows
 codex-multi-auth forecast --live   # best account for the next session (live probes)
 codex-multi-auth status            # pool, rotation state, runtime markers
+codex-ma web                       # open the local real-time pool dashboard
 ```
 
 To re-authenticate one account without disturbing the rest:
