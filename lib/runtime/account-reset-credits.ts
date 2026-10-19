@@ -65,6 +65,13 @@ export function resetAccountLabel(account: Pick<AccountMetadataV3, "email">, ind
  const printable = email && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(email);
  return `Account ${index + 1}${printable ? ` (${email})` : ""}`;
 }
+/** Strips terminal control codes, invisible formatters, and whitespace before printing credit titles. */
+export function sanitizeCreditTitle(title: string | null | undefined): string | null {
+ if (typeof title !== "string") return null;
+ const trimmed = title.trim();
+ if (!trimmed || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(trimmed)) return null;
+ return trimmed;
+}
 export async function refreshAndPrintResetCredits(log:(message:string)=>void){
  const storage=await loadAccounts();if(!storage?.accounts.length)return;
  const manager=new AccountManager(undefined,storage);
@@ -78,7 +85,8 @@ export async function refreshAndPrintResetCredits(log:(message:string)=>void){
    if(snap?.credits?.length){
     snap.credits.forEach((c,idx)=>{
      const exp=c.expiresAt&&Number.isFinite(c.expiresAt)?new Date(c.expiresAt*1000).toLocaleString():'unknown';
-     log(`   - credit #${idx+1}: expires ${exp}${c.title?` (${c.title})`:''}`);
+     const title=sanitizeCreditTitle(c.title);
+     log(`   - credit #${idx+1}: expires ${exp}${title?` (${title})`:''}`);
     });
    }
   });

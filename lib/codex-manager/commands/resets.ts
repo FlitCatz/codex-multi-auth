@@ -1,7 +1,7 @@
 import { AccountManager } from '../../accounts.js';
 import { loadAccounts } from '../../storage.js';
 import { runWithGlobalStoragePath } from '../../storage/path-state.js';
-import { createResetCreditService, resetTargetForStoredAccount, resetAccountLabel } from '../../runtime/account-reset-credits.js';
+import { createResetCreditService, resetTargetForStoredAccount, resetAccountLabel, sanitizeCreditTitle } from '../../runtime/account-reset-credits.js';
 import { withCheckProgress } from '../../ui/check-progress.js';
 const usage='Usage: codex-multi-auth resets list [--refresh] | redeem <account-number> | auto manual|last-resort';
 export async function runResetsCommand(args:string[]):Promise<number>{
@@ -30,7 +30,8 @@ export async function runResetsCommand(args:string[]):Promise<number>{
    if(snapshot?.credits?.length){
     snapshot.credits.forEach((c,idx)=>{
      const exp=c.expiresAt&&Number.isFinite(c.expiresAt)?new Date(c.expiresAt*1000).toLocaleString():'unknown';
-     console.log(`   - credit #${idx+1}: expires ${exp}${c.title?` (${c.title})`:''}`);
+     const title=sanitizeCreditTitle(c.title);
+     console.log(`   - credit #${idx+1}: expires ${exp}${title?` (${title})`:''}`);
     });
    }
   });

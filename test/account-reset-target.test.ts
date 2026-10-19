@@ -1,5 +1,17 @@
 import { expect,it } from 'vitest';
-import { resetTargetForStoredAccount, resetAccountLabel } from '../lib/runtime/account-reset-credits.js';
+import { resetTargetForStoredAccount, resetAccountLabel, sanitizeCreditTitle } from '../lib/runtime/account-reset-credits.js';
+
+it('sanitizes credit titles and rejects control or newline characters', () => {
+ expect(sanitizeCreditTitle('Full reset')).toBe('Full reset');
+ expect(sanitizeCreditTitle('  Full reset  ')).toBe('Full reset');
+ expect(sanitizeCreditTitle('Full reset\nline 2')).toBeNull();
+ expect(sanitizeCreditTitle('Full reset\r\nline 2')).toBeNull();
+ expect(sanitizeCreditTitle('Full reset\u202E')).toBeNull();
+ expect(sanitizeCreditTitle('')).toBeNull();
+ expect(sanitizeCreditTitle('   ')).toBeNull();
+ expect(sanitizeCreditTitle(null)).toBeNull();
+ expect(sanitizeCreditTitle(undefined)).toBeNull();
+});
 it('uses the native credential binding, not an organization display alias',()=>{
  const account={recordId:'r',accountId:'native-workspace',refreshToken:'secret',addedAt:1,lastUsed:1,workspaces:[{id:'native-workspace',name:'Token account'},{id:'org-personal',name:'Personal'}],currentWorkspaceIndex:1};
  expect(resetTargetForStoredAccount(account)?.accountId).toBe('native-workspace');expect(account.currentWorkspaceIndex).toBe(1);

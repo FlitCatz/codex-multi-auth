@@ -121,14 +121,32 @@ it('prints credit expiration dates and titles when credit details are present', 
  const { resetTargetForStoredAccount } = await import('../lib/runtime/account-reset-credits.js');
  const key = resetTargetForStoredAccount({ accountId: 'workspace', email: 'reader@example.test', refreshToken: 'secret', addedAt: 1, lastUsed: 1 })!.key;
  const expiresAt = 1793300484;
+ const expectedDate = new Date(expiresAt * 1000).toLocaleString();
  f.refresh.mockResolvedValue({
   [key]: {
    updatedAt: Date.now(),
    availableCount: 1,
-   credits: [{ id: 'c1', expiresAt, title: 'Full reset' }]
+   credits: [{ expiresAt, title: 'Full reset' }]
   }
  });
  expect(await runResetsCommand(['list', '--refresh'])).toBe(0);
  expect(console.log).toHaveBeenCalledWith(expect.stringContaining('Account 1 (reader@example.test): 1 reset credits'));
- expect(console.log).toHaveBeenCalledWith(expect.stringMatching(/credit #1: expires .* \(Full reset\)/));
+ expect(console.log).toHaveBeenCalledWith(`   - credit #1: expires ${expectedDate} (Full reset)`);
+});
+
+it('sanitizes control characters and newlines from credit titles', async () => {
+ const { resetTargetForStoredAccount } = await import('../lib/runtime/account-reset-credits.js');
+ const key = resetTargetForStoredAccount({ accountId: 'workspace', email: 'reader@example.test', refreshToken: 'secret', addedAt: 1, lastUsed: 1 })!.key;
+ const expiresAt = 1793300484;
+ const expectedDate = new Date(expiresAt * 1000).toLocaleString();
+ f.refresh.mockResolvedValue({
+  [key]: {
+   updatedAt: Date.now(),
+   availableCount: 1,
+   credits: [{ expiresAt, title: 'Full reset\nfake-injected-line' }]
+  }
+ });
+ expect(await runResetsCommand(['list', '--refresh'])).toBe(0);
+ expect(console.log).toHaveBeenCalledWith(`   - credit #1: expires ${expectedDate}`);
+ expect(console.log).not.toHaveBeenCalledWith(expect.stringContaining('fake-injected-line'));
 });
