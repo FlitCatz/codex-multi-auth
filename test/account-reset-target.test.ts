@@ -62,7 +62,7 @@ it.each([
   expect(target.accountId).toBe('refused-explicit');
   const service=createResetCreditService(manager);
   const snapshots=await service.refresh([target]);
-  expect(rpc).toHaveBeenCalled();
+  expect(rpc).toHaveBeenCalledWith(expect.anything(),'account/rateLimits/read',{excludeResetCreditDetails:false});
   expect(snapshots[target.key]?.availableCount).toBe(expected);
   // The reset state stays keyed on the stored target, not the mirror id.
   expect(Object.keys((await service.status()).snapshots)).toEqual(expected===undefined?[]:[target.key]);
