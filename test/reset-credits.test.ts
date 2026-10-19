@@ -16,11 +16,21 @@ function fixture(){
  return {service,read,consume};
 }
 describe('reset credits',()=>{
- it('trusts the count, not a capped detail list; preserves unknown',()=>{
+ it('trusts the count, not a capped detail list; preserves unknown and credit details',()=>{
   expect(parseResetSnapshot(payload('a'), 'a',1).availableCount).toBe(2);
   expect(parseResetSnapshot(payload('a',null,null),'a',1).availableCount).toBeNull();
   expect(()=>parseResetSnapshot(payload('b'),'a',1)).toThrow(/identity/);
   expect(()=>parseResetSnapshot({...payload('a'),rateLimitResetCredits:{availableCount:-1}},'a',1)).toThrow();
+  const withCredits = {
+   ...payload('a'),
+   rateLimitResetCredits: {
+    availableCount: 1,
+    credits: [{ id: 'cred-1', expiresAt: 1793300484, title: 'Weekly reset' }]
+   }
+  };
+  const snap = parseResetSnapshot(withCredits, 'a', 1);
+  expect(snap.availableCount).toBe(1);
+  expect(snap.credits).toEqual([{ id: 'cred-1', expiresAt: 1793300484, title: 'Weekly reset' }]);
  });
  it('defaults to manual and does not redeem in automatic mode',async()=>{
   const f=fixture();expect(await f.service.automatic([target('a')])).toBeNull();expect(f.consume).not.toHaveBeenCalled();expect(f.read).not.toHaveBeenCalled();

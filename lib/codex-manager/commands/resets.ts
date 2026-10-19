@@ -22,7 +22,18 @@ export async function runResetsCommand(args:string[]):Promise<number>{
   const refreshed=value==='--refresh'?await withCheckProgress('Refreshing reset-credit availability',()=>service.refresh(targets)):null;
   const state=await service.status();console.log(`Automatic redemption: ${state.policy}`);
   if(state.lastRedemption){const index=(storage?.accounts??[]).findIndex(a=>resetTargetForStoredAccount(a)?.key===state.lastRedemption?.key);console.log(`Last confirmed reset: ${index>=0?`account ${index+1}`:"removed account"}; ${state.lastRedemption.outcome}; ${state.lastRedemption.automatic?"automatic":"explicit"}`);}
-  (storage?.accounts??[]).forEach((a,i)=>{const target=resetTargetForStoredAccount(a);const ambiguous=target&&(keyCounts.get(target.key)??0)>1;const snapshot=target&&!ambiguous?(refreshed??state.snapshots)[target.key]:undefined;console.log(`${resetAccountLabel(a,i)}: ${snapshot?.availableCount??'unknown'} reset credits${snapshot?` (checked ${Math.max(0,Math.floor((Date.now()-snapshot.updatedAt)/1000))}s ago)`:''}${ambiguous?' [ambiguous account identity; repair duplicate records]':''}${target?.key===state.pending?.key?' [redemption pending; retry this account]':''}`);});
+  (storage?.accounts??[]).forEach((a,i)=>{
+   const target=resetTargetForStoredAccount(a);
+   const ambiguous=target&&(keyCounts.get(target.key)??0)>1;
+   const snapshot=target&&!ambiguous?(refreshed??state.snapshots)[target.key]:undefined;
+   console.log(`${resetAccountLabel(a,i)}: ${snapshot?.availableCount??'unknown'} reset credits${snapshot?` (checked ${Math.max(0,Math.floor((Date.now()-snapshot.updatedAt)/1000))}s ago)`:''}${ambiguous?' [ambiguous account identity; repair duplicate records]':''}${target?.key===state.pending?.key?' [redemption pending; retry this account]':''}`);
+   if(snapshot?.credits?.length){
+    snapshot.credits.forEach((c,idx)=>{
+     const exp=c.expiresAt&&Number.isFinite(c.expiresAt)?new Date(c.expiresAt*1000).toLocaleString():'unknown';
+     console.log(`   - credit #${idx+1}: expires ${exp}${c.title?` (${c.title})`:''}`);
+    });
+   }
+  });
   const failed=refreshed?targets.filter(target=>(keyCounts.get(target.key)??0)>1||!refreshed[target.key]).length:0;
   if(failed){console.error(`${failed} of ${targets.length} reset-credit reads failed. Check account authentication and the native Codex backend (CODEX_MULTI_AUTH_USAGE_CODEX_BIN selects an executable). No credits were redeemed.`);return 1;}
   return 0;

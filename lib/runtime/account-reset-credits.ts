@@ -44,7 +44,7 @@ export function createResetCreditService(manager?:AccountManager):ResetCreditSer
    // applies). Verify the reply against that id; the snapshot stays keyed on the target.
    const freshAuth=await auth(target);
    const sent=codexCliAccountIdFor(freshAuth,freshAuth.accessToken)??freshAuth.accountId;
-   const reply=await nativeRateLimitsRpc(freshAuth,'account/rateLimits/read',{excludeResetCreditDetails:true});
+   const reply=await nativeRateLimitsRpc(freshAuth,'account/rateLimits/read',{excludeResetCreditDetails:false});
    if(!isRecord(reply)||reply.accountId!==sent)throw Error('Reset credit workspace identity mismatch');
    return {...reply,accountId:target.accountId};
   },
@@ -71,6 +71,16 @@ export async function refreshAndPrintResetCredits(log:(message:string)=>void){
  const targets=storage.accounts.map(resetTargetForStoredAccount).filter((t):t is ResetTarget=>Boolean(t));
  try{
   const snapshots=await withCheckProgress(`Checking reset credits for ${targets.length} accounts`,()=>createResetCreditService(manager).refresh(targets),log);
-  storage.accounts.forEach((a,i)=>{const target=resetTargetForStoredAccount(a);const count=target?snapshots[target.key]?.availableCount:undefined;log(`${resetAccountLabel(a,i)}: available subscription resets: ${count??'unknown (not verified)'}`);});
+  storage.accounts.forEach((a,i)=>{
+   const target=resetTargetForStoredAccount(a);
+   const snap=target?snapshots[target.key]:undefined;
+   log(`${resetAccountLabel(a,i)}: available subscription resets: ${snap?.availableCount??'unknown (not verified)'}`);
+   if(snap?.credits?.length){
+    snap.credits.forEach((c,idx)=>{
+     const exp=c.expiresAt&&Number.isFinite(c.expiresAt)?new Date(c.expiresAt*1000).toLocaleString():'unknown';
+     log(`   - credit #${idx+1}: expires ${exp}${c.title?` (${c.title})`:''}`);
+    });
+   }
+  });
  }finally{await manager.flushPendingSave();}
 }

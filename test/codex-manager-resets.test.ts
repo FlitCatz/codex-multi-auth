@@ -116,3 +116,19 @@ it('accepts a successful read whose credit count is unavailable', async () => {
  expect(console.error).not.toHaveBeenCalled();
  expect(console.log).toHaveBeenCalledWith(expect.stringContaining('unknown reset credits (checked'));
 });
+
+it('prints credit expiration dates and titles when credit details are present', async () => {
+ const { resetTargetForStoredAccount } = await import('../lib/runtime/account-reset-credits.js');
+ const key = resetTargetForStoredAccount({ accountId: 'workspace', email: 'reader@example.test', refreshToken: 'secret', addedAt: 1, lastUsed: 1 })!.key;
+ const expiresAt = 1793300484;
+ f.refresh.mockResolvedValue({
+  [key]: {
+   updatedAt: Date.now(),
+   availableCount: 1,
+   credits: [{ id: 'c1', expiresAt, title: 'Full reset' }]
+  }
+ });
+ expect(await runResetsCommand(['list', '--refresh'])).toBe(0);
+ expect(console.log).toHaveBeenCalledWith(expect.stringContaining('Account 1 (reader@example.test): 1 reset credits'));
+ expect(console.log).toHaveBeenCalledWith(expect.stringMatching(/credit #1: expires .* \(Full reset\)/));
+});
