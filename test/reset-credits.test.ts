@@ -30,7 +30,8 @@ describe('reset credits',()=>{
   };
   const snap = parseResetSnapshot(withCredits, 'a', 1);
   expect(snap.availableCount).toBe(1);
-  expect(snap.credits).toEqual([{ id: 'cred-1', expiresAt: 1793300484, title: 'Weekly reset' }]);
+  expect(snap.credits).toEqual([{ expiresAt: 1793300484, title: 'Weekly reset' }]);
+  expect(snap.credits?.[0]).not.toHaveProperty('id');
  });
  it('defaults to manual and does not redeem in automatic mode',async()=>{
   const f=fixture();expect(await f.service.automatic([target('a')])).toBeNull();expect(f.consume).not.toHaveBeenCalled();expect(f.read).not.toHaveBeenCalled();

@@ -10,26 +10,27 @@ import { MAX_RATE_LIMIT_DELAY_MS } from '../constants.js';
 
 export interface ResetTarget { key: string; accountId: string }
 export interface ResetCreditDetail {
-	id?: string | null;
 	status?: string | null;
 	grantedAt?: number | null;
 	expiresAt?: number | null;
 	title?: string | null;
 	description?: string | null;
 }
-const creditDetailSchema=z.object({id:z.string().nullish(),status:z.string().nullish(),grantedAt:z.number().nullish(),expiresAt:z.number().nullish(),title:z.string().nullish(),description:z.string().nullish()}).passthrough();
+const creditRpcItemSchema=z.object({id:z.string().nullish(),status:z.string().nullish(),grantedAt:z.number().nullish(),expiresAt:z.number().nullish(),title:z.string().nullish(),description:z.string().nullish()}).passthrough();
+const creditDetailSchema=z.object({status:z.string().nullish(),grantedAt:z.number().nullish(),expiresAt:z.number().nullish(),title:z.string().nullish(),description:z.string().nullish()}).passthrough();
 const windowSchema=z.object({usedPercent:z.number().min(0).max(100).optional(),resetsAt:z.number().nonnegative().nullish(),windowDurationMins:z.number().nonnegative().nullish()});
 const snapshotSchema=z.object({updatedAt:z.number(),availableCount:z.number().int().nonnegative().nullable(),credits:z.array(creditDetailSchema).nullish(),ordinaryUsageAllowed:z.boolean().nullable(),planType:z.string().nullable(),primary:windowSchema,secondary:windowSchema});
 export type ResetSnapshot=z.infer<typeof snapshotSchema>;
 const stateSchema=z.object({version:z.literal(1),policy:z.enum(['manual','last-resort']).default('manual'),snapshots:z.record(z.string(),snapshotSchema).default({}),pending:z.object({key:z.string(),idempotencyKey:z.string().uuid()}).optional(),lastAutomaticCheckAt:z.number().optional(),lastRedemptionAt:z.number().optional(),lastRedemption:z.object({key:z.string(),at:z.number(),outcome:z.enum(['reset','nothingToReset','noCredit','alreadyRedeemed']),automatic:z.boolean()}).optional()});
 type State=z.infer<typeof stateSchema>;
-const readSchema=z.object({accountId:z.string(),ordinaryUsageAllowed:z.boolean().nullish(),rateLimitResetCredits:z.object({availableCount:z.number().int().nonnegative(),credits:z.array(creditDetailSchema).nullish()}).nullish(),rateLimits:z.object({planType:z.string().nullish(),primary:windowSchema.nullish(),secondary:windowSchema.nullish()})});
+const readSchema=z.object({accountId:z.string(),ordinaryUsageAllowed:z.boolean().nullish(),rateLimitResetCredits:z.object({availableCount:z.number().int().nonnegative(),credits:z.array(creditRpcItemSchema).nullish()}).nullish(),rateLimits:z.object({planType:z.string().nullish(),primary:windowSchema.nullish(),secondary:windowSchema.nullish()})});
 const outcomeSchema=z.object({outcome:z.enum(['reset','nothingToReset','noCredit','alreadyRedeemed'])});
 export type ResetOutcome=z.infer<typeof outcomeSchema>['outcome'];
 export function parseResetSnapshot(value:unknown,accountId:string,now:number):ResetSnapshot {
  const parsed=readSchema.parse(value);
  if(parsed.accountId!==accountId)throw Error('Reset credit workspace identity mismatch');
- return {updatedAt:now,availableCount:parsed.rateLimitResetCredits?.availableCount??null,credits:parsed.rateLimitResetCredits?.credits??null,ordinaryUsageAllowed:parsed.ordinaryUsageAllowed??null,planType:parsed.rateLimits.planType??null,primary:parsed.rateLimits.primary??{},secondary:parsed.rateLimits.secondary??{}};
+ const credits=parsed.rateLimitResetCredits?.credits?.map(({id:_id,...rest})=>rest)??null;
+ return {updatedAt:now,availableCount:parsed.rateLimitResetCredits?.availableCount??null,credits,ordinaryUsageAllowed:parsed.ordinaryUsageAllowed??null,planType:parsed.rateLimits.planType??null,primary:parsed.rateLimits.primary??{},secondary:parsed.rateLimits.secondary??{}};
 }
 export function resetSnapshotQuota(snapshot:ResetSnapshot):QuotaCacheEntry {
  // A bogus resetsAt must not read as a window that never resets.
