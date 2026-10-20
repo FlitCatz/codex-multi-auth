@@ -68,6 +68,7 @@ import {
 	HTTP_STATUS,
 	LUNA_RESERVE_MODEL,
 	MAX_RATE_LIMIT_DELAY_MS,
+	RATE_LIMIT_CACHE_TTL_MS,
 	OPENAI_HEADERS,
 	OPENAI_HEADER_VALUES,
 	URL_PATHS,
@@ -3275,7 +3276,7 @@ async function handleRequestInner(
 					const confirmedKey = confirmedQuotaExhaustionKey(context.family, context.model);
 					const confirmedResetAt =
 						state.now() +
-						Math.min(Math.max(0, Math.floor(retryAfterMs)), MAX_RATE_LIMIT_DELAY_MS);
+						Math.min(Math.max(0, Math.floor(retryAfterMs)), RATE_LIMIT_CACHE_TTL_MS);
 					rateLimitState.account.rateLimitResetTimes[confirmedKey] = Math.max(
 						rateLimitState.account.rateLimitResetTimes[confirmedKey] ?? 0,
 						confirmedResetAt,

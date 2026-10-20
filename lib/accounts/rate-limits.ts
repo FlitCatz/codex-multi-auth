@@ -3,7 +3,7 @@
  * Extracted from accounts.ts to reduce module size and improve cohesion.
  */
 
-import { LUNA_RESERVE_MODEL } from "../constants.js";
+import { LUNA_RESERVE_MODEL, RATE_LIMIT_CACHE_TTL_MS } from "../constants.js";
 import { nowMs } from "../utils.js";
 import type { ModelFamily } from "../prompts/codex.js";
 
@@ -41,6 +41,25 @@ export interface RateLimitState {
 
 export interface RateLimitedEntity {
 	rateLimitResetTimes: RateLimitState;
+}
+
+/**
+ * Bound legacy persisted routing deadlines once, when loading the account.
+ * These deadlines schedule revalidation; quota snapshots retain upstream resets.
+ * Never call this on every selection: that would slide the deadline indefinitely.
+ */
+export function boundRateLimitCache(
+	times: RateLimitState,
+	now = nowMs(),
+): RateLimitState {
+	return Object.fromEntries(
+		Object.entries(times).map(([key, until]) => [
+			key,
+			typeof until === "number"
+				? Math.min(until, now + RATE_LIMIT_CACHE_TTL_MS)
+				: until,
+		]),
+	);
 }
 
 export function clearExpiredRateLimits(entity: RateLimitedEntity): void {

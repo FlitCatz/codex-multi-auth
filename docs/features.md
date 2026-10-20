@@ -57,6 +57,15 @@ The proxy also forwards model discovery, image generation/edits, and Codex dicta
 
 ---
 
+## Hourly quota revalidation
+
+Account rate-limit deadlines and preemptive quota deferrals are bounded to one
+hour. Cached exhausted usage older than an hour is unknown for routing purposes.
+The next eligible request checks the server again on the same pinned account;
+a fresh 429 renews the local block. Shorter server retry windows still apply.
+Authentication failures, circuit breakers, disabled accounts, and policy blocks
+are unaffected. No background inference or automatic reset redemption is added.
+
 ## Local Governance
 
 All of this is file-backed under `~/.codex/multi-auth`. Nothing is a hosted or multi-user service.

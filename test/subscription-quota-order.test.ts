@@ -27,11 +27,11 @@ describe("subscription quota order",()=>{
  });
 });
 
-it("reserves exactly five percent and keeps exhaustion until reset even if the observation ages",async()=>{
+it("reserves exactly five percent and stops treating hourly stale observations as exhausted",async()=>{
  const {usesSubscriptionReserve}=await import("../lib/runtime/subscription-quota-order.js");
  expect(usesSubscriptionReserve(subscriptionQuotaPreference(quota(5.1,1),now))).toBe(false);
  expect(usesSubscriptionReserve(subscriptionQuotaPreference(quota(5,1),now))).toBe(true);
- expect(subscriptionQuotaPreference({...quota(0,24),updatedAt:now-3600000},now).exhausted).toBe(true);
+ expect(subscriptionQuotaPreference({...quota(0,24),updatedAt:now-3600000},now).exhausted).toBe(false);
  expect(subscriptionQuotaPreference({...quota(0,-1),updatedAt:now-3600000},now).exhausted).toBe(false);
 });
 

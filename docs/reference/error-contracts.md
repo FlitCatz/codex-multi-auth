@@ -182,6 +182,13 @@ contributes to selection skip reasons such as `policy-blocked`.
 
 ---
 
+### Rate-limit cache deadlines
+
+The rate-limit contribution to `reset_at` / `retry_after_ms` is a local
+revalidation deadline, at most one hour after the rejection, not a promise that
+the subscription window has reset. Quota snapshots keep the server reset time
+for display. A later cooldown or circuit-breaker deadline may still block use.
+
 ## Options-object compatibility contract
 
 For selected exported helpers, options-object forms were added without removing

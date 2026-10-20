@@ -11,7 +11,7 @@ import * as zlib from "node:zlib";
 import { AccountManager, getRuntimeTrackerKey } from "../lib/accounts.js";
 import { getModelFamily } from "../lib/prompts/codex.js";
 import { CodexValidationError } from "../lib/errors.js";
-import { HTTP_STATUS, OPENAI_HEADERS } from "../lib/constants.js";
+import { HTTP_STATUS, OPENAI_HEADERS, RATE_LIMIT_CACHE_TTL_MS } from "../lib/constants.js";
 import {
 	startRuntimeRotationProxy,
 	buildTokenInvalidationBody,
@@ -1042,6 +1042,44 @@ describe("runtime rotation proxy", () => {
 		});
 	});
 
+	it("revalidates a hard pin after an hour and renews a genuine upstream rejection", async () => {
+		let clock = Date.now() - 3 * RATE_LIMIT_CACHE_TTL_MS;
+		vi.spyOn(Date, "now").mockImplementation(() => clock);
+		const stored = createStorage(clock, 2);
+		for (const row of stored.accounts) row.expiresAt = clock + 24 * RATE_LIMIT_CACHE_TTL_MS;
+		const accountManager = new AccountManager(undefined, stored);
+		let exhausted = true;
+		const { calls, fetchImpl } = createRecordingFetch(() => exhausted
+			? new Response(JSON.stringify({ error: { type: "usage_limit_reached", message: "Quota exhausted" } }), {
+				status: 429,
+				headers: { "retry-after": "604800", "x-codex-primary-used-percent": "100", "x-codex-primary-reset-after-seconds": "604800" },
+			})
+			: textEventStream("data: recovered\n\n"));
+		const proxy = await startProxy({ accountManager, fetchImpl, options: { forcedAccountIndex: 0, now: () => clock } });
+		const send = () => postResponses(proxy, { model: "gpt-5-codex", stream: true, input: [] });
+		const first = await send();
+		await first.text();
+		expect(first.status).toBe(503);
+		expect(calls).toHaveLength(1);
+		clock += RATE_LIMIT_CACHE_TTL_MS - 1;
+		await (await send()).text();
+		expect(calls).toHaveLength(1);
+		clock += 1;
+		await (await send()).text();
+		expect(calls).toHaveLength(2);
+		// A fresh 429 must renew the block; an external reset is not assumed.
+		clock += RATE_LIMIT_CACHE_TTL_MS - 1;
+		await (await send()).text();
+		expect(calls).toHaveLength(2);
+		clock += 1;
+		exhausted = false;
+		const recovered = await send();
+		expect(recovered.status).toBe(200);
+		await recovered.text();
+		expect(calls).toHaveLength(3);
+		expect(calls.every(call => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID) === "acc_1")).toBe(true);
+	});
+
 	it("retries a healthy forced pin after a zero-cooldown upstream 503", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
@@ -1646,7 +1684,7 @@ describe("runtime rotation proxy", () => {
 		// The human sentence and machine-readable reason now agree on the 429's
 		// live blocker and its persisted recovery deadline.
 		expect(payload.error.message).toContain("(rate-limited)");
-		expect(payload.error.message).toContain("the rate limit resets at");
+		expect(payload.error.message).toContain("the cached rate limit will be rechecked at");
 		expect(payload.error.message).not.toContain("already-attempted");
 		expect(payload.error.message).toContain("launcher");
 		expect(payload.error.message).not.toContain("unpin");
@@ -2582,7 +2620,7 @@ describe("runtime rotation proxy", () => {
 		expect(
 			(accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5.2"] ?? 0) -
 				Date.now(),
-		).toBeGreaterThan(60 * 60 * 1_000);
+		).toBeLessThanOrEqual(RATE_LIMIT_CACHE_TTL_MS);
 	});
 
 	it("keeps quota snapshots attached to account identity across index changes", () => {

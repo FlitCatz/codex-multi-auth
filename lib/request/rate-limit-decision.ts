@@ -260,7 +260,7 @@ const DEADLINE_SENTENCES: Record<DeadlineNoun, (resetAt: string) => string> = {
 		`the account is expected to be available again at ${resetAt}`,
 	"next-attempt": (resetAt) => `the next attempt is allowed at ${resetAt}`,
 	"cooldown-ends": (resetAt) => `the cooldown ends at ${resetAt}`,
-	"rate-limit-reset": (resetAt) => `the rate limit resets at ${resetAt}`,
+	"rate-limit-reset": (resetAt) => `the cached rate limit will be rechecked at ${resetAt}`,
 };
 
 interface BlockerDescription {

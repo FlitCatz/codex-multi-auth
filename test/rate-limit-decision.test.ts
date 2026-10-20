@@ -311,7 +311,7 @@ describe("buildPinnedUnavailableErrorBody", () => {
 		expect(body.reset_at).toBe(new Date(resetAtMs).toISOString());
 		expect(body.retry_after_ms).toBe(30_000);
 		expect(body.message).toContain(
-			`the rate limit resets at ${new Date(resetAtMs).toISOString()}`,
+			`the cached rate limit will be rechecked at ${new Date(resetAtMs).toISOString()}`,
 		);
 		// A forced pin is not cleared by `unpin`; the remedy must not suggest it.
 		expect(body.message).toContain("set by this session's launcher");
@@ -390,7 +390,7 @@ describe("buildPinnedUnavailableErrorBody", () => {
 		expect(body.reason).toBe("rate-limited");
 		expect(body.message).toContain("(rate-limited)");
 		expect(body.message).toContain(
-			`the rate limit resets at ${new Date(resetAtMs).toISOString()}`,
+			`the cached rate limit will be rechecked at ${new Date(resetAtMs).toISOString()}`,
 		);
 	});
 
@@ -407,7 +407,7 @@ describe("buildPinnedUnavailableErrorBody", () => {
 			},
 		);
 		expect(body.message).toContain(
-			`the rate limit resets at ${new Date(resetAtMs).toISOString()}`,
+			`the cached rate limit will be rechecked at ${new Date(resetAtMs).toISOString()}`,
 		);
 	});
 
@@ -524,7 +524,7 @@ describe("buildPinnedUnavailableErrorBody", () => {
 		);
 		expect(body.message).toContain("(rate-limited)");
 		expect(body.message).toContain(
-			`the rate limit resets at ${new Date(resetAtMs).toISOString()}`,
+			`the cached rate limit will be rechecked at ${new Date(resetAtMs).toISOString()}`,
 		);
 	});
 
@@ -546,7 +546,7 @@ describe("buildPinnedUnavailableErrorBody", () => {
 		);
 		expect(explicitUndefined.message).toBe(omitted.message);
 		expect(explicitUndefined.message).toContain(
-			`the rate limit resets at ${new Date(resetAtMs).toISOString()}`,
+			`the cached rate limit will be rechecked at ${new Date(resetAtMs).toISOString()}`,
 		);
 	});
 

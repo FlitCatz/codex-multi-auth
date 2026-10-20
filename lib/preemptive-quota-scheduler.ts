@@ -1,4 +1,4 @@
-import { MAX_RATE_LIMIT_DELAY_MS } from "./constants.js";
+import { MAX_RATE_LIMIT_DELAY_MS, RATE_LIMIT_CACHE_TTL_MS } from "./constants.js";
 import { quotaLeftPercentFromUsed } from "./quota-readiness.js";
 
 export interface QuotaSchedulerWindow {
@@ -280,6 +280,11 @@ export class PreemptiveQuotaScheduler {
 
 		const snapshot = this.snapshots.get(key);
 		if (!snapshot) return { defer: false, waitMs: 0 };
+		const cacheRemainingMs = snapshot.updatedAt + RATE_LIMIT_CACHE_TTL_MS - now;
+		if (cacheRemainingMs <= 0) {
+			this.snapshots.delete(key);
+			return { defer: false, waitMs: 0 };
+		}
 
 		// For a 429 deferral, only count a window whose reset is genuinely a
 		// rate-limit / exhaustion window. A window carrying a healthy usedPercent
@@ -305,7 +310,7 @@ export class PreemptiveQuotaScheduler {
 		const longestWait = waitCandidates.length > 0 ? Math.max(...waitCandidates) : 0;
 
 		if (snapshot.status === 429 && longestWait > 0) {
-			const bounded = Math.min(longestWait, this.maxDeferralMs);
+			const bounded = Math.min(longestWait, this.maxDeferralMs, cacheRemainingMs);
 			if (bounded > 0) {
 				return { defer: true, waitMs: bounded, reason: "rate-limit" };
 			}
@@ -332,7 +337,11 @@ export class PreemptiveQuotaScheduler {
 				: 0,
 		);
 		if (nearExhaustedWait > 0) {
-			return { defer: true, waitMs: nearExhaustedWait, reason: "quota-near-exhaustion" };
+			return {
+				defer: true,
+				waitMs: Math.min(nearExhaustedWait, cacheRemainingMs),
+				reason: "quota-near-exhaustion",
+			};
 		}
 
 		return { defer: false, waitMs: 0 };

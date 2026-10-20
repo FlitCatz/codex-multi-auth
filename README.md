@@ -99,6 +99,13 @@ codex-multi-auth rotation status              # is live rotation enabled?
 
 With rotation on (the default), request-bearing wrapper commands — `exec`, `review`, `resume`, `fork`, `app`, and the bare TUI — route through a local proxy that picks the healthiest account per request, refreshes tokens as needed, and fails over across the pool on rate limits within a bounded retry budget. The proxy listens on loopback only, authenticates its own clients with a per-process token, forwards only Responses API, model-discovery, image, thread-goal, and `POST /transcribe` calls, and never writes account emails or tokens to client headers or logs. Transcription preserves the incoming multipart audio body and boundary, uses managed ChatGPT OAuth, and does not replay ambiguous audio uploads across accounts. Plain `codex` is never touched: rotation exists only inside `codex-multi-auth-codex`/`mcodex` sessions, or inside the packaged desktop app after an opt-in, reversible bind. Turn it off with `codex-multi-auth rotation disable` or `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0`.
 
+### Quota cache revalidation
+
+Local rate-limit blocks are valid for at most one hour. The next request then
+rechecks upstream, including for a hard-pinned account, so an out-of-band quota
+reset does not require a manual switch. A fresh upstream rejection starts a new
+bounded wait; this does not reset quota or spend reset credits.
+
 ## Where state lives
 
 | What | Path |

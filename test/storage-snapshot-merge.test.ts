@@ -160,3 +160,14 @@ it("does not drop unknown account fields another version wrote", () => {
     const [row] = mergeAccountSnapshot(base, disk, local).accounts;
     expect((row as Record<string, unknown>).codexCliMirror).toEqual({ forAccountId: "a", accountId: "org-b" });
 });
+it("lets a lowered local deadline replace an unchanged disk deadline but keeps the later of two observations", () => {
+    const base = fixture();
+    base.accounts[0]!.rateLimitResetTimes = { codex: 1_000 };
+    const disk = structuredClone(base), local = structuredClone(base);
+    local.accounts[0]!.rateLimitResetTimes = { codex: 400 };
+    expect(mergeAccountSnapshot(base, disk, local).accounts[0]!.rateLimitResetTimes).toEqual({ codex: 400 });
+    disk.accounts[0]!.rateLimitResetTimes = { codex: 300 };
+    expect(mergeAccountSnapshot(base, disk, local).accounts[0]!.rateLimitResetTimes).toEqual({ codex: 400 });
+    const unchangedLocal = structuredClone(base);
+    expect(mergeAccountSnapshot(base, disk, unchangedLocal).accounts[0]!.rateLimitResetTimes).toEqual({ codex: 300 });
+});

@@ -1,3 +1,4 @@
+import { RATE_LIMIT_CACHE_TTL_MS } from "./constants.js";
 import { extractAccountId } from "./auth/token-utils.js";
 import { createHash } from "node:crypto";
 import { resolveAccountRecordId } from "./storage/record-identity.js";
@@ -125,6 +126,12 @@ export function isQuotaCacheEntryExhausted(
 	// Codex quota windows are cumulative gates: a 0% remaining active window blocks use
 	// even if another window still has quota left.
 	const updatedAt = entry?.updatedAt;
+	// Stale usage is unknown, not proof that the server still rejects requests.
+	if (
+		typeof updatedAt === "number" &&
+		Number.isFinite(updatedAt) &&
+		now >= updatedAt + RATE_LIMIT_CACHE_TTL_MS
+	) return false;
 	return (
 		quotaWindowIsExhausted(entry?.primary, now, updatedAt) ||
 		quotaWindowIsExhausted(entry?.secondary, now, updatedAt)

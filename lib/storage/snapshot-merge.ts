@@ -87,7 +87,10 @@ function mergeRuntimeAccount(base: AccountMetadataV3, disk: AccountMetadataV3, l
         const before = base.rateLimitResetTimes?.[key], a = disk.rateLimitResetTimes?.[key], b = local.rateLimitResetTimes?.[key];
         // An explicit clear is an operation, not a new observation.
         const clear = before !== undefined && ((a === undefined && b === before) || (b === undefined && a === before) || (a === undefined && b === undefined));
-        const value = clear ? undefined : Math.max(a ?? 0, b ?? 0);
+        // A side that kept the baseline made no observation, so the other side's
+        // value wins even when lower (e.g. a load-time revalidation bound).
+        // Only two concurrent observations keep the later deadline.
+        const value = clear ? undefined : a === before ? b : b === before ? a : Math.max(a ?? 0, b ?? 0);
         if (value !== undefined) limits[key] = value;
     }
     const runtime = {

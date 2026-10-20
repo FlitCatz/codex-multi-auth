@@ -6212,7 +6212,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 		expect(markRateLimitedWithReason).toHaveBeenCalledTimes(1);
 	});
 
-	it("persists the longer parsed rate-limit cooldown across overlapping requests", async () => {
+	it("persists the longer parsed cooldown up to the hourly revalidation bound across overlapping requests", async () => {
 		const { AccountManager } = await import("../lib/accounts.js");
 		const { AccountManager: ActualAccountManager } =
 			await vi.importActual<typeof import("../lib/accounts.js")>(
@@ -6367,7 +6367,7 @@ describe("OpenAIOAuthPlugin runtime toast forwarding", () => {
 			expect(markRateLimitedWithReason).toHaveBeenCalledTimes(2);
 			const familyKey = markRateLimitedWithReason.mock.calls[0]?.[2] as string;
 			expect(requestAccount.rateLimitResetTimes[familyKey]).toBe(
-				Date.parse("2026-04-05T01:30:00.000Z"),
+				Date.parse("2026-04-05T01:00:00.000Z"),
 			);
 		} finally {
 			vi.useRealTimers();

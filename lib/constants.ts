@@ -171,3 +171,6 @@ export function stripModelEffortSuffix(modelId: string): string {
 	if (EFFORT_SUFFIX_EXEMPT_PATTERN.test(modelId)) return modelId;
 	return modelId.replace(EFFORT_SUFFIX_PATTERN, "");
 }
+
+/** Maximum lifetime of a local quota rejection before upstream revalidation. */
+export const RATE_LIMIT_CACHE_TTL_MS = 60 * 60_000;

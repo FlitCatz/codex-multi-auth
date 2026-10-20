@@ -1,3 +1,4 @@
+import { RATE_LIMIT_CACHE_TTL_MS } from "../lib/constants.js";
 import { describe, expect, it } from "vitest";
 import {
 	PreemptiveQuotaScheduler,
@@ -189,15 +190,14 @@ describe("preemptive quota scheduler", () => {
 
 		expect(decision).toEqual({
 			defer: true,
-			waitMs: resetWaitMs - 1_000,
+			waitMs: RATE_LIMIT_CACHE_TTL_MS - 1_000,
 			reason: "quota-near-exhaustion",
 		});
 	});
 
-	it("caps trusted monthly-scale reset data at the seven-day safety ceiling", () => {
+	it("revalidates monthly-scale reset data after an hour", () => {
 		const scheduler = new PreemptiveQuotaScheduler();
 		const now = 1_000_000;
-		const sevenDaysMs = 7 * 24 * 60 * 60_000;
 		scheduler.update("acc:model", {
 			status: 200,
 			primary: {},
@@ -210,7 +210,7 @@ describe("preemptive quota scheduler", () => {
 
 		const decision = scheduler.getDeferral("acc:model", now + 1_000);
 
-		expect(decision.waitMs).toBe(sevenDaysMs);
+		expect(decision.waitMs).toBe(RATE_LIMIT_CACHE_TTL_MS - 1_000);
 	});
 
 	it.each([
@@ -236,7 +236,7 @@ describe("preemptive quota scheduler", () => {
 		});
 	});
 
-	it("falls back to the configured cap for stale reset data", () => {
+	it("does not defer on stale reset data", () => {
 		const maxDeferralMs = 30 * 60_000;
 		const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs });
 		const now = 1_000_000;
@@ -251,9 +251,8 @@ describe("preemptive quota scheduler", () => {
 		const decision = scheduler.getDeferral("acc:model", now + 1_000);
 
 		expect(decision).toEqual({
-			defer: true,
-			waitMs: maxDeferralMs,
-			reason: "quota-near-exhaustion",
+			defer: false,
+			waitMs: 0,
 		});
 	});
 
@@ -341,7 +340,7 @@ describe("preemptive quota scheduler", () => {
 		expect(scheduler.getDeferral("acc:model", 2_000).defer).toBe(true);
 	});
 
-	it("ignores empty keys for update/markRateLimited and falls back when updatedAt is falsy", () => {
+	it("ignores empty keys and expires snapshots with a zero observation time", () => {
 		const now = Date.now();
 		const scheduler = new PreemptiveQuotaScheduler();
 
@@ -364,8 +363,8 @@ describe("preemptive quota scheduler", () => {
 			updatedAt: 0,
 		});
 		const decision = scheduler.getDeferral("acc:model", now + 5_000);
-		expect(decision.defer).toBe(true);
-		expect(decision.reason).toBe("rate-limit");
+		expect(decision.defer).toBe(false);
+		expect(decision.waitMs).toBe(0);
 	});
 
 	it("prunes snapshots using the latest reset from primary or secondary windows", () => {
