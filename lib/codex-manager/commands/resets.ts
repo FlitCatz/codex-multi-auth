@@ -1,7 +1,7 @@
 import { AccountManager } from '../../accounts.js';
 import { loadAccounts } from '../../storage.js';
 import { runWithGlobalStoragePath } from '../../storage/path-state.js';
-import { createResetCreditService, resetTargetForStoredAccount, resetAccountLabel } from '../../runtime/account-reset-credits.js';
+import { createResetCreditService, resetTargetForStoredAccount, resetAccountLabel, formatResetCreditLine } from '../../runtime/account-reset-credits.js';
 import { withCheckProgress } from '../../ui/check-progress.js';
 const usage='Usage: codex-multi-auth resets list [--refresh] | redeem <account-number> | auto manual|last-resort';
 export async function runResetsCommand(args:string[]):Promise<number>{
@@ -22,7 +22,13 @@ export async function runResetsCommand(args:string[]):Promise<number>{
   const refreshed=value==='--refresh'?await withCheckProgress('Refreshing reset-credit availability',()=>service.refresh(targets)):null;
   const state=await service.status();console.log(`Automatic redemption: ${state.policy}`);
   if(state.lastRedemption){const index=(storage?.accounts??[]).findIndex(a=>resetTargetForStoredAccount(a)?.key===state.lastRedemption?.key);console.log(`Last confirmed reset: ${index>=0?`account ${index+1}`:"removed account"}; ${state.lastRedemption.outcome}; ${state.lastRedemption.automatic?"automatic":"explicit"}`);}
-  (storage?.accounts??[]).forEach((a,i)=>{const target=resetTargetForStoredAccount(a);const ambiguous=target&&(keyCounts.get(target.key)??0)>1;const snapshot=target&&!ambiguous?(refreshed??state.snapshots)[target.key]:undefined;console.log(`${resetAccountLabel(a,i)}: ${snapshot?.availableCount??'unknown'} reset credits${snapshot?` (checked ${Math.max(0,Math.floor((Date.now()-snapshot.updatedAt)/1000))}s ago)`:''}${ambiguous?' [ambiguous account identity; repair duplicate records]':''}${target?.key===state.pending?.key?' [redemption pending; retry this account]':''}`);});
+  (storage?.accounts??[]).forEach((a,i)=>{
+   const target=resetTargetForStoredAccount(a);
+   const ambiguous=target&&(keyCounts.get(target.key)??0)>1;
+   const snapshot=target&&!ambiguous?(refreshed??state.snapshots)[target.key]:undefined;
+   console.log(`${resetAccountLabel(a,i)}: ${snapshot?.availableCount??'unknown'} reset credits${snapshot?` (checked ${Math.max(0,Math.floor((Date.now()-snapshot.updatedAt)/1000))}s ago)`:''}${ambiguous?' [ambiguous account identity; repair duplicate records]':''}${target?.key===state.pending?.key?' [redemption pending; retry this account]':''}`);
+   snapshot?.credits?.forEach((c,idx)=>console.log(formatResetCreditLine(c,idx)));
+  });
   const failed=refreshed?targets.filter(target=>(keyCounts.get(target.key)??0)>1||!refreshed[target.key]).length:0;
   if(failed){console.error(`${failed} of ${targets.length} reset-credit reads failed. Check account authentication and the native Codex backend (CODEX_MULTI_AUTH_USAGE_CODEX_BIN selects an executable). No credits were redeemed.`);return 1;}
   return 0;

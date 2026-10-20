@@ -24,7 +24,7 @@
 | Usage ledger | `~/.codex/multi-auth/usage/usage-ledger.jsonl` | Redacted request metadata: hashed account/email identifiers, no prompts, no auth headers |
 | Account policies | `~/.codex/multi-auth/account-policies.json` | Tags, weights, pause/drain, notes — keyed by hashed account identity |
 | API routes | `~/.codex/multi-auth/api-routes.json` | Optional non-OAuth route definitions; holds raw `apiKey` values — treat as credential material |
-| Reset credits | `~/.codex/multi-auth/reset-credits.json` | Reset-credit availability snapshots, keyed by account identity |
+| Reset credits | `~/.codex/multi-auth/reset-credits.json` | Reset-credit availability snapshots, keyed by account identity; per-credit expiry and title only (no credit IDs) |
 | Budget guards | `~/.codex/multi-auth/budget-guards.json` | Local request/token/cost limits |
 | Routing profiles | `~/.codex/multi-auth/routing-profiles.json` | Project-aware preferences, keyed by project identity |
 | Bridge client tokens | `~/.codex/multi-auth/local-client-tokens.json` | SHA-256 hashes + prefixes only; plaintext `cma_local_*` tokens show once at creation |

@@ -1,5 +1,41 @@
 import { expect,it } from 'vitest';
-import { resetTargetForStoredAccount, resetAccountLabel } from '../lib/runtime/account-reset-credits.js';
+import { resetTargetForStoredAccount, resetAccountLabel, sanitizeCreditTitle, formatResetCreditLine } from '../lib/runtime/account-reset-credits.js';
+
+it('sanitizes credit titles and rejects control or newline characters', () => {
+ expect(sanitizeCreditTitle('Full reset')).toBe('Full reset');
+ expect(sanitizeCreditTitle('  Full reset  ')).toBe('Full reset');
+ expect(sanitizeCreditTitle('Full reset\nline 2')).toBeNull();
+ expect(sanitizeCreditTitle('Full reset\r\nline 2')).toBeNull();
+ expect(sanitizeCreditTitle('Full reset\u202E')).toBeNull();
+ expect(sanitizeCreditTitle('')).toBeNull();
+ expect(sanitizeCreditTitle('   ')).toBeNull();
+ expect(sanitizeCreditTitle(null)).toBeNull();
+ expect(sanitizeCreditTitle(undefined)).toBeNull();
+});
+it('labels non-expiring credits separately from unknown or out-of-range expiry',()=>{
+ expect(formatResetCreditLine({expiresAt:null,title:'Bonus'},0)).toBe('   - credit #1: no expiry (Bonus)');
+ for(const expiresAt of [undefined,0,-5,1e300])expect(formatResetCreditLine({expiresAt},1)).toBe('   - credit #2: expires unknown');
+});
+it('check resets requests credit details and prints each expiry and title without persisting credit ids',async()=>{
+ const {vi}=await import('vitest');
+ const {mkdtemp,readFile,rm}=await import('node:fs/promises');const {tmpdir}=await import('node:os');const {join}=await import('node:path');
+ const {refreshAndPrintResetCredits}=await import('../lib/runtime/account-reset-credits.js');
+ const native=await import('../lib/runtime/native-rate-limits.js');const stored=await import('../lib/storage.js');
+ const dir=await mkdtemp(join(tmpdir(),'reset-print-'));const previous=process.env.CODEX_MULTI_AUTH_DIR;process.env.CODEX_MULTI_AUTH_DIR=dir;
+ const row={recordId:'r',accountId:'workspace',email:'reader@example.test',refreshToken:'refresh-fixture',accessToken:'access-fixture',expiresAt:Date.now()+3600000,addedAt:1,lastUsed:1};
+ const load=vi.spyOn(stored,'loadAccounts').mockResolvedValue({version:3,activeIndex:0,accounts:[row]});
+ const rpc=vi.spyOn(native,'nativeRateLimitsRpc').mockImplementation(async auth=>({accountId:auth.accountId,rateLimitResetCredits:{availableCount:2,credits:[{id:'credit-id-fixture',grantedAt:1,expiresAt:1793300484,title:'Weekly reset',backendExtra:'x'},{id:'credit-id-2',expiresAt:null}]},rateLimits:{planType:'pro'}}));
+ const toLocale=vi.spyOn(Date.prototype,'toLocaleString').mockImplementation(function(this:Date){return `local:${this.getTime()}`;});
+ try{
+  const lines:string[]=[];
+  await refreshAndPrintResetCredits(message=>lines.push(message));
+  expect(rpc).toHaveBeenCalledWith(expect.anything(),'account/rateLimits/read',{excludeResetCreditDetails:false});
+  expect(lines).toEqual(expect.arrayContaining(['Account 1 (reader@example.test): available subscription resets: 2','   - credit #1: expires local:1793300484000 (Weekly reset)','   - credit #2: no expiry']));
+  const persisted=await readFile(join(dir,'reset-credits.json'),'utf8');
+  expect(persisted).not.toMatch(/credit-id|backendExtra|grantedAt/);
+  expect(Object.values(JSON.parse(persisted).snapshots)).toEqual([expect.objectContaining({credits:[{expiresAt:1793300484,title:'Weekly reset'},{expiresAt:null}]})]);
+ }finally{toLocale.mockRestore();rpc.mockRestore();load.mockRestore();if(previous===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=previous;await rm(dir,{recursive:true,force:true,maxRetries:5});}
+});
 it('uses the native credential binding, not an organization display alias',()=>{
  const account={recordId:'r',accountId:'native-workspace',refreshToken:'secret',addedAt:1,lastUsed:1,workspaces:[{id:'native-workspace',name:'Token account'},{id:'org-personal',name:'Personal'}],currentWorkspaceIndex:1};
  expect(resetTargetForStoredAccount(account)?.accountId).toBe('native-workspace');expect(account.currentWorkspaceIndex).toBe(1);
@@ -50,7 +86,7 @@ it.each([
   expect(target.accountId).toBe('refused-explicit');
   const service=createResetCreditService(manager);
   const snapshots=await service.refresh([target]);
-  expect(rpc).toHaveBeenCalled();
+  expect(rpc).toHaveBeenCalledWith(expect.anything(),'account/rateLimits/read',{excludeResetCreditDetails:false});
   expect(snapshots[target.key]?.availableCount).toBe(expected);
   // The reset state stays keyed on the stored target, not the mirror id.
   expect(Object.keys((await service.status()).snapshots)).toEqual(expected===undefined?[]:[target.key]);

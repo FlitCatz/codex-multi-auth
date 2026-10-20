@@ -5978,6 +5978,9 @@ describe('earned reset last-resort integration',()=>{
    const response=await postResponses(proxy,{model:'chat-fixture',input:'hello'});expect(response.status).toBe(200);await response.text();
    diskSpy.mockRestore();
    expect(consumptions).toBe(otherUsable?0:1);
+   // Request-path recovery reads only counts and quota; it must skip the per-credit detail lookup.
+   const reads=rpc.mock.calls.filter(([,method])=>method==='account/rateLimits/read');
+   expect(reads.length).toBeGreaterThan(0);expect(reads.every(([,,params])=>params.excludeResetCreditDetails===true)).toBe(true);
    expect(calls.find(c=>c.url.endsWith('/responses'))?.headers.get('chatgpt-account-id')).toBe(otherUsable?'acc_2':'acc_1');
   }finally{await service.setPolicy('manual');rpc.mockRestore();if(originalDir===undefined)delete process.env.CODEX_MULTI_AUTH_DIR;else process.env.CODEX_MULTI_AUTH_DIR=originalDir;await fs.rm(testDir,{recursive:true,force:true,maxRetries:5});}
  });
