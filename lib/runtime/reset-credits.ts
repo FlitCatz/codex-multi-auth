@@ -9,28 +9,24 @@ import type { QuotaCacheEntry } from '../quota-cache.js';
 import { MAX_RATE_LIMIT_DELAY_MS } from '../constants.js';
 
 export interface ResetTarget { key: string; accountId: string }
-export interface ResetCreditDetail {
-	status?: string | null;
-	grantedAt?: number | null;
-	expiresAt?: number | null;
-	title?: string | null;
-	description?: string | null;
-}
-const creditRpcItemSchema=z.object({id:z.string().nullish(),status:z.string().nullish(),grantedAt:z.number().nullish(),expiresAt:z.number().nullish(),title:z.string().nullish(),description:z.string().nullish()}).passthrough();
-const creditDetailSchema=z.object({status:z.string().nullish(),grantedAt:z.number().nullish(),expiresAt:z.number().nullish(),title:z.string().nullish(),description:z.string().nullish()}).passthrough();
+// Display-only projection: unknown keys (credit ids, backend extras) are stripped before
+// persistence, and a malformed field degrades to unknown instead of failing the count read.
+// expiresAt is Unix seconds; null means the credit does not expire.
+const creditDetailSchema=z.object({expiresAt:z.number().nullish().catch(undefined),title:z.string().nullish().catch(undefined)});
+export type ResetCreditDetail=z.infer<typeof creditDetailSchema>;
+const creditDetailsSchema=z.array(creditDetailSchema).nullish().catch(null);
 const windowSchema=z.object({usedPercent:z.number().min(0).max(100).optional(),resetsAt:z.number().nonnegative().nullish(),windowDurationMins:z.number().nonnegative().nullish()});
-const snapshotSchema=z.object({updatedAt:z.number(),availableCount:z.number().int().nonnegative().nullable(),credits:z.array(creditDetailSchema).nullish(),ordinaryUsageAllowed:z.boolean().nullable(),planType:z.string().nullable(),primary:windowSchema,secondary:windowSchema});
+const snapshotSchema=z.object({updatedAt:z.number(),availableCount:z.number().int().nonnegative().nullable(),credits:creditDetailsSchema,ordinaryUsageAllowed:z.boolean().nullable(),planType:z.string().nullable(),primary:windowSchema,secondary:windowSchema});
 export type ResetSnapshot=z.infer<typeof snapshotSchema>;
 const stateSchema=z.object({version:z.literal(1),policy:z.enum(['manual','last-resort']).default('manual'),snapshots:z.record(z.string(),snapshotSchema).default({}),pending:z.object({key:z.string(),idempotencyKey:z.string().uuid()}).optional(),lastAutomaticCheckAt:z.number().optional(),lastRedemptionAt:z.number().optional(),lastRedemption:z.object({key:z.string(),at:z.number(),outcome:z.enum(['reset','nothingToReset','noCredit','alreadyRedeemed']),automatic:z.boolean()}).optional()});
 type State=z.infer<typeof stateSchema>;
-const readSchema=z.object({accountId:z.string(),ordinaryUsageAllowed:z.boolean().nullish(),rateLimitResetCredits:z.object({availableCount:z.number().int().nonnegative(),credits:z.array(creditRpcItemSchema).nullish()}).nullish(),rateLimits:z.object({planType:z.string().nullish(),primary:windowSchema.nullish(),secondary:windowSchema.nullish()})});
+const readSchema=z.object({accountId:z.string(),ordinaryUsageAllowed:z.boolean().nullish(),rateLimitResetCredits:z.object({availableCount:z.number().int().nonnegative(),credits:creditDetailsSchema}).nullish(),rateLimits:z.object({planType:z.string().nullish(),primary:windowSchema.nullish(),secondary:windowSchema.nullish()})});
 const outcomeSchema=z.object({outcome:z.enum(['reset','nothingToReset','noCredit','alreadyRedeemed'])});
 export type ResetOutcome=z.infer<typeof outcomeSchema>['outcome'];
 export function parseResetSnapshot(value:unknown,accountId:string,now:number):ResetSnapshot {
  const parsed=readSchema.parse(value);
  if(parsed.accountId!==accountId)throw Error('Reset credit workspace identity mismatch');
- const credits=parsed.rateLimitResetCredits?.credits?.map(({id:_id,...rest})=>rest)??null;
- return {updatedAt:now,availableCount:parsed.rateLimitResetCredits?.availableCount??null,credits,ordinaryUsageAllowed:parsed.ordinaryUsageAllowed??null,planType:parsed.rateLimits.planType??null,primary:parsed.rateLimits.primary??{},secondary:parsed.rateLimits.secondary??{}};
+ return {updatedAt:now,availableCount:parsed.rateLimitResetCredits?.availableCount??null,credits:parsed.rateLimitResetCredits?.credits??null,ordinaryUsageAllowed:parsed.ordinaryUsageAllowed??null,planType:parsed.rateLimits.planType??null,primary:parsed.rateLimits.primary??{},secondary:parsed.rateLimits.secondary??{}};
 }
 export function resetSnapshotQuota(snapshot:ResetSnapshot):QuotaCacheEntry {
  // A bogus resetsAt must not read as a window that never resets.
@@ -42,11 +38,12 @@ export function isResetSubscription(snapshot:ResetSnapshot):boolean {
  return ['plus','pro','prolite','team','business','self_serve_business_prolite','enterprise','edu','edu_plus','edu_pro'].includes(snapshot.planType??'');
 }
 export interface ResetCreditIO {
- read:(target:ResetTarget)=>Promise<unknown>;
+ /** creditDetails asks the backend for per-credit rows; only display refreshes need them. */
+ read:(target:ResetTarget,options:{creditDetails:boolean})=>Promise<unknown>;
  consume:(target:ResetTarget,idempotencyKey:string)=>Promise<unknown>;
  now?:()=>number;
 }
-/** No credentials or credit IDs are persisted. One global redemption lease covers
+/** No credentials or credit IDs are persisted (credit rows keep only expiry and title). One global redemption lease covers
  * all accounts: concurrent exhausted requests cannot independently spend credits. */
 /** A stored time further ahead than this came from a clock that has since stepped back: treat it as expired. */
 const FUTURE_SKEW_MS=5*60000;
@@ -69,9 +66,9 @@ export class ResetCreditService {
   finally {await fs.rm(path,{force:true});}
  }
  async setPolicy(policy:State['policy']){await withFileTransactionLock(this.path,async()=>{const s=await this.status();s.policy=policy;await this.save(s);});}
- private async read(target:ResetTarget){return parseResetSnapshot(await this.io.read(target),target.accountId,this.now());}
+ private async read(target:ResetTarget,creditDetails=false){return parseResetSnapshot(await this.io.read(target,{creditDetails}),target.accountId,this.now());}
  async refresh(targets:ResetTarget[]):Promise<Record<string,ResetSnapshot>>{
-  const results=await mapWithConcurrency(targets,3,async t=>{try{return {key:t.key,snapshot:await this.read(t)}}catch{return null}});
+  const results=await mapWithConcurrency(targets,3,async t=>{try{return {key:t.key,snapshot:await this.read(t,true)}}catch{return null}});
   return withFileTransactionLock(this.path,async()=>{const state=await this.status();const updated:Record<string,ResetSnapshot>={};const now=this.now();for(const row of results)if(row){const old=state.snapshots[row.key];if(!old||old.updatedAt<=row.snapshot.updatedAt||old.updatedAt>now+FUTURE_SKEW_MS)state.snapshots[row.key]=row.snapshot;updated[row.key]=row.snapshot;}await this.save(state);return updated;});
  }
  private async consumeLocked(state:State,target:ResetTarget,automatic=false):Promise<ResetOutcome>{

@@ -25,13 +25,29 @@ describe('reset credits',()=>{
    ...payload('a'),
    rateLimitResetCredits: {
     availableCount: 1,
-    credits: [{ id: 'cred-1', expiresAt: 1793300484, title: 'Weekly reset' }]
+    credits: [{ id: 'cred-1', status: 'available', grantedAt: 1, description: 'backend copy', extra: true, expiresAt: 1793300484, title: 'Weekly reset' }, { id: 'cred-2', expiresAt: null }]
    }
   };
   const snap = parseResetSnapshot(withCredits, 'a', 1);
   expect(snap.availableCount).toBe(1);
-  expect(snap.credits).toEqual([{ expiresAt: 1793300484, title: 'Weekly reset' }]);
-  expect(snap.credits?.[0]).not.toHaveProperty('id');
+  expect(snap.credits).toStrictEqual([{ expiresAt: 1793300484, title: 'Weekly reset' }, { expiresAt: null }]);
+  // A malformed detail row must not fail the count read that automatic redemption depends on.
+  const malformed = parseResetSnapshot({ ...payload('a'), rateLimitResetCredits: { availableCount: 3, credits: [{ expiresAt: 'soon', title: 7 }] } }, 'a', 1);
+  expect(malformed.availableCount).toBe(3);
+  expect(malformed.credits).toStrictEqual([{ expiresAt: undefined, title: undefined }]);
+  expect(parseResetSnapshot({ ...payload('a'), rateLimitResetCredits: { availableCount: 3, credits: 'invalid' } }, 'a', 1).credits).toBeNull();
+ });
+ it('requests credit details only for display refreshes, not redemption or automatic reads',async()=>{
+  const f=fixture();await f.service.refresh([target('a')]);expect(f.read).toHaveBeenLastCalledWith(target('a'),{creditDetails:true});
+  f.read.mockClear();await f.service.redeem(target('a'));expect(f.read.mock.calls.length).toBeGreaterThan(0);expect(f.read.mock.calls.every(([,options])=>options.creditDetails===false)).toBe(true);
+  const g=fixture();await fs.rm(join(dir,'state.json'),{force:true});await g.service.setPolicy('last-resort');await g.service.automatic([target('a'),target('b')]);
+  expect(g.consume).toHaveBeenCalledTimes(1);expect(g.read.mock.calls.length).toBeGreaterThan(0);expect(g.read.mock.calls.every(([,options])=>options.creditDetails===false)).toBe(true);
+ });
+ it('loads existing snapshots with or without credit rows and strips non-display credit fields on save',async()=>{
+  const f=fixture();const snapshot={updatedAt:1,availableCount:1,ordinaryUsageAllowed:false,planType:'pro',primary:{},secondary:{}};
+  await fs.writeFile(join(dir,'state.json'),JSON.stringify({version:1,policy:'manual',snapshots:{legacy:snapshot,detailed:{...snapshot,credits:[{id:'credit-id',status:'available',expiresAt:5,title:'t'}]}}}));
+  const state=await f.service.status();expect(state.snapshots.legacy?.credits).toBeUndefined();expect(state.snapshots.detailed?.credits).toStrictEqual([{expiresAt:5,title:'t'}]);
+  await f.service.setPolicy('manual');expect(await fs.readFile(join(dir,'state.json'),'utf8')).not.toContain('credit-id');
  });
  it('defaults to manual and does not redeem in automatic mode',async()=>{
   const f=fixture();expect(await f.service.automatic([target('a')])).toBeNull();expect(f.consume).not.toHaveBeenCalled();expect(f.read).not.toHaveBeenCalled();

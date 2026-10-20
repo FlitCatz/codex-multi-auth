@@ -7,7 +7,7 @@ import { modelScopeId, workspaceModelScopes } from './workspace-model-scopes.js'
 import { nativeRateLimitsRpc } from './native-rate-limits.js';
 import { codexCliAccountIdFor } from '../auth/token-utils.js';
 import { isRecord } from '../utils.js';
-import { ResetCreditService, type ResetTarget } from './reset-credits.js';
+import { ResetCreditService, type ResetCreditDetail, type ResetTarget } from './reset-credits.js';
 import { withCheckProgress } from '../ui/check-progress.js';
 
 export function resetTargetForStoredAccount(account:AccountMetadataV3):ResetTarget|null{
@@ -39,12 +39,12 @@ export function createResetCreditService(manager?:AccountManager):ResetCreditSer
  return {accessToken:fresh.accessToken,accountId:target.accountId,expiresAt:fresh.account.expires??0,codexCliMirror:current.codexCliMirror};
  };
  return new ResetCreditService(join(getCodexMultiAuthDir(),'reset-credits.json'),{
-  read:async target=>{
+  read:async(target,{creditDetails})=>{
    // The backend answers for the id written into its auth.json (the mirror id when one
    // applies). Verify the reply against that id; the snapshot stays keyed on the target.
    const freshAuth=await auth(target);
    const sent=codexCliAccountIdFor(freshAuth,freshAuth.accessToken)??freshAuth.accountId;
-   const reply=await nativeRateLimitsRpc(freshAuth,'account/rateLimits/read',{excludeResetCreditDetails:false});
+   const reply=await nativeRateLimitsRpc(freshAuth,'account/rateLimits/read',{excludeResetCreditDetails:!creditDetails});
    if(!isRecord(reply)||reply.accountId!==sent)throw Error('Reset credit workspace identity mismatch');
    return {...reply,accountId:target.accountId};
   },
@@ -72,6 +72,13 @@ export function sanitizeCreditTitle(title: string | null | undefined): string | 
  if (!trimmed || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(trimmed)) return null;
  return trimmed;
 }
+/** One local terminal line per credit row; expiresAt is Unix seconds and null means it never expires. */
+export function formatResetCreditLine(credit:ResetCreditDetail,index:number):string{
+ const date=new Date(typeof credit.expiresAt==='number'&&credit.expiresAt>0?credit.expiresAt*1000:Number.NaN);
+ const expiry=credit.expiresAt===null?'no expiry':Number.isNaN(date.getTime())?'expires unknown':`expires ${date.toLocaleString()}`;
+ const title=sanitizeCreditTitle(credit.title);
+ return `   - credit #${index+1}: ${expiry}${title?` (${title})`:''}`;
+}
 export async function refreshAndPrintResetCredits(log:(message:string)=>void){
  const storage=await loadAccounts();if(!storage?.accounts.length)return;
  const manager=new AccountManager(undefined,storage);
@@ -82,13 +89,7 @@ export async function refreshAndPrintResetCredits(log:(message:string)=>void){
    const target=resetTargetForStoredAccount(a);
    const snap=target?snapshots[target.key]:undefined;
    log(`${resetAccountLabel(a,i)}: available subscription resets: ${snap?.availableCount??'unknown (not verified)'}`);
-   if(snap?.credits?.length){
-    snap.credits.forEach((c,idx)=>{
-     const exp=c.expiresAt&&Number.isFinite(c.expiresAt)?new Date(c.expiresAt*1000).toLocaleString():'unknown';
-     const title=sanitizeCreditTitle(c.title);
-     log(`   - credit #${idx+1}: expires ${exp}${title?` (${title})`:''}`);
-    });
-   }
+   snap?.credits?.forEach((c,idx)=>log(formatResetCreditLine(c,idx)));
   });
  }finally{await manager.flushPendingSave();}
 }

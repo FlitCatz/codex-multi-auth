@@ -1,7 +1,7 @@
 import { AccountManager } from '../../accounts.js';
 import { loadAccounts } from '../../storage.js';
 import { runWithGlobalStoragePath } from '../../storage/path-state.js';
-import { createResetCreditService, resetTargetForStoredAccount, resetAccountLabel, sanitizeCreditTitle } from '../../runtime/account-reset-credits.js';
+import { createResetCreditService, resetTargetForStoredAccount, resetAccountLabel, formatResetCreditLine } from '../../runtime/account-reset-credits.js';
 import { withCheckProgress } from '../../ui/check-progress.js';
 const usage='Usage: codex-multi-auth resets list [--refresh] | redeem <account-number> | auto manual|last-resort';
 export async function runResetsCommand(args:string[]):Promise<number>{
@@ -27,13 +27,7 @@ export async function runResetsCommand(args:string[]):Promise<number>{
    const ambiguous=target&&(keyCounts.get(target.key)??0)>1;
    const snapshot=target&&!ambiguous?(refreshed??state.snapshots)[target.key]:undefined;
    console.log(`${resetAccountLabel(a,i)}: ${snapshot?.availableCount??'unknown'} reset credits${snapshot?` (checked ${Math.max(0,Math.floor((Date.now()-snapshot.updatedAt)/1000))}s ago)`:''}${ambiguous?' [ambiguous account identity; repair duplicate records]':''}${target?.key===state.pending?.key?' [redemption pending; retry this account]':''}`);
-   if(snapshot?.credits?.length){
-    snapshot.credits.forEach((c,idx)=>{
-     const exp=c.expiresAt&&Number.isFinite(c.expiresAt)?new Date(c.expiresAt*1000).toLocaleString():'unknown';
-     const title=sanitizeCreditTitle(c.title);
-     console.log(`   - credit #${idx+1}: expires ${exp}${title?` (${title})`:''}`);
-    });
-   }
+   snapshot?.credits?.forEach((c,idx)=>console.log(formatResetCreditLine(c,idx)));
   });
   const failed=refreshed?targets.filter(target=>(keyCounts.get(target.key)??0)>1||!refreshed[target.key]).length:0;
   if(failed){console.error(`${failed} of ${targets.length} reset-credit reads failed. Check account authentication and the native Codex backend (CODEX_MULTI_AUTH_USAGE_CODEX_BIN selects an executable). No credits were redeemed.`);return 1;}
