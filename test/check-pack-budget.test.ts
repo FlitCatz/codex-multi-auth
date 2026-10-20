@@ -24,8 +24,18 @@ describe("parsePackMetadata", () => {
 		});
 	});
 
+	it("reads npm 12 output keyed by package name", () => {
+		const result = parsePackMetadata(
+			JSON.stringify({
+				"codex-multi-auth": { size: 456, files: [{ path: "dist/index.js" }] },
+			}),
+		);
+		expect(result).toEqual({ packageSize: 456, paths: ["dist/index.js"] });
+	});
+
 	it("throws when npm pack returns no package metadata", () => {
 		expect(() => parsePackMetadata("[]")).toThrow(/no package metadata/);
+		expect(() => parsePackMetadata("{}")).toThrow(/no package metadata/);
 	});
 
 	it("throws when npm pack reports a non-positive package size", () => {
