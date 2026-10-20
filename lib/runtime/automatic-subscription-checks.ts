@@ -21,7 +21,8 @@ export function createAutomaticSubscriptionCheck(observe?: Observer) {
         await saveQuotaCache(cache, baseline);
     });
     return (signal: AbortSignal) => runWithStoragePathState(storageState, () => runAutomaticAccountChecks({
-        path: `${path}.automatic-checks.json`, signal, loadPolicies: loadAccountPolicyStore,
+        // Priming may consume quota: malformed permissions must never normalize to OFF.
+        path: `${path}.automatic-checks.json`, signal, loadPolicies: () => loadAccountPolicyStore({ strict: true }),
         loadAccounts: async () => { const snapshot = await read(); return snapshot.verified ? snapshot.storage : null; },
         check: async (storage, index) => {
             const manager = new AccountManager(undefined, storage);
@@ -37,8 +38,8 @@ export function createAutomaticSubscriptionCheck(observe?: Observer) {
                 // A refresh is an I/O boundary: revalidate removal, policy, auth and workspace changes.
                 const disk = await read();
                 const current = disk.verified ? disk.storage?.accounts.find(row => resolveAccountRecordId(row) === resolveAccountRecordId(fresh.account)) : undefined;
-                const policy = current ? (await loadAccountPolicyStore()).accounts[getAccountPolicyKey(current)] : undefined;
-                if (!disk.storage || !current || current.refreshToken !== fresh.account.refreshToken || current.accessToken !== fresh.accessToken || !policy?.autoPrime || policy.paused || policy.drained || current.enabled === false || current.authInvalidatedAt || (current.coolingDownUntil ?? 0) > Date.now())
+                const policy = current ? (await loadAccountPolicyStore({ strict: true })).accounts[getAccountPolicyKey(current)] : undefined;
+                if (!disk.storage || !current || current.refreshToken !== fresh.account.refreshToken || current.accessToken !== fresh.accessToken || !policy?.autoPrime || policy.paused || policy.drained || policy.emergencyOnly || current.enabled === false || current.authInvalidatedAt || (current.coolingDownUntil ?? 0) > Date.now())
                     return;
                 if (automaticCheckWorkspaceId(current) !== targetId || signal.aborted)
                     return;

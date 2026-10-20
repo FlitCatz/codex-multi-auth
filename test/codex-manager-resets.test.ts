@@ -87,6 +87,17 @@ it('identifies a disabled pending account without calling it removed',async()=>{
  const output=JSON.stringify(vi.mocked(console.error).mock.calls);
  expect(output).toContain('account 2');expect(output).toContain('disabled');expect(output).not.toContain('was removed');
 });
+it('names the owner of a pending result whose workspace is no longer selected',async()=>{
+ const {resetTargetForStoredAccount}=await import('../lib/runtime/account-reset-credits.js');
+ const other={accountId:'binding',refreshToken:'fixture-3',addedAt:1,lastUsed:1,workspaces:[{id:'team-a',name:'A'},{id:'team-b',name:'B'}],currentWorkspaceIndex:1};
+ const key=resetTargetForStoredAccount({...other,currentWorkspaceIndex:0})!.key;
+ expect(resetTargetForStoredAccount(other)!.key).not.toBe(key);
+ f.extraAccounts=[other];
+ f.redeem.mockRejectedValue(Error('pending'));f.list.mockResolvedValue({version:1,policy:'manual',snapshots:{},pending:{key}});
+ expect(await runResetsCommand(['redeem','1'])).toBe(1);
+ const output=JSON.stringify(vi.mocked(console.error).mock.calls);
+ expect(output).toContain('account 2');expect(output).toContain('no longer selected');expect(output).not.toContain('was removed');
+});
 
 it('reports every failed refresh and exits nonzero instead of silently succeeding with unknown counts', async () => {
  f.refresh.mockResolvedValue({});

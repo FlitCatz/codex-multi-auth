@@ -3,8 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, afterEach, it, expect, vi } from "vitest";
 import { saveAccounts, setStoragePathDirect } from "../lib/storage.js";
-import { getAccountPolicyKey, saveAccountPolicyStore, upsertAccountPolicy, type AccountPolicyStore } from "../lib/account-policy.js";
+import { getAccountPolicyKey, getAccountPolicyPath, saveAccountPolicyStore, upsertAccountPolicy, type AccountPolicyStore } from "../lib/account-policy.js";
 import { createAutomaticSubscriptionCheck } from "../lib/runtime/automatic-subscription-checks.js";
+import { automaticAccountCheckKey } from "../lib/runtime/automatic-account-checks.js";
 import { findQuotaCacheEntryForAccount, quotaWorkspaceKey } from "../lib/quota-readiness.js";
 import type { QuotaCacheData } from "../lib/quota-cache.js";
 import * as tokenRefresh from "../lib/runtime/rotation-token-refresh.js";
@@ -40,6 +41,27 @@ it("does not prime a disabled saved workspace even when a sibling is enabled", a
     await saveAccountPolicyStore(policies);
     await createAutomaticSubscriptionCheck(vi.fn())(new AbortController().signal);
     expect(probe).not.toHaveBeenCalled();
+});
+
+it.each(["token", "mirror", "unresolved", "disabled"])("canonicalizes selected Personal quota probes (%s)", async mode => {
+    const accessToken = `e30.${Buffer.from(JSON.stringify({"https://api.openai.com/auth": {chatgpt_account_id: "native-token"}})).toString("base64url")}.fixture`;
+    const account = { recordId: "alias-record", accountId: "other-workspace", refreshToken: "fixture-refresh", accessToken: mode === "unresolved" ? "opaque" : accessToken, expiresAt: Date.now()+3600000, addedAt: 1, lastUsed: 1, currentWorkspaceIndex: 1, workspaces: [{id:"other-workspace",enabled:true},{id:"org-personal",name:"Personal",enabled:mode !== "disabled"}], ...(mode === "mirror" ? {codexCliMirror:{forAccountId:"org-personal",accountId:"native-mirror"}} : {}) };
+    await saveAccounts({version:3, activeIndex:0, accounts:[account]});
+    const before = await fs.readFile(join(dir,"accounts.json"),"utf8");
+    const policies: AccountPolicyStore = {version:1,accounts:{}};
+    upsertAccountPolicy(policies,getAccountPolicyKey(account),p=>{p.autoPrime=true;});
+    await saveAccountPolicyStore(policies);
+    const cache: QuotaCacheData = {byAccountId:{},byEmail:{}};
+    loadQuota.mockResolvedValue(cache);
+    await createAutomaticSubscriptionCheck()(new AbortController().signal);
+    if (mode === "unresolved" || mode === "disabled") expect(probe).not.toHaveBeenCalled();
+    else {
+        const expected = mode === "mirror" ? "native-mirror" : "native-token";
+        expect(probe).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({accountId:expected,accessToken,primeUnusedSubscription:true}));
+        expect(findQuotaCacheEntryForAccount(cache,account,[account])?.status).toBe(200);
+        expect(findQuotaCacheEntryForAccount(cache,account,[account],undefined,"other-workspace")).toBeNull();
+    }
+    expect(await fs.readFile(join(dir,"accounts.json"),"utf8")).toBe(before);
 });
 
 it("does not probe credentials replaced while refreshing the saved account", async () => {
@@ -149,4 +171,74 @@ it("preserves exhausted organization quota when a Personal check is followed by 
         account.currentWorkspaceIndex = 0;
         expect(findQuotaCacheEntryForAccount(cache, account, storage.accounts)?.primary.usedPercent).toBe(100);
     }
+});
+
+it("revalidates emergency reservation after token refresh before consuming quota", async()=>{
+ const account={recordId:"fixture",accountId:"personal",refreshToken:"fixture-refresh",accessToken:"fixture-access",expiresAt:Date.now()+3600000,addedAt:1,lastUsed:1};
+ await saveAccounts({version:3,activeIndex:0,accounts:[account]});
+ const policies:AccountPolicyStore={version:1,accounts:{}};
+ upsertAccountPolicy(policies,getAccountPolicyKey(account),p=>{p.autoPrime=true;});
+ await saveAccountPolicyStore(policies);
+ vi.spyOn(tokenRefresh,"ensureFreshAccessToken").mockImplementationOnce(async({account:live})=>{
+  upsertAccountPolicy(policies,getAccountPolicyKey(account),p=>{p.emergencyOnly=true;});
+  await saveAccountPolicyStore(policies);
+  return {ok:true,account:live,accessToken:"fixture-access"};
+ });
+ await createAutomaticSubscriptionCheck(vi.fn())(new AbortController().signal);
+ expect(probe).not.toHaveBeenCalled();
+});
+
+async function primingPolicyFixture() {
+    const account = { recordId: "policy-fixture", accountId: "personal", refreshToken: "fixture-refresh", accessToken: "fixture-access", expiresAt: Date.now() + 3600000, addedAt: 1, lastUsed: 1 };
+    await saveAccounts({ version: 3, activeIndex: 0, accounts: [account] });
+    const policies: AccountPolicyStore = { version: 1, accounts: {} };
+    const key = getAccountPolicyKey(account);
+    upsertAccountPolicy(policies, key, policy => { policy.autoPrime = true; });
+    await saveAccountPolicyStore(policies);
+    return {
+        account,
+        restore: () => saveAccountPolicyStore(policies),
+        corrupt: (flag: string) => fs.writeFile(getAccountPolicyPath(), JSON.stringify({
+            version: 1,
+            accounts: { [key]: { ...policies.accounts[key], [flag]: "true" } },
+        })),
+    };
+}
+
+it.each(["emergencyOnly", "paused", "drained", "autoPrime"])("rejects malformed %s before consuming an automatic priming attempt", async flag => {
+    const fixture = await primingPolicyFixture();
+    await fixture.corrupt(flag);
+    const observed = vi.fn();
+    const refresh = vi.spyOn(tokenRefresh, "ensureFreshAccessToken");
+    const run = createAutomaticSubscriptionCheck(observed);
+    const signal = new AbortController().signal;
+
+    await expect(run(signal)).rejects.toThrow("Invalid account policy row");
+    expect(refresh).not.toHaveBeenCalled();
+    expect(probe).not.toHaveBeenCalled();
+    expect(observed).not.toHaveBeenCalled();
+    expect(saveQuota).not.toHaveBeenCalled();
+    await expect(fs.stat(join(dir, "accounts.json.automatic-checks.json"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    await fixture.restore();
+    await run(signal);
+    expect(probe).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ accountId: "personal", primeUnusedSubscription: true }));
+    expect(observed).toHaveBeenCalledTimes(1);
+});
+
+it.each(["emergencyOnly", "paused", "drained", "autoPrime"])("rejects %s corrupted during refresh before priming or observing quota", async flag => {
+    const fixture = await primingPolicyFixture();
+    const observed = vi.fn();
+    vi.spyOn(tokenRefresh, "ensureFreshAccessToken").mockImplementationOnce(async ({ account }) => {
+        await fixture.corrupt(flag);
+        return { ok: true, account, accessToken: "fixture-access" };
+    });
+
+    await createAutomaticSubscriptionCheck(observed)(new AbortController().signal);
+    expect(tokenRefresh.ensureFreshAccessToken).toHaveBeenCalledTimes(1);
+    expect(probe).not.toHaveBeenCalled();
+    expect(observed).not.toHaveBeenCalled();
+    expect(saveQuota).not.toHaveBeenCalled();
+    const attempts: unknown = JSON.parse(await fs.readFile(join(dir, "accounts.json.automatic-checks.json"), "utf8"));
+    expect(attempts).toEqual({ [automaticAccountCheckKey(fixture.account)]: expect.any(Number) });
 });

@@ -16,6 +16,13 @@ function fixture(){
  return {service,read,consume};
 }
 describe('reset credits',()=>{
+ it('redeems a promax credit when ordinary usage is authoritatively exhausted',async()=>{
+  const f=fixture();await f.service.setPolicy('last-resort');
+  f.read.mockImplementation(async t=>({...payload(t.accountId),rateLimits:{...payload(t.accountId).rateLimits,planType:'promax'}}));
+  await f.service.automatic([target('a')]);
+  expect(f.consume).toHaveBeenCalledTimes(1);
+ });
+
  it('trusts the count, not a capped detail list; preserves unknown and credit details',()=>{
   expect(parseResetSnapshot(payload('a'), 'a',1).availableCount).toBe(2);
   expect(parseResetSnapshot(payload('a',null,null),'a',1).availableCount).toBeNull();
@@ -37,11 +44,12 @@ describe('reset credits',()=>{
   expect(malformed.credits).toStrictEqual([{ expiresAt: undefined, title: undefined }]);
   expect(parseResetSnapshot({ ...payload('a'), rateLimitResetCredits: { availableCount: 3, credits: 'invalid' } }, 'a', 1).credits).toBeNull();
  });
- it('requests credit details only for display refreshes, not redemption or automatic reads',async()=>{
+ it('requests credit details for display refreshes and last-resort credit selection, not explicit redemption',async()=>{
   const f=fixture();await f.service.refresh([target('a')]);expect(f.read).toHaveBeenLastCalledWith(target('a'),{creditDetails:true});
   f.read.mockClear();await f.service.redeem(target('a'));expect(f.read.mock.calls.length).toBeGreaterThan(0);expect(f.read.mock.calls.every(([,options])=>options.creditDetails===false)).toBe(true);
   const g=fixture();await fs.rm(join(dir,'state.json'),{force:true});await g.service.setPolicy('last-resort');await g.service.automatic([target('a'),target('b')]);
-  expect(g.consume).toHaveBeenCalledTimes(1);expect(g.read.mock.calls.length).toBeGreaterThan(0);expect(g.read.mock.calls.every(([,options])=>options.creditDetails===false)).toBe(true);
+  // Last-resort rechecks need credit IDs to spend the earliest-expiring credit; the follow-up read after consume does not.
+  expect(g.consume).toHaveBeenCalledTimes(1);expect(g.read.mock.calls.map(([t,options])=>[t.key,options.creditDetails])).toEqual([['a',true],['b',true],['a',false]]);
  });
  it('loads existing snapshots with or without credit rows and strips non-display credit fields on save',async()=>{
   const f=fixture();const snapshot={updatedAt:1,availableCount:1,ordinaryUsageAllowed:false,planType:'pro',primary:{},secondary:{}};

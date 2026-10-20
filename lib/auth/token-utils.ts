@@ -317,6 +317,18 @@ export function isOpenAiOrgId(accountId: string | undefined): boolean {
 	return /^org-/i.test(accountId?.trim() ?? "");
 }
 
+/** Preserve the native client's org-alias mapping; this is not workspace fallback. */
+export function nativeWorkspaceIdentity(
+	account: { access?: string; codexCliMirror?: CodexCliMirror },
+	storedId: string | undefined,
+): string | undefined {
+	const id = storedId?.trim();
+	if (!id) return undefined;
+	if (!isOpenAiOrgId(id)) return id;
+	const native = codexCliAccountIdFor({ accountId: id, codexCliMirror: account.codexCliMirror }, account.access);
+	return native && !isOpenAiOrgId(native) ? native : undefined;
+}
+
 export function resolveCodexAuthAccountId(
 	accountId: string | undefined,
 	accessToken?: string,

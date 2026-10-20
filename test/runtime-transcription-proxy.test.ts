@@ -317,6 +317,42 @@ describe("runtime transcription proxy", () => {
 		expect(reloadSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("does not count a reserved emergency credential as ready transcription capacity", async () => {
+		const baseNow = Date.now();
+		vi.spyOn(Date, "now").mockReturnValue(baseNow);
+		vi.spyOn(runtimePolicy, "evaluateRuntimePolicy").mockResolvedValue({
+			allowed: true,
+			statusCode: 200,
+			errorCode: null,
+			reasons: [],
+			projectKey: null,
+			blockedAccountIndexes: new Set(),
+			emergencyAccountIndexes: new Set([1]),
+			scoreBoostByAccount: {},
+			budgetEvaluations: [],
+		});
+		const manager = new AccountManager(undefined, createStorage(baseNow, 2));
+		vi.spyOn(AccountManager, "loadFromDisk").mockResolvedValue(manager);
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response(JSON.stringify({ error: { code: "rate_limit_exceeded" } }), {
+				status: HTTP_STATUS.TOO_MANY_REQUESTS,
+				headers: { "content-type": "application/json", "retry-after": "60" },
+			}),
+		);
+		const proxy = await startProxy(manager, fetchImpl);
+
+		expect((await postTranscribe(proxy, Buffer.from("--first--\r\n"))).status)
+			.toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+		const exhausted = await postTranscribe(proxy, Buffer.from("--second--\r\n"));
+		const payload = (await exhausted.json()) as {
+			error: { retry_after_ms: number; account_skip_reasons?: Record<string, string> };
+		};
+
+		expect(exhausted.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(payload.error.retry_after_ms).toBe(60_000);
+		expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual(["acc_1"]);
+	});
+
 	it("discovers a newly logged-in credential while resident credentials are transcription-rate-limited", async () => {
 		const baseNow = Date.now();
 		vi.spyOn(Date, "now").mockReturnValue(baseNow);
@@ -544,7 +580,7 @@ describe("runtime transcription proxy", () => {
 		expect(proxy.getStatus().rotations).toBe(0);
 	});
 
-	it("uses request-local enabled workspace scope without mutating the saved selection", async () => {
+	it("refuses a disabled selected transcription workspace without using a sibling", async () => {
 		const manager = new AccountManager(undefined, createStorage(Date.now(), 1));
 		const account = manager.getAccountByIndex(0);
 		if (!account) throw new Error("missing test account");
@@ -569,8 +605,8 @@ describe("runtime transcription proxy", () => {
 
 		account.workspaces[1]!.enabled = false;
 		const fallback = await postTranscribe(proxy, Buffer.from("--fallback--\r\n"));
-		expect(fallback.status).toBe(HTTP_STATUS.OK);
-		expect(calls[1]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("workspace-bound");
+		expect(fallback.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(calls).toHaveLength(1);
 		expect(account.currentWorkspaceIndex).toBe(1);
 	});
 

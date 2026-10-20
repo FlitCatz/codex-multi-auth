@@ -194,6 +194,27 @@ it("uses real upstream WebSockets and reuses the socket for a continuation", asy
 	});
 	expect(f.calls[0]).not.toHaveProperty("stream");
 });
+it.each([undefined, false, true])("preserves caller permission metadata over WebSocket (%s)", async (enabled) => {
+	const f = await fixture();
+	const ws = await f.connect();
+	const metadata = enabled === undefined ? undefined : {
+		thread_id: "fixture-thread",
+		sandbox: enabled ? "seatbelt" : "none",
+		sandbox_mode: enabled ? "workspace-write" : "danger-full-access",
+		approval_policy: "on-request",
+		auto_review_enabled: enabled,
+		node_repl_auto_review_required: enabled,
+		node_repl_disabled: !enabled,
+	};
+	const clientMetadata = metadata === undefined ? undefined : {
+		"x-codex-turn-metadata": JSON.stringify(metadata),
+		...metadata,
+	};
+	expect((await turn(ws, { model: "shared", input: [], client_metadata: clientMetadata })).at(-1)?.type).toBe("response.completed");
+	expect(f.calls).toHaveLength(1);
+	expect(f.calls[0]?.client_metadata).toEqual(clientMetadata);
+});
+
 it("rejects unknown or cross-pool continuations without sending them upstream", async () => {
 	const f = await fixture();
 	const ws = await f.connect();
@@ -607,6 +628,33 @@ it("falls back to HTTP for an API credential whose WebSocket handshake is refuse
 	expect((await turn(ws, { model: "api/fixture", input: [] })).at(-1)).toMatchObject({ type: "response.completed" });
 	expect(posts).toHaveLength(2);
 	expect(JSON.parse(posts[0]!)).toMatchObject({ model: "api/fixture", stream: true });
+});
+
+it.each([undefined, false, true])("preserves caller permission metadata during HTTP recovery (%s)", async (enabled) => {
+	const posts: string[] = [];
+	const receivedHeaders: IncomingMessage["headers"][] = [];
+	const upstream = rejectingUpstream(404, {}, (body) => posts.push(body));
+	upstream.prependListener("request", (req) => {
+		if (req.method === "POST") receivedHeaders.push(req.headers);
+	});
+	const metadata = enabled === undefined ? undefined : {
+		sandbox: enabled ? "seatbelt" : "none",
+		auto_review_enabled: enabled,
+	};
+	const encoded = metadata === undefined ? undefined : JSON.stringify(metadata);
+	const clientMetadata = metadata === undefined ? undefined : {
+		...metadata, "x-codex-turn-metadata": encoded,
+	};
+	const g = await customGateway({ upstream, outboundHeaders: {
+		"openai-beta": "responses=experimental",
+		...(encoded === undefined ? {} : { "x-codex-turn-metadata": encoded }),
+	} });
+	const ws = await g.connect({ authorization: "Bearer fixture-local", "openai-beta": "responses_websockets=2026-02-06" });
+	expect((await turn(ws, { model: "api/fixture", input: [], client_metadata: clientMetadata })).at(-1)?.type).toBe("response.completed");
+	expect(posts).toHaveLength(1);
+	expect(JSON.parse(posts[0]!).client_metadata).toEqual(clientMetadata);
+	expect(receivedHeaders[0]?.["x-codex-turn-metadata"]).toBe(encoded);
+	expect(receivedHeaders[0]?.["openai-beta"]).toBe("responses=experimental");
 });
 
 it("does not fall back to HTTP for a ChatGPT workspace whose handshake is refused", async () => {

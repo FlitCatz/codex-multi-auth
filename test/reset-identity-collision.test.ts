@@ -62,3 +62,27 @@ it('revalidates identity uniqueness on disk before consuming',async()=>{
  expect(native.nativeRateLimitsRpc).toHaveBeenCalledTimes(1);
  expect(native.nativeRateLimitsRpc).toHaveBeenCalledWith(expect.anything(),'account/rateLimits/read',expect.anything());
 });
+
+it('requests reset-credit details needed to compare expiration across accounts',async()=>{
+ const data=imported(false);
+ const service=createResetCreditService(new AccountManager(undefined,data));
+ await service.refresh([resetTargetForStoredAccount(data.accounts[0]!)!]);
+ expect(native.nativeRateLimitsRpc).toHaveBeenCalledExactlyOnceWith(expect.anything(),'account/rateLimits/read',{excludeResetCreditDetails:false});
+});
+
+it('forwards the earliest-expiring explicit credit ID through the production native adapter',async()=>{
+ const data=imported(false);
+ const now=Math.floor(Date.now()/1000);
+ vi.mocked(native.nativeRateLimitsRpc).mockImplementation(async(auth,method)=>{
+  if(method==='account/rateLimitResetCredit/consume')return {outcome:'reset'};
+  return {accountId:auth.accountId,ordinaryUsageAllowed:false,rateLimits:{planType:'pro',primary:{usedPercent:100,resetsAt:now+7200}},rateLimitResetCredits:{availableCount:1,credits:[{id:auth.accessToken==='access-one'?'later':'soonest',resetType:'codexRateLimits',status:'available',grantedAt:now-3600,expiresAt:now+(auth.accessToken==='access-one'?3600:300)}]}};
+ });
+ const service=createResetCreditService(new AccountManager(undefined,data));
+ await service.setPolicy('last-resort');
+ const targets=data.accounts.map(a=>resetTargetForStoredAccount(a)!);
+ expect(await service.automatic(targets)).toEqual({key:targets[1]!.key,outcome:'reset'});
+ const calls=vi.mocked(native.nativeRateLimitsRpc).mock.calls.filter(([,method])=>method==='account/rateLimitResetCredit/consume');
+ expect(calls).toHaveLength(1);
+ expect(calls[0]?.[0].accessToken).toBe('access-two');
+ expect(calls[0]?.[2]).toEqual({idempotencyKey:expect.any(String),creditId:'soonest'});
+});

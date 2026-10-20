@@ -2014,11 +2014,21 @@ export class AccountManager {
 		return this.getMinWaitTimeForFamily("codex");
 	}
 
-	getMinWaitTimeForFamily(family: ModelFamily, model?: string | null): number {
+	/**
+	 * Accounts in `excludedIndexes` (policy-blocked or reserved for this request)
+	 * are not capacity the caller can retry into, so they never shorten the wait.
+	 */
+	getMinWaitTimeForFamily(
+		family: ModelFamily,
+		model?: string | null,
+		excludedIndexes?: ReadonlySet<number>,
+	): number {
 		const now = nowMs();
 		const enabledAccounts = this.accounts.filter(
 			(account) =>
-				account.enabled !== false && !this.isAccountAuthInvalidated(account),
+				account.enabled !== false &&
+				!this.isAccountAuthInvalidated(account) &&
+				!excludedIndexes?.has(account.index),
 		);
 		const available = enabledAccounts.filter((account) => {
 			clearExpiredRateLimits(account);

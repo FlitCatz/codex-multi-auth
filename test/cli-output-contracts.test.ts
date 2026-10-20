@@ -241,7 +241,7 @@ describe("cli output contracts", () => {
 			"codex-multi-auth workspace <account> [workspace]",
 			"codex-multi-auth best [--live] [--json] [--model <model>]",
 			"codex-multi-auth forecast [--live] [--json] [--explain] [--model <model>] [--no-runtime-overlay]",
-			"codex-multi-auth account tag|untag|weight|priority|auto-prime|pause|unpause|drain|undrain|note|policy list ...",
+			"codex-multi-auth account tag|untag|weight|priority|auto-prime|emergency-only|pause|unpause|drain|undrain|note|policy list ...",
 			"codex-multi-auth uninstall [--dry-run] [--json] [--clear-accounts]",
 			"codex-multi-auth verify-flagged [--dry-run|-n] [--json] [--no-restore]",
 			"codex-multi-auth verify [--paths | --flagged | --all] [--json]",

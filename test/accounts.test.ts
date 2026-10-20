@@ -1718,6 +1718,30 @@ describe("AccountManager", () => {
 			expect(manager.getMinWaitTimeForFamily("codex")).toBe(0);
 		});
 
+		it("ignores excluded accounts so policy-reserved capacity does not report a zero wait", () => {
+			const now = Date.now();
+			const stored = {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						rateLimitResetTimes: { codex: now + 30000 },
+					},
+					{ refreshToken: "token-2", addedAt: now, lastUsed: now },
+				],
+			};
+
+			const manager = new AccountManager(undefined, stored);
+			expect(manager.getMinWaitTimeForFamily("codex")).toBe(0);
+			const waitTime = manager.getMinWaitTimeForFamily("codex", null, new Set([1]));
+			expect(waitTime).toBeGreaterThan(0);
+			expect(waitTime).toBeLessThanOrEqual(30000);
+			expect(manager.getMinWaitTimeForFamily("codex", null, new Set([0, 1]))).toBe(0);
+		});
+
 		it("returns wait time when all accounts rate limited", () => {
 			const now = Date.now();
 			const stored = {

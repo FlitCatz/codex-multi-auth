@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { z } from "zod";
 import { resolveAccountRecordId } from "../accounts.js";
-import { extractAccountId } from "../auth/token-utils.js";
+import { extractAccountId, nativeWorkspaceIdentity } from "../auth/token-utils.js";
 import { getAccountPolicyKey, type AccountPolicyStore } from "../account-policy.js";
 import type { AccountMetadataV3, AccountStorageV3 } from "../storage.js";
 import { withFileTransactionLock } from "../storage/file-lock.js";
@@ -26,11 +26,12 @@ export interface AutomaticAccountCheckOptions {
 }
 /** Honor the saved selection; a disabled/invalid selection must not fall back to a sibling. */
 export function automaticCheckWorkspaceId(account: AccountMetadataV3): string | undefined {
+    const identity = { access: account.accessToken, codexCliMirror: account.codexCliMirror };
     if (account.workspaces?.length) {
         const selected = account.workspaces[account.currentWorkspaceIndex ?? 0];
-        return selected?.enabled === false ? undefined : selected?.id.trim() || undefined;
+        return selected?.enabled === false ? undefined : nativeWorkspaceIdentity(identity, selected?.id);
     }
-    return account.accountId?.trim() || extractAccountId(account.accessToken) || undefined;
+    return nativeWorkspaceIdentity(identity, account.accountId?.trim() || extractAccountId(account.accessToken));
 }
 
 /** Policy keys can be shared by organization members; attempt limits must never be. */
@@ -84,7 +85,9 @@ export async function runAutomaticAccountChecks(options: AutomaticAccountCheckOp
         // Keep every still-saved workspace's throttle, including temporarily disabled selections.
         const keys = new Set(storage.accounts.flatMap(account => [
             automaticAccountCheckKey(account),
-            ...(account.workspaces ?? []).map(workspace => workspaceAttemptKey(account, workspace.id.trim())),
+            ...(account.workspaces ?? []).map(workspace => workspaceAttemptKey(account, nativeWorkspaceIdentity(
+                { access: account.accessToken, codexCliMirror: account.codexCliMirror }, workspace.id,
+            ) ?? "")),
         ]));
         for (const key of Object.keys(attempts))
             if (!keys.has(key))
@@ -96,7 +99,7 @@ export async function runAutomaticAccountChecks(options: AutomaticAccountCheckOp
             if (!account)
                 continue;
             const key = automaticAccountCheckKey(account), policy = policies.accounts[getAccountPolicyKey(account)], now = options.now?.() ?? Date.now();
-            if (!policy?.autoPrime || policy.paused || policy.drained || account.enabled === false || account.authInvalidatedAt || (account.coolingDownUntil ?? 0) > now)
+            if (!policy?.autoPrime || policy.paused || policy.drained || policy.emergencyOnly || account.enabled === false || account.authInvalidatedAt || (account.coolingDownUntil ?? 0) > now)
                 continue;
             const lastAttempt = attempts[key];
             if (lastAttempt !== undefined && lastAttempt <= now + FUTURE_SKEW_MS && now - lastAttempt < AUTOMATIC_CHECK_INTERVAL_MS)

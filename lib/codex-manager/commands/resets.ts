@@ -1,8 +1,14 @@
 import { AccountManager } from '../../accounts.js';
-import { loadAccounts } from '../../storage.js';
+import { loadAccounts, type AccountMetadataV3 } from '../../storage.js';
 import { runWithGlobalStoragePath } from '../../storage/path-state.js';
 import { createResetCreditService, resetTargetForStoredAccount, resetAccountLabel, formatResetCreditLine } from '../../runtime/account-reset-credits.js';
 import { withCheckProgress } from '../../ui/check-progress.js';
+// A pending result may belong to a workspace that was since disabled or deselected.
+function ownsPendingKey(account:AccountMetadataV3,key:string):boolean{
+ const workspaces=account.workspaces?.map(workspace=>({...workspace,enabled:true}));
+ const selections=[undefined,...(workspaces??[]).map((_,index)=>index)];
+ return selections.some(index=>resetTargetForStoredAccount({...account,enabled:true,workspaces:index===undefined?undefined:workspaces,currentWorkspaceIndex:index??account.currentWorkspaceIndex})?.key===key);
+}
 const usage='Usage: codex-multi-auth resets list [--refresh] | redeem <account-number> | auto manual|last-resort';
 export async function runResetsCommand(args:string[]):Promise<number>{
  const [command='list',value,...extra]=args;
@@ -38,10 +44,11 @@ export async function runResetsCommand(args:string[]):Promise<number>{
   const pending=command==='redeem'?await service.status().then(s=>s.pending??null,()=>({key:undefined})):null;
   // The pending record can belong to another account (a redeem is refused while
   // any result is pending); point at the account that actually needs the retry.
-  const owner=pending?.key?(storage?.accounts??[]).findIndex(a=>resetTargetForStoredAccount({...a,enabled:true,workspaces:undefined})?.key===pending.key):-1;
+  const pendingKey=pending?.key;
+  const owner=pendingKey?(storage?.accounts??[]).findIndex(a=>ownsPendingKey(a,pendingKey)):-1;
   const pendingAccount=owner>=0?storage?.accounts[owner]:undefined;
-  const disabled=pendingAccount?resetTargetForStoredAccount(pendingAccount)===null:false;
-  const retry=disabled?`account ${owner+1} or its workspace is disabled; re-enable it before retrying the pending result`:pending?.key&&owner<0?'check it there (the pending account was removed)':owner>=0&&owner!==Number(value)-1?`retry account ${owner+1}, which holds the pending result`:'retry the same account';
+  const disabled=pendingAccount?resetTargetForStoredAccount(pendingAccount)?.key!==pendingKey:false;
+  const retry=disabled?`account ${owner+1} or its pending workspace is disabled or no longer selected; re-enable and select it before retrying the pending result`:pending?.key&&owner<0?'check it there (the pending account was removed)':owner>=0&&owner!==Number(value)-1?`retry account ${owner+1}, which holds the pending result`:'retry the same account';
   console.error(command==='list'?'Reset-credit availability could not be refreshed. No credits were redeemed.':command==='auto'?'Reset-credit settings could not be updated.':pending?`Reset operation could not be confirmed. No new automatic redemption will be attempted while a result is pending; use resets list and ${retry}.`:'No reset credit was redeemed. Availability could not be confirmed or a reset was just redeemed; run resets list --refresh and try again.');return 1;}
  finally{await manager.flushPendingSave();}
  });

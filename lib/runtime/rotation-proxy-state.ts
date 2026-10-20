@@ -1,3 +1,4 @@
+import type { ResetExhaustionEvidence } from "./reset-credits.js";
 import type { NativeAccountSnapshot } from "./native-account-storage.js";
 import type { QuotaCacheData, QuotaCacheEntry } from "../quota-cache.js";
 import type {RuntimeCapabilityFailures} from "./runtime-capability-failures.js";
@@ -99,6 +100,8 @@ export interface RotationProxyState extends RotationProxyStateInit {
  catalogApiRoutes?:ApiRouteCredential[];
  catalogInventory?:ModelInventory;
  subscriptionQuotaObservations?: Map<string, QuotaCacheEntry>;
+ /** Explicit pre-inference quota rejections, scoped to immutable workspace/model identity. */
+ subscriptionQuotaRejections?: Map<string, ResetExhaustionEvidence>;
 	readonly threadGoalFallbacks: Map<string, string | null>;
 	lastGlobalAccountIndex: number | null;
 	lastGlobalSwitchAt: number;

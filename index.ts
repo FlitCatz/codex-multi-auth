@@ -1120,13 +1120,8 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 										model: model ?? null,
 										capabilityPolicy: capabilityPolicyStore,
 									});
-								} catch (policyError) {
-									logWarn("Runtime policy evaluation failed open.", {
-										error:
-											policyError instanceof Error
-												? policyError.message
-												: String(policyError),
-									});
+								} catch {
+									logWarn("Runtime policy evaluation failed; request blocked.");
 								}
 								usageRecorder = createRuntimeUsageRecorder({
 									source: "plugin-host",
@@ -1141,6 +1136,28 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 									statusCode: null,
 									errorCode: "plugin_host_request_failed",
 								};
+								if (!runtimePolicyDecision) {
+									runtimeMetrics.failedRequests += 1;
+									runtimeMetrics.lastError = "Runtime policy unavailable";
+									syncRuntimeObservability(requestTraceId);
+									usageCompletion = {
+										outcome: "blocked",
+										statusCode: 503,
+										errorCode: "runtime_policy_unavailable",
+									};
+									return new Response(
+										JSON.stringify({
+											error: {
+												message: "Runtime policy could not be loaded for this local request.",
+												code: "runtime_policy_unavailable",
+											},
+										}),
+										{
+											status: 503,
+											headers: { "content-type": "application/json; charset=utf-8" },
+										},
+									);
+								}
 								if (runtimePolicyDecision && !runtimePolicyDecision.allowed) {
 									runtimeMetrics.failedRequests += 1;
 									runtimeMetrics.lastError = "Runtime policy blocked request";
@@ -1169,6 +1186,12 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 									);
 								}
 
+								// This host cannot prove ordinary capacity and permitted reset
+								// recovery are exhausted, so emergency accounts stay reserved.
+								const blockedAccountIndexes = new Set([
+									...(runtimePolicyDecision?.blockedAccountIndexes ?? []),
+									...(runtimePolicyDecision?.emergencyAccountIndexes ?? []),
+								]);
 								const abortSignal = requestInit?.signal ?? init?.signal ?? null;
 								const sleep = createAbortableSleep(abortSignal);
 								const poolCooldownRemainingMs =
@@ -1347,7 +1370,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 													modelFamily,
 													model,
 												) &&
-												!runtimePolicyDecision?.blockedAccountIndexes.has(
+												!blockedAccountIndexes.has(
 													preferredSessionAccountIndex,
 												)
 											) {
@@ -1374,6 +1397,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												{
 													pidOffsetEnabled,
 													scoreBoostByAccount: capabilityBoostByAccount,
+													blockedAccountIndexes,
 												},
 											);
 										}
@@ -1381,11 +1405,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 											break;
 										}
 										attempted.add(account.index);
-										if (
-											runtimePolicyDecision?.blockedAccountIndexes.has(
-												account.index,
-											)
-										) {
+										if (blockedAccountIndexes.has(account.index)) {
 											continue;
 										}
 										// Log account selection for debugging rotation
@@ -2447,7 +2467,9 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 												const streamFallbackCandidateOrder =
 													buildAdaptiveStreamFailoverCandidateOrder(
 														account.index,
-														accountSnapshotList as Array<
+														accountSnapshotList.filter(
+															(candidate) => !blockedAccountIndexes.has(candidate.index),
+														) as Array<
 															Pick<
 																import("./lib/accounts.js").ManagedAccount,
 																| "index"
@@ -2482,6 +2504,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 																return null;
 															}
 															if (
+																	blockedAccountIndexes.has(candidateIndex) ||
 																!accountManager.isAccountAvailableForFamily(
 																	candidateIndex,
 																	modelFamily,

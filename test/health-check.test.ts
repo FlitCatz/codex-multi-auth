@@ -392,6 +392,20 @@ it("does not probe a disabled selected workspace through its stored binding", as
  expect(fetchCodexQuotaSnapshotMock).not.toHaveBeenCalled();
 });
 
+it.each([false,true])("probes and reads canonical Personal quota in health checks (refresh=%s)", async forceRefresh => {
+ const access=`e30.${Buffer.from(JSON.stringify({"https://api.openai.com/auth":{chatgpt_account_id:"native-personal"}})).toString("base64url")}.fixture`;
+ const a=account("alias",{accessToken:access,workspaces:[{id:"org-personal",name:"Personal",enabled:true}]});
+ loadAccountsMock.mockResolvedValue(storageWith([a]));
+ queuedRefreshMock.mockResolvedValue({type:"success",access,refresh:a.refreshToken,expires:REAL_NOW+3600000});
+ fetchCodexQuotaSnapshotMock.mockResolvedValue(snapshot());
+ await runHealthCheck({liveProbe:true,forceRefresh});
+ expect(fetchCodexQuotaSnapshotMock).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({accountId:"native-personal",accessToken:access}));
+ const {findQuotaCacheEntryForAccount}=await import("../lib/quota-readiness.js");
+ const saved:QuotaCacheData=saveQuotaCacheMock.mock.calls.at(-1)![0];
+ expect(findQuotaCacheEntryForAccount(saved,a,[a])?.primary.usedPercent).toBe(10);
+ expect(a.workspaces?.[0]?.id).toBe("org-personal");
+});
+
 
 it("shows unknown auto-prime when a real policy read fails", async () => {
  const {promises:fs} = await import("node:fs");
